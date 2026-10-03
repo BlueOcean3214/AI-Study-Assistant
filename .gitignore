@@ -1,5 +1,22 @@
 .idea/
 .venv/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .env
+.env.*
+!.env.example
+
+# Local runtime data and SQLite files
+feedback.db
+feedback.db-*
+feedback_backup.json
+*.sqlite
+*.sqlite3
+
+# Test/build artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/

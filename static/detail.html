@@ -1,0 +1,767 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>任务详情</title>
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: #f5f6f3;
+            color: #1f2d24;
+            font-family: Arial, sans-serif;
+        }
+
+        .page {
+            max-width: 430px;
+            min-height: 100vh;
+            margin: 0 auto;
+            padding: 18px 20px 30px;
+        }
+
+        /* 顶部导航 */
+
+        .nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 26px;
+        }
+
+        .back {
+            color: #315b45;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .date {
+            color: #777;
+            font-size: 14px;
+        }
+
+
+        /* 页面标题 */
+
+        .page-title {
+            font-size: 28px;
+            font-weight: bold;
+            line-height: 1.35;
+            margin: 0 0 8px;
+        }
+
+        .page-subtitle {
+            color: #777;
+            font-size: 14px;
+            line-height: 1.6;
+            margin: 0 0 22px;
+        }
+
+
+        /* 主任务卡 */
+
+        .task-card {
+            background: #28513b;
+            color: white;
+            border-radius: 20px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+
+        .task-card-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .task-tag {
+            font-size: 12px;
+            opacity: 0.82;
+        }
+
+        .status {
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 20px;
+            padding: 5px 9px;
+            font-size: 12px;
+        }
+
+        .task-title {
+            font-size: 22px;
+            font-weight: bold;
+            line-height: 1.45;
+            margin-bottom: 13px;
+        }
+
+        .task-meta {
+            font-size: 13px;
+            opacity: 0.88;
+        }
+
+
+        /* AI原因 */
+
+        .reason-card {
+            background: #eaf3ec;
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 16px;
+        }
+
+        .reason-title {
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 9px;
+        }
+
+        .reason-text {
+            font-size: 14px;
+            color: #56705f;
+            line-height: 1.7;
+        }
+
+
+        /* 完成清单 */
+
+        .check-card {
+            background: white;
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 16px;
+        }
+
+        .check-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .check-title {
+            font-size: 16px;
+            font-weight: bold;
+        }
+
+        .check-count {
+            font-size: 13px;
+            color: #777;
+        }
+
+        .check-item {
+            display: flex;
+            gap: 12px;
+            padding: 16px 0;
+            border-bottom: 1px solid #edf0ed;
+            cursor: pointer;
+        }
+
+        .check-item:last-child {
+            border-bottom: none;
+        }
+
+        .checkbox {
+            width: 22px;
+            height: 22px;
+            border: 2px solid #bfc8c1;
+            border-radius: 50%;
+            flex-shrink: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-top: 2px;
+        }
+
+        .check-item.completed .checkbox {
+            border-color: #4b8f68;
+            background: #4b8f68;
+            color: white;
+        }
+
+        .check-item.completed .checkbox::after {
+            content: "✓";
+            font-size: 13px;
+        }
+
+        .item-main {
+            flex: 1;
+        }
+
+        .item-title {
+            font-size: 14px;
+            font-weight: bold;
+            margin-bottom: 5px;
+            line-height: 1.5;
+        }
+
+        .item-time {
+            font-size: 12px;
+            color: #4b8f68;
+            margin-bottom: 5px;
+        }
+
+        .item-desc {
+            font-size: 12px;
+            color: #888;
+            line-height: 1.6;
+        }
+
+        .check-item.completed .item-title {
+            text-decoration: line-through;
+            color: #999;
+        }
+
+
+        /* 提示 */
+
+        .tip {
+            display: flex;
+            gap: 8px;
+            align-items: flex-start;
+            color: #777;
+            font-size: 12px;
+            line-height: 1.6;
+            margin: 10px 2px 8px;
+        }
+
+
+        /* 备注 */
+
+        .note {
+            color: #999;
+            font-size: 12px;
+            line-height: 1.5;
+            margin: 0 2px 16px;
+        }
+
+
+        /* 开始按钮 */
+
+        .start-button {
+            width: 100%;
+            border: none;
+            border-radius: 14px;
+            padding: 16px;
+            background: #28513b;
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+
+        /* 错误 */
+
+        .error {
+            background: #fff1f1;
+            color: #a33;
+            padding: 16px;
+            border-radius: 14px;
+        }
+
+    </style>
+
+</head>
+
+
+<body>
+
+<div class="page">
+
+
+    <!-- 顶部导航 -->
+
+    <div class="nav">
+
+        <div
+            class="back"
+            onclick="goBack()"
+        >
+            ‹ 今日最重要任务
+        </div>
+
+        <div class="date" data-current-local-date>
+            10月3日
+        </div>
+
+    </div>
+
+
+    <!-- 页面标题 -->
+
+    <h1 class="page-title">
+        为什么今天先做它？
+    </h1>
+
+    <p class="page-subtitle">
+        这个任务会根据你的学习情况动态调整。
+    </p>
+
+
+    <!-- 主任务卡 -->
+
+    <div class="task-card">
+
+        <div class="task-card-top">
+
+            <div class="task-tag">
+                数学二 · 优先完成
+            </div>
+
+            <div class="status">
+                未开始
+            </div>
+
+        </div>
+
+
+        <div
+            id="taskTitle"
+            class="task-title"
+        >
+            正在加载任务...
+        </div>
+
+
+        <div
+            id="taskMeta"
+            class="task-meta"
+        >
+            正在加载...
+        </div>
+
+    </div>
+
+
+    <!-- AI 调整原因 -->
+
+    <div class="reason-card">
+
+        <div class="reason-title">
+            ✨ 为什么今天先做它？
+        </div>
+
+        <div
+            id="reason"
+            class="reason-text"
+        >
+            正在加载...
+        </div>
+
+    </div>
+
+
+    <!-- 完成清单 -->
+
+    <div class="check-card">
+
+        <div class="check-header">
+
+            <div class="check-title">
+                具体要完成什么
+            </div>
+
+            <div
+                id="checkCount"
+                class="check-count"
+            >
+                0 / 0 已完成
+            </div>
+
+        </div>
+
+
+        <!-- AI动态生成的子任务 -->
+
+        <div id="subtasks"></div>
+
+    </div>
+
+
+    <!-- 完成提示 -->
+
+    <div class="tip">
+
+        <span>ⓘ</span>
+
+        <span id="completionTip">
+            完成以上任务，就可以结束。不追加新题。
+        </span>
+
+    </div>
+
+
+    <!-- 备注 -->
+
+    <div class="note">
+        ✍️ 已计入今日计划，剩余时间作为缓冲。
+    </div>
+
+
+    <!-- 开始学习 -->
+
+    <button
+        class="start-button"
+        onclick="startTask()"
+    >
+        开始学习 ▷
+    </button>
+
+</div>
+
+
+<script>
+
+let completedCount = 0;
+let totalSubtasks = 0;
+let completedSubtaskIndices = [];
+let currentPlanKey = "";
+
+
+function makePlanKey(plan) {
+    return JSON.stringify({
+        task: plan.task,
+        subtasks: Array.isArray(plan.subtasks) ? plan.subtasks : []
+    });
+}
+
+
+function loadCompletedSubtaskIndices(plan, subtasks) {
+    currentPlanKey = makePlanKey(plan);
+
+    if (
+        sessionStorage.getItem("completed_subtask_plan_key")
+        !== currentPlanKey
+    ) {
+        return [];
+    }
+
+    try {
+        const savedIndices = JSON.parse(
+            sessionStorage.getItem("completed_subtask_indices") || "[]"
+        );
+
+        if (!Array.isArray(savedIndices)) {
+            return [];
+        }
+
+        return [...new Set(savedIndices)].filter(index =>
+            Number.isInteger(index)
+            && index >= 0
+            && index < subtasks.length
+        );
+    } catch (error) {
+        console.error("解析子任务完成状态失败：", error);
+        return [];
+    }
+}
+
+
+function saveCompletedSubtaskIndices() {
+    sessionStorage.setItem(
+        "completed_subtask_indices",
+        JSON.stringify(completedSubtaskIndices)
+    );
+    sessionStorage.setItem(
+        "completed_subtask_plan_key",
+        currentPlanKey
+    );
+}
+
+
+/*
+ * 从首页保存的 current_plan 中
+ * 获取本次 AI 生成的学习计划
+ */
+function loadPlan() {
+
+    const planText =
+        sessionStorage.getItem("current_plan");
+
+
+    if (!planText) {
+
+        document.getElementById("taskTitle")
+            .textContent = "没有找到当前任务";
+
+        return;
+    }
+
+
+    let plan;
+
+    try {
+
+        plan = JSON.parse(planText);
+
+    } catch (error) {
+
+        console.error("解析学习计划失败：", error);
+
+        document.getElementById("taskTitle")
+            .textContent = "学习计划数据异常";
+
+        return;
+    }
+
+
+    /*
+     * 显示主任务
+     */
+
+    document.getElementById("taskTitle")
+        .textContent = plan.task;
+
+
+    /*
+     * 显示预计时间
+     */
+
+    document.getElementById("taskMeta")
+        .textContent =
+            "🕒 预计 "
+            + plan.estimated_minutes
+            + " 分钟 · 今日计划的一部分";
+
+
+    /*
+     * 显示 AI 调整原因
+     */
+
+    document.getElementById("reason")
+        .textContent = plan.reason;
+
+
+    /*
+     * 动态显示子任务
+     */
+
+    if (
+        Array.isArray(plan.subtasks)
+        && plan.subtasks.length > 0
+    ) {
+
+        renderSubtasks(plan.subtasks, plan);
+
+    } else {
+
+        totalSubtasks = 0;
+        completedCount = 0;
+        completedSubtaskIndices = [];
+        currentPlanKey = makePlanKey(plan);
+        saveCompletedSubtaskIndices();
+        document.getElementById("checkCount")
+            .textContent = "0 / 0 已完成";
+
+        document.getElementById("subtasks")
+            .innerHTML =
+                '<div class="error">'
+                + '当前计划没有生成具体子任务。'
+                + '</div>';
+
+    }
+
+
+    /*
+     * 显示完成标准
+     */
+
+    if (plan.completion_criteria) {
+
+        document.getElementById("completionTip")
+            .textContent =
+                plan.completion_criteria
+                + "。完成后即可结束，不追加新题。";
+
+    }
+
+}
+
+
+/*
+ * 动态生成子任务
+ */
+function renderSubtasks(subtasks, plan) {
+
+    const container =
+        document.getElementById("subtasks");
+
+
+    container.innerHTML = "";
+
+
+    totalSubtasks = subtasks.length;
+
+    completedSubtaskIndices =
+        loadCompletedSubtaskIndices(plan, subtasks);
+
+    completedCount = completedSubtaskIndices.length;
+    saveCompletedSubtaskIndices();
+
+
+    /*
+     * 初始化完成数量
+     */
+
+    document.getElementById("checkCount")
+        .textContent =
+            completedCount
+            + " / "
+            + totalSubtasks
+            + " 已完成";
+
+
+    /*
+     * 遍历 AI 生成的每个子任务
+     */
+
+    subtasks.forEach(function(subtask, index) {
+
+        const item =
+            document.createElement("div");
+
+
+        item.className = "check-item";
+        item.dataset.subtaskIndex = String(index);
+
+        if (completedSubtaskIndices.includes(index)) {
+            item.classList.add("completed");
+        }
+
+
+        item.innerHTML = `
+            <div class="checkbox"></div>
+
+            <div class="item-main">
+
+                <div class="item-title">
+                    ${escapeHtml(subtask.title)}
+                </div>
+
+              <div class="item-time">
+    ${subtask.minutes} 分钟
+    ${
+        subtask.question_count > 0
+        ? " · " + subtask.question_count + " 道题"
+        : ""
+    }
+</div>
+                <div class="item-desc">
+                    ${escapeHtml(subtask.description)}
+                </div>
+
+            </div>
+        `;
+
+
+        /*
+         * 点击子任务
+         */
+
+        item.addEventListener(
+            "click",
+            function() {
+                toggleItem(item);
+            }
+        );
+
+
+        container.appendChild(item);
+
+    });
+
+}
+
+
+/*
+ * 点击子任务完成 / 取消完成
+ */
+function toggleItem(element) {
+
+    const index = Number(element.dataset.subtaskIndex);
+    const isCompleted = element.classList.toggle("completed");
+
+    if (isCompleted && !completedSubtaskIndices.includes(index)) {
+        completedSubtaskIndices.push(index);
+    } else if (!isCompleted) {
+        completedSubtaskIndices = completedSubtaskIndices.filter(
+            savedIndex => savedIndex !== index
+        );
+    }
+
+    completedCount = completedSubtaskIndices.length;
+    saveCompletedSubtaskIndices();
+
+
+    document.getElementById("checkCount")
+        .textContent =
+            completedCount
+            + " / "
+            + totalSubtasks
+            + " 已完成";
+
+}
+
+
+/*
+ * 防止 AI 返回的文本直接插入 HTML
+ */
+function escapeHtml(text) {
+
+    if (text === null || text === undefined) {
+        return "";
+    }
+
+    return String(text)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+
+}
+
+
+/*
+ * 开始学习
+ */
+function startTask() {
+
+    window.location.href =
+        "/app/study.html";
+
+}
+
+
+/*
+ * 返回首页
+ */
+function goBack() {
+
+    window.location.href =
+        "/app/plan.html";
+
+}
+
+
+loadPlan();
+
+</script>
+
+<script src="/app/local-date.js"></script>
+
+</body>
+
+</html>

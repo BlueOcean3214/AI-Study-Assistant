@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>学习中</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f5f6f3;
+            color: #1f2d24;
+        }
+
+        .page {
+            max-width: 430px;
+            min-height: 100vh;
+            margin: 0 auto;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .top {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 50px;
+        }
+
+        .back {
+            color: #315b45;
+            cursor: pointer;
+        }
+
+        .date {
+            color: #777;
+        }
+
+        .tag {
+            color: #4b8f68;
+            font-size: 14px;
+            margin-bottom: 15px;
+        }
+
+        h1 {
+            font-size: 27px;
+            line-height: 1.4;
+            margin-bottom: 12px;
+        }
+
+        .task {
+            color: #666;
+            line-height: 1.6;
+            margin-bottom: 40px;
+        }
+
+        .timer {
+            font-size: 58px;
+            font-weight: bold;
+            letter-spacing: 2px;
+            margin: 40px 0;
+        }
+
+        .tip {
+            color: #888;
+            font-size: 13px;
+            line-height: 1.6;
+            margin-bottom: 30px;
+        }
+
+        button {
+            width: 100%;
+            border: none;
+            border-radius: 14px;
+            padding: 16px;
+            font-size: 16px;
+            font-weight: bold;
+            color: white;
+            background: #28513b;
+            cursor: pointer;
+        }
+    </style>
+
+</head>
+
+<body>
+
+<div class="page">
+
+    <div class="top">
+
+        <div
+            class="back"
+            onclick="goBack()"
+        >
+            ‹ 任务详情
+        </div>
+
+        <div class="date" data-current-local-date>
+            10月3日
+        </div>
+
+    </div>
+
+
+    <div class="tag">
+        数学二 · 今日最重要任务
+    </div>
+
+
+    <h1>
+        正在学习
+    </h1>
+
+
+    <div
+        id="task"
+        class="task"
+    >
+        正在加载任务...
+    </div>
+
+
+    <div
+        id="timer"
+        class="timer"
+    >
+        00:00
+    </div>
+
+
+    <div class="tip">
+        专注完成当前任务即可。<br>
+        结束学习后，系统会记录你的实际学习时间。
+    </div>
+
+
+    <button onclick="finishStudy()">
+        结束学习
+    </button>
+
+</div>
+
+
+<script>
+
+let startTime = Date.now();
+
+sessionStorage.setItem(
+    "study_start_time",
+    startTime.toString()
+);
+
+
+function updateTimer() {
+
+    const elapsedSeconds =
+        Math.floor((Date.now() - startTime) / 1000);
+
+    const minutes =
+        Math.floor(elapsedSeconds / 60);
+
+    const seconds =
+        elapsedSeconds % 60;
+
+    document.getElementById("timer").textContent =
+        String(minutes).padStart(2, "0")
+        + ":"
+        + String(seconds).padStart(2, "0");
+}
+
+
+setInterval(updateTimer, 1000);
+
+
+function finishStudy() {
+
+    const elapsedSeconds =
+        Math.floor((Date.now() - startTime) / 1000);
+
+    sessionStorage.setItem(
+        "actual_study_seconds",
+        elapsedSeconds.toString()
+    );
+
+    window.location.href = "/app/feedback.html";
+
+}
+
+
+function goBack() {
+
+    window.location.href = "/app/detail.html";
+
+}
+function loadPlan() {
+
+    const planText =
+        sessionStorage.getItem("current_plan");
+
+    if (!planText) {
+        document.getElementById("task").textContent =
+            "没有找到当前学习任务";
+        return;
+    }
+
+    const plan = JSON.parse(planText);
+
+    // sessionStorage remains available across the same-tab study/feedback
+    // navigation. Preserve the detail-page checkbox indices as well.
+    const savedIndices =
+        sessionStorage.getItem("completed_subtask_indices");
+
+    if (savedIndices) {
+        try {
+            const parsedIndices = JSON.parse(savedIndices);
+            sessionStorage.setItem(
+                "completed_subtask_indices",
+                JSON.stringify(Array.isArray(parsedIndices) ? parsedIndices : [])
+            );
+        } catch (error) {
+            console.error("读取子任务完成状态失败：", error);
+            sessionStorage.setItem("completed_subtask_indices", "[]");
+        }
+    }
+
+    document.getElementById("task").textContent =
+        plan.task;
+}
+loadPlan();
+</script>
+
+<script src="/app/local-date.js"></script>
+
+</body>
+
+</html>

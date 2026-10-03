@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>任务反馈</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f5f6f3;
+            color: #1f2d24;
+        }
+
+        .page {
+            max-width: 430px;
+            min-height: 100vh;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f6f3;
+        }
+
+        .top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 28px;
+            font-size: 15px;
+        }
+
+        .back {
+            color: #315b45;
+            cursor: pointer;
+        }
+
+        .date {
+            color: #777;
+        }
+
+        h1 {
+            margin: 0 0 8px;
+            font-size: 28px;
+        }
+
+        .subtitle {
+            margin: 0 0 24px;
+            color: #777;
+            line-height: 1.6;
+            font-size: 14px;
+        }
+
+        .task-card {
+            background: #28513b;
+            color: white;
+            border-radius: 18px;
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+
+        .tag {
+            font-size: 13px;
+            opacity: 0.8;
+            margin-bottom: 10px;
+        }
+
+        .task-title {
+            font-size: 20px;
+            font-weight: bold;
+            line-height: 1.4;
+            margin-bottom: 14px;
+        }
+
+        .time {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .actual-time {
+            font-size: 15px;
+            margin: 18px 0;
+        }
+
+        .section-title {
+            font-size: 16px;
+            font-weight: bold;
+            margin-bottom: 12px;
+        }
+
+        .option {
+            background: white;
+            border-radius: 14px;
+            padding: 16px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            border: 2px solid transparent;
+        }
+
+        .option.selected {
+            border-color: #4b8f68;
+            background: #edf5ef;
+        }
+
+        .option-title {
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+
+        .option-desc {
+            color: #888;
+            font-size: 13px;
+        }
+
+        .reason-box {
+            margin-top: 22px;
+            display: none;
+        }
+
+        .reason-option {
+            background: white;
+            border-radius: 12px;
+            padding: 13px 15px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            border: 2px solid transparent;
+        }
+
+        .reason-option.selected {
+            border-color: #4b8f68;
+            background: #edf5ef;
+        }
+
+        .tip {
+            text-align: center;
+            font-size: 12px;
+            color: #888;
+            margin: 20px 0 14px;
+        }
+
+        button {
+            width: 100%;
+            border: none;
+            border-radius: 14px;
+            padding: 16px;
+            font-size: 16px;
+            font-weight: bold;
+            background: #28513b;
+            color: white;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            background: #b9c4bc;
+            cursor: not-allowed;
+        }
+
+        .success {
+            display: none;
+            text-align: center;
+            padding-top: 100px;
+        }
+
+        .success-icon {
+            width: 70px;
+            height: 70px;
+            margin: 0 auto 20px;
+            border-radius: 50%;
+            background: #4b8f68;
+            color: white;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-size: 38px;
+        }
+
+        .success h2 {
+            margin-bottom: 10px;
+        }
+
+        .success p {
+            color: #777;
+            line-height: 1.6;
+            font-size: 14px;
+        }
+    </style>
+</head>
+
+<body>
+
+<div class="page">
+
+    <!-- 反馈页面 -->
+    <div id="feedbackPage">
+
+        <div class="top">
+            <div class="back">‹ 任务反馈</div>
+            <div class="date" data-current-local-date>10月3日</div>
+        </div>
+
+        <h1>任务完成了吗？</h1>
+
+        <p class="subtitle">
+            记录今天的实际情况，明天的计划会更贴合你的节奏。
+        </p>
+
+        <div class="task-card">
+            <div class="tag">数学二 · 今日最重要任务</div>
+
+          <div
+    id="taskTitle"
+    class="task-title"
+>
+    正在加载任务...
+</div>
+
+          <div
+    id="estimatedTime"
+    class="time"
+>
+    正在加载预计时间...
+</div>
+        </div>
+
+       <div class="actual-time">
+    实际学习时间：
+    <strong id="actualTime">0 分钟</strong>
+</div>
+
+        <div class="section-title">
+            完成情况
+        </div>
+
+        <div
+            class="option"
+            onclick="selectStatus('completed', this)"
+        >
+            <div class="option-title">已完成</div>
+            <div class="option-desc">任务按计划完成</div>
+        </div>
+
+        <div
+            class="option"
+            onclick="selectStatus('partial', this)"
+        >
+            <div class="option-title">部分完成</div>
+            <div class="option-desc">完成了一部分，还有内容未完成</div>
+        </div>
+
+        <div
+            class="option"
+            onclick="selectStatus('not_completed', this)"
+        >
+            <div class="option-title">没完成</div>
+            <div class="option-desc">今天没有完成这个任务</div>
+        </div>
+
+        <div id="reasonBox" class="reason-box">
+
+            <div class="section-title">
+                为什么没有完成？
+            </div>
+
+            <div
+                class="reason-option"
+                onclick="selectReason('任务时间太长', this)"
+            >
+                任务时间太长
+            </div>
+
+            <div
+                class="reason-option"
+                onclick="selectReason('任务难度太高', this)"
+            >
+                任务难度太高
+            </div>
+
+            <div
+                class="reason-option"
+                onclick="selectReason('临时有事情', this)"
+            >
+                临时有事情
+            </div>
+
+            <div
+                class="reason-option"
+                onclick="selectReason('今天状态不好', this)"
+            >
+                今天状态不好
+            </div>
+
+            <div
+                class="reason-option"
+                onclick="selectReason('其他', this)"
+            >
+                其他
+            </div>
+
+        </div>
+
+        <div class="tip">
+            如实记录就好，计划会随你的节奏调整
+        </div>
+
+        <button id="saveButton" onclick="saveFeedback()" disabled>
+            保存反馈
+        </button>
+
+    </div>
+
+
+    <!-- 保存成功页面 -->
+    <div id="successPage" class="success">
+
+        <div class="success-icon">
+            ✓
+        </div>
+
+        <h2>已记录今天的学习情况</h2>
+
+        <p>
+            系统会结合你的完成情况，在下一次生成计划时动态调整任务安排。
+        </p>
+
+        <button onclick="backToPlan()">
+            返回今日计划
+        </button>
+
+    </div>
+
+</div>
+
+
+<script>
+
+    let selectedStatus = null;
+    let selectedReason = null;
+
+    function selectStatus(status, element) {
+
+        selectedStatus = status;
+        selectedReason = null;
+
+        const options = document.querySelectorAll(".option");
+
+        options.forEach(option => {
+            option.classList.remove("selected");
+        });
+
+        element.classList.add("selected");
+
+        const reasonBox = document.getElementById("reasonBox");
+
+        if (status === "partial" || status === "not_completed") {
+            reasonBox.style.display = "block";
+        } else {
+            reasonBox.style.display = "none";
+        }
+
+        updateSaveButton();
+    }
+
+
+    function selectReason(reason, element) {
+
+        selectedReason = reason;
+
+        const options = document.querySelectorAll(".reason-option");
+
+        options.forEach(option => {
+            option.classList.remove("selected");
+        });
+
+        element.classList.add("selected");
+
+        updateSaveButton();
+    }
+
+
+    function updateSaveButton() {
+
+        const button = document.getElementById("saveButton");
+
+        if (selectedStatus === "completed") {
+            button.disabled = false;
+            return;
+        }
+
+        if (
+            (selectedStatus === "partial" ||
+             selectedStatus === "not_completed")
+            && selectedReason
+        ) {
+            button.disabled = false;
+            return;
+        }
+
+        button.disabled = true;
+    }
+
+
+    async function saveFeedback() {
+
+        const seconds =
+    Number(
+        sessionStorage.getItem("actual_study_seconds")
+    ) || 0;
+
+let actualMinutes =
+    Math.floor(seconds / 60);
+
+if (actualMinutes < 1 && seconds > 0) {
+    actualMinutes = 1;
+}
+
+const planText =
+    sessionStorage.getItem("current_plan");
+
+if (!planText) {
+    alert("没有找到当前学习任务");
+    return;
+}
+
+let plan;
+try {
+    plan = JSON.parse(planText);
+} catch (error) {
+    console.error("解析当前学习计划失败：", error);
+    alert("当前学习计划数据异常，请返回今日计划重新开始");
+    return;
+}
+
+if (
+    !plan
+    || typeof plan !== "object"
+    || Array.isArray(plan)
+    || typeof plan.task !== "string"
+    || !Number.isFinite(Number(plan.estimated_minutes))
+) {
+    alert("当前学习计划数据异常，请返回今日计划重新开始");
+    return;
+}
+
+const subtasks = Array.isArray(plan.subtasks) ? plan.subtasks : [];
+const totalSubtasks = subtasks.length;
+const currentPlanKey = JSON.stringify({
+    task: plan.task,
+    subtasks: subtasks
+});
+
+let completedIndices = [];
+if (
+    sessionStorage.getItem("completed_subtask_plan_key")
+    === currentPlanKey
+) {
+    try {
+        const savedIndices = JSON.parse(
+            sessionStorage.getItem("completed_subtask_indices") || "[]"
+        );
+        if (Array.isArray(savedIndices)) {
+            completedIndices = [...new Set(savedIndices)].filter(index =>
+                Number.isInteger(index)
+                && index >= 0
+                && index < totalSubtasks
+            );
+        }
+    } catch (error) {
+        console.error("解析子任务完成状态失败：", error);
+    }
+}
+
+const completedSubtasks = completedIndices.length;
+const totalQuestions = Number.isInteger(plan.question_count)
+    && plan.question_count >= 0
+    ? plan.question_count
+    : 0;
+const completedQuestions = completedIndices.reduce(
+    (total, index) => {
+        const questionCount = Number(subtasks[index]?.question_count);
+        return total + (
+            Number.isInteger(questionCount) && questionCount > 0
+                ? questionCount
+                : 0
+        );
+    },
+    0
+);
+
+const feedback = {
+    task: plan.task,
+    estimated_minutes: plan.estimated_minutes,
+    actual_minutes: actualMinutes,
+    status: selectedStatus,
+    reason: selectedReason,
+    completed_subtasks: completedSubtasks,
+    total_subtasks: totalSubtasks,
+    completed_questions: completedQuestions,
+    total_questions: totalQuestions
+};
+
+        try {
+
+            const response = await fetch("/feedback", {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json"
+                },
+                body: JSON.stringify(feedback)
+            });
+
+            const data = await response.json();
+
+            if (response.ok) {
+
+                document.getElementById("feedbackPage").style.display = "none";
+                document.getElementById("successPage").style.display = "block";
+
+                console.log(data);
+
+            } else {
+
+                alert("保存失败");
+
+            }
+
+        } catch (error) {
+
+            console.error(error);
+
+            alert("无法连接服务器");
+
+        }
+    }
+
+
+    function backToPlan() {
+
+        window.location.href = "/app/plan.html";
+
+    }
+    function loadActualTime() {
+
+    const seconds =
+        Number(
+            sessionStorage.getItem("actual_study_seconds")
+        ) || 0;
+
+    let minutes =
+        Math.floor(seconds / 60);
+
+    // 测试时如果不到1分钟，也显示1分钟
+    if (minutes < 1 && seconds > 0) {
+        minutes = 1;
+    }
+
+    document.getElementById("actualTime").textContent =
+        minutes + " 分钟";
+
+}
+function loadCurrentPlan() {
+
+    const planText =
+        sessionStorage.getItem("current_plan");
+
+    if (!planText) {
+        return;
+    }
+
+    const plan = JSON.parse(planText);
+
+    document.getElementById("taskTitle").textContent =
+        plan.task;
+
+    document.getElementById("estimatedTime").textContent =
+        "◷ 预计时间 " + plan.estimated_minutes + " 分钟";
+}
+loadCurrentPlan();
+loadActualTime();
+</script>
+
+<script src="/app/local-date.js"></script>
+
+</body>
+</html>

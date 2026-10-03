@@ -1,0 +1,734 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>今日计划</title>
+
+    <style>
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            background: #f5f6f3;
+            color: #1f2d24;
+            font-family: Arial, sans-serif;
+        }
+
+        .page {
+            max-width: 430px;
+            min-height: 100vh;
+            margin: 0 auto;
+            padding: 18px 20px 30px;
+        }
+
+        /* 顶部导航 */
+
+        .nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 28px;
+            font-size: 14px;
+        }
+
+        .nav-left {
+            color: #777;
+        }
+
+        .nav-right {
+            color: #777;
+        }
+
+
+        /* 头部 */
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 24px;
+        }
+
+        .header h1 {
+            margin: 0 0 8px;
+            font-size: 28px;
+            line-height: 1.35;
+        }
+
+        .date {
+            color: #777;
+            font-size: 14px;
+        }
+
+        .filter {
+            font-size: 22px;
+            color: #555;
+        }
+
+
+        /* 整体进度 */
+
+        .progress-card {
+            background: white;
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 18px;
+        }
+
+        .progress-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .progress-title {
+            font-size: 14px;
+            color: #666;
+        }
+
+        .progress-value {
+            font-size: 24px;
+            font-weight: bold;
+        }
+
+        .exam-days {
+            text-align: right;
+        }
+
+        .exam-label {
+            font-size: 12px;
+            color: #999;
+        }
+
+        .exam-value {
+            font-size: 20px;
+            font-weight: bold;
+        }
+
+        .progress-bar {
+            height: 8px;
+            background: #e4e8e5;
+            border-radius: 10px;
+            overflow: hidden;
+            margin: 14px 0 10px;
+        }
+
+        .progress-fill {
+            width: 45%;
+            height: 100%;
+            background: #4b8f68;
+            border-radius: 10px;
+        }
+
+        .progress-note {
+            color: #999;
+            font-size: 12px;
+        }
+
+
+        /* 今日学习时长 */
+
+        .study-summary {
+            background: white;
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 22px;
+        }
+
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+
+        .section-header strong {
+            font-size: 16px;
+        }
+
+        .section-header span {
+            color: #4b8f68;
+            font-size: 13px;
+        }
+
+        .study-numbers {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .study-item {
+            width: 48%;
+        }
+
+        .study-number {
+            font-size: 22px;
+            font-weight: bold;
+        }
+
+        .study-label {
+            color: #999;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        .study-bar {
+            height: 7px;
+            border-radius: 10px;
+            background: #e6e9e6;
+            margin: 16px 0 10px;
+        }
+
+        .study-fill {
+            width: 0%;
+            height: 100%;
+            background: #4b8f68;
+        }
+
+        .buffer {
+            color: #999;
+            font-size: 12px;
+            line-height: 1.5;
+        }
+
+
+        /* 最重要任务 */
+
+        .important-section {
+            margin-bottom: 24px;
+        }
+
+        .important-card {
+            background: #28513b;
+            color: white;
+            border-radius: 20px;
+            padding: 20px;
+        }
+
+        .important-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .important-tag {
+            font-size: 12px;
+            opacity: 0.8;
+        }
+
+        .do-first {
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 20px;
+            padding: 6px 10px;
+            font-size: 12px;
+        }
+
+        .task-meta {
+            font-size: 13px;
+            opacity: 0.8;
+            margin-bottom: 10px;
+        }
+
+        .task-title {
+            font-size: 21px;
+            font-weight: bold;
+            line-height: 1.45;
+            margin-bottom: 10px;
+        }
+
+        .task-reason {
+            font-size: 13px;
+            line-height: 1.6;
+            opacity: 0.85;
+            margin-bottom: 18px;
+        }
+
+        .view-task {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 13px;
+            background: white;
+            color: #28513b;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+
+        /* 其他任务 */
+
+        .other-section {
+            margin-top: 22px;
+        }
+
+        .other-task {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: white;
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 10px;
+        }
+
+        .other-title {
+            font-size: 14px;
+            font-weight: bold;
+            margin-bottom: 6px;
+            line-height: 1.4;
+        }
+
+        .other-meta {
+            font-size: 12px;
+            color: #999;
+        }
+
+        .other-icon {
+            font-size: 20px;
+        }
+
+        .other-note {
+            color: #999;
+            font-size: 12px;
+            line-height: 1.5;
+            margin-top: 10px;
+        }
+
+
+        /* 加载 */
+
+        .loading {
+            text-align: center;
+            padding: 40px 0;
+            color: #888;
+        }
+
+        .error {
+            padding: 16px;
+            border-radius: 14px;
+            background: #fff1f1;
+            color: #a33;
+        }
+
+    </style>
+
+</head>
+
+
+<body>
+
+<div class="page">
+
+
+    <!-- 顶部 -->
+
+    <div class="nav">
+
+        <div class="nav-left">
+            首页 · 今日计划
+        </div>
+
+        <div class="nav-right">
+            ⋯
+        </div>
+
+    </div>
+
+
+    <!-- 头部 -->
+
+    <div class="header">
+
+        <div>
+
+            <h1>
+                今天，先做好一件事
+            </h1>
+
+            <div
+                id="currentDate"
+                class="date"
+                data-current-local-date
+                data-date-format="full"
+            >
+                2026年10月3日 · 星期六
+            </div>
+
+        </div>
+
+        <div class="filter">
+            ☰
+        </div>
+
+    </div>
+
+
+    <!-- 整体进度 -->
+
+    <div class="progress-card">
+
+        <div class="progress-top">
+
+            <div>
+
+                <div class="progress-title">
+                    整体复习进度
+                </div>
+
+                <div class="progress-value">
+                    45%
+                </div>
+
+            </div>
+
+            <div class="exam-days">
+
+                <div class="exam-label">
+                    距离考试还有
+                </div>
+
+                <div class="exam-value">
+                    85 天
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="progress-bar">
+
+            <div class="progress-fill"></div>
+
+        </div>
+
+
+        <div class="progress-note">
+            四科平均进度 · 考试日期：2026年12月26日
+        </div>
+
+    </div>
+
+
+    <!-- 今日学习时长 -->
+
+    <div class="study-summary">
+
+        <div class="section-header">
+
+            <strong>
+                今日学习时长
+            </strong>
+
+            <span>
+                调整今天 ›
+            </span>
+
+        </div>
+
+
+        <div class="study-numbers">
+
+            <div class="study-item">
+
+                <div
+                    id="actualStudyTime"
+                    class="study-number"
+                >
+                    0 分钟
+                </div>
+
+                <div class="study-label">
+                    已学
+                </div>
+
+            </div>
+
+
+            <div class="study-item">
+
+                <div class="study-number">
+                    2小时30分
+                </div>
+
+                <div class="study-label">
+                    计划共
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <div class="study-bar">
+
+            <div class="study-fill"></div>
+
+        </div>
+
+
+        <div class="buffer">
+            可用3小时 = 计划2小时30分 + 缓冲30分钟
+        </div>
+
+    </div>
+
+
+    <!-- AI任务 -->
+
+    <div
+        id="loading"
+        class="loading"
+    >
+        正在生成今日计划...
+    </div>
+
+
+    <div
+        id="planContent"
+        style="display:none;"
+    >
+
+        <div class="important-section">
+
+            <div class="section-header">
+
+                <strong>
+                    今日最重要任务
+                </strong>
+
+            </div>
+
+
+            <div class="important-card">
+
+                <div class="important-top">
+
+                    <div
+                        id="taskTag"
+                        class="important-tag"
+                    >
+                        数学二 · 今日最重要任务
+                    </div>
+
+                    <div class="do-first">
+                        先做这一件
+                    </div>
+
+                </div>
+
+
+                <div
+                    id="taskMeta"
+                    class="task-meta"
+                >
+                    正在加载...
+                </div>
+
+
+                <div
+                    id="taskTitle"
+                    class="task-title"
+                >
+                </div>
+
+
+                <div
+                    id="taskReason"
+                    class="task-reason"
+                >
+                </div>
+
+
+                <button
+                    class="view-task"
+                    onclick="startTask()"
+                >
+                    查看任务，准备开始 ↗
+                </button>
+
+            </div>
+
+        </div>
+
+
+        <!-- 其他任务 -->
+
+        <div class="other-section">
+
+            <div class="section-header">
+
+                <strong>
+                    其他学习任务
+                </strong>
+
+                <span>
+                    2项 · 共75分钟
+                </span>
+
+            </div>
+
+
+            <div class="other-task">
+
+                <div>
+
+                    <div class="other-title">
+                        精读一篇阅读，整理生词
+                    </div>
+
+                    <div class="other-meta">
+                        英语二 · 45分钟 · 未开始
+                    </div>
+
+                </div>
+
+                <div class="other-icon">
+                    📖
+                </div>
+
+            </div>
+
+
+            <div class="other-task">
+
+                <div>
+
+                    <div class="other-title">
+                        复习唯物论，完成10道选择题
+                    </div>
+
+                    <div class="other-meta">
+                        思想政治理论 · 30分钟 · 未开始
+                    </div>
+
+                </div>
+
+                <div class="other-icon">
+                    📝
+                </div>
+
+            </div>
+
+
+            <div class="other-note">
+                设计专业基础今天不加任务，留到明天再安排。
+            </div>
+
+        </div>
+
+    </div>
+
+
+</div>
+
+
+<script>
+
+
+async function loadPlan() {
+
+    try {
+
+        const response =
+            await fetch("/next-plan");
+
+        const data =
+            await response.json();
+
+        if (!response.ok || !data.next_plan) {
+            throw new Error(
+                data.message || "服务器没有返回有效的学习计划"
+            );
+        }
+
+        const plan =
+            data.next_plan;
+
+
+        /*
+         * 保存当前计划
+         * 后面的任务详情、学习中、反馈页面
+         * 都使用这一份计划。
+         */
+
+        sessionStorage.setItem(
+            "current_plan",
+            JSON.stringify(data.next_plan)
+        );
+
+
+        document.getElementById("loading")
+            .style.display = "none";
+
+        document.getElementById("planContent")
+            .style.display = "block";
+
+
+        document.getElementById("taskTitle")
+            .textContent = plan.task;
+
+
+        document.getElementById("taskMeta")
+            .textContent =
+                "数学二 · 预计"
+                + plan.estimated_minutes
+                + "分钟 · 未开始";
+
+
+        document.getElementById("taskReason")
+            .textContent =
+                plan.reason;
+
+
+    } catch (error) {
+
+        document.getElementById("loading")
+            .style.display = "none";
+
+        document.getElementById("planContent")
+            .style.display = "block";
+
+        document.getElementById("planContent")
+            .innerHTML =
+                '<div class="error">'
+                + '暂时无法生成今日计划：'
+                + error.message
+                + '</div>';
+
+        console.error(error);
+
+    }
+
+}
+
+
+function startTask() {
+
+    window.location.href =
+        "/app/detail.html";
+
+}
+
+
+loadPlan();
+
+</script>
+
+<script src="/app/local-date.js"></script>
+
+</body>
+
+</html>
