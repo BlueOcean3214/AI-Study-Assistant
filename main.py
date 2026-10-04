@@ -1,9 +1,12 @@
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
+
+import document_service
 
 from rag_service import retrieve_chunks
 
@@ -225,6 +228,92 @@ def ask(question):
         "error": error
     }
 
+
+
+
+
+# ==========================
+# Mini RAG 文档导入接口
+# ==========================
+
+# 单个上传文件最大 2 MB
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024
+
+
+def upload_error(message):
+
+    return JSONResponse(
+        status_code=400,
+        content={
+            "message": message
+        }
+    )
+
+
+@app.post("/upload")
+async def upload_document(file: UploadFile = File(...)):
+
+    # 1. 只取文件名本身，防止客户端传入路径或 ../ 写到 knowledge 之外
+
+    filename = Path(file.filename).name if file.filename else ""
+
+    if not filename:
+
+        return upload_error("文件名不能为空")
+
+    if Path(filename).suffix.lower() != ".txt":
+
+        return upload_error("目前只支持 .txt 文件")
+
+
+    # 2. 读取 bytes，并限制大小
+
+    contents = await file.read()
+
+    if len(contents) > MAX_UPLOAD_BYTES:
+
+        return upload_error("文件过大，当前最大支持 2 MB")
+
+
+    # 3. 保存进知识库（编码识别、文件名校验、切片都在 document_service 里）
+
+    try:
+
+        source = document_service.save_document(
+            filename,
+            contents
+        )
+
+    except document_service.DocumentError as error:
+
+        return upload_error(str(error))
+
+
+    # 4. 复用 document_service 统计这篇文档切成了多少 chunk
+
+    try:
+
+        text = document_service.read_text(
+            document_service.KNOWLEDGE_PATH / source
+        )
+
+        chunk_count = len(
+            document_service.chunk_text(text, source)
+        )
+
+    except document_service.DocumentError:
+
+        chunk_count = 0
+
+
+    # 5. 返回结果；向量由 rag_service 在下次检索时按需生成
+
+    return {
+        "message": "文档上传成功",
+        "source": source,
+        "size_bytes": len(contents),
+        "chunk_count": chunk_count
+    }
 
 
 
