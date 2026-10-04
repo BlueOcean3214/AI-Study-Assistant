@@ -9,6 +9,7 @@ OLLAMA_MODEL = "qwen3.5:4b"
 
 
 def call_ollama(prompt):
+
     try:
         response = requests.post(
             OLLAMA_URL,
@@ -31,6 +32,28 @@ def call_ollama(prompt):
     except (ValueError, AttributeError):
         return None, "Ollama 返回内容格式异常"
 
+def ask_with_rag(question, context):
+        if context:
+            prompt = f"""
+    你是一个学习助手。
+
+    请参考下面资料回答问题：
+
+    {context}
+
+
+    用户问题：
+    {question}
+
+    要求：
+    1. 优先依据资料回答。
+    2. 如果资料没有相关内容，可以使用自己的知识补充。
+    3. 不要编造资料中不存在的信息。
+    """
+        else:
+            prompt = question
+
+        return call_ollama(prompt)
 
 def analyze_feedback(feedback_list, summary):
     prompt = f"""
