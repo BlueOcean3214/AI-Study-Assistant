@@ -14,6 +14,12 @@ from pathlib import Path
 import embedding_service
 import main
 import rag_service
+import vector_cache
+
+# 测试隔离：向量缓存写到临时目录，避免污染真实 .rag_cache/
+CACHE_FIXTURE = Path(__file__).resolve().parent / "_test_cache_rag"
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+vector_cache.CACHE_DIR = CACHE_FIXTURE
 
 
 def check(name, condition, detail=""):
@@ -230,5 +236,8 @@ finally:
 check("降级时 /ask 仍返回答案", degraded_response["answer"] == "stub answer")
 check("降级时 sources 为空", degraded_response["sources"] == [])
 check("降级时 prompt 直接使用问题", captured.get("prompt") == "定积分怎么学")
+
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+check("测试缓存目录已清理", not CACHE_FIXTURE.exists())
 
 print("\n全部用例通过")

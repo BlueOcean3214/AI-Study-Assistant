@@ -12,6 +12,12 @@ from pathlib import Path
 
 import document_service
 import rag_service
+import vector_cache
+
+# 测试隔离：向量缓存写到临时目录，避免污染真实 .rag_cache/
+CACHE_FIXTURE = Path(__file__).resolve().parent / "_test_cache_document"
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+vector_cache.CACHE_DIR = CACHE_FIXTURE
 
 
 def check(name, condition, detail=""):
@@ -236,5 +242,8 @@ finally:
     shutil.rmtree(fixture, ignore_errors=True)
 
 check("测试夹具已清理", not fixture.exists())
+
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+check("测试缓存目录已清理", not CACHE_FIXTURE.exists())
 
 print("\n全部用例通过")

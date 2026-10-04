@@ -9,6 +9,7 @@
 """
 
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -17,9 +18,16 @@ from pathlib import Path
 
 import requests
 
+import vector_cache
+
 PROJECT_DIR = Path(__file__).resolve().parent
 KNOWLEDGE_DIR = PROJECT_DIR / "knowledge"
 SERVER_LOG = PROJECT_DIR / "_test_upload_server.log"
+
+# 测试隔离：向量缓存写到临时目录，并把它传给子进程（uvicorn 服务）
+CACHE_FIXTURE = PROJECT_DIR / "_test_cache_upload"
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+vector_cache.CACHE_DIR = CACHE_FIXTURE
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
@@ -92,6 +100,7 @@ else:
         cwd=str(PROJECT_DIR),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
+        env={**os.environ, "RAG_CACHE_DIR": str(CACHE_FIXTURE)},
     )
     print(f"已启动测试服务：{base_url}（日志：{SERVER_LOG.name}）")
 
@@ -306,5 +315,8 @@ if SERVER_LOG.exists():
     print(f"WARN: 服务日志未能删除，可手动删除 {SERVER_LOG.name}")
 else:
     check("服务日志已清理", True)
+
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+check("测试缓存目录已清理", not CACHE_FIXTURE.exists())
 
 print("\n全部用例通过")

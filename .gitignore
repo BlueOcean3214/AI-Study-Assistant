@@ -14,6 +14,9 @@ feedback_backup.json
 *.sqlite
 *.sqlite3
 
+# Embedding 向量缓存（本地生成，可随时删除重建）
+.rag_cache/
+
 # Test/build artifacts
 .pytest_cache/
 .coverage

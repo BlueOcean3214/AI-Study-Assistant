@@ -15,10 +15,18 @@
 """
 
 import contextlib
+import shutil
 import time
+from pathlib import Path
 
 import embedding_service
 import rag_service
+import vector_cache
+
+# 测试隔离：向量缓存写到临时目录，避免污染真实 .rag_cache/
+CACHE_FIXTURE = Path(__file__).resolve().parent / "_test_cache_batching"
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+vector_cache.CACHE_DIR = CACHE_FIXTURE
 
 
 def check(name, condition, detail=""):
@@ -181,7 +189,10 @@ with patched(
     rag_service.retrieve_chunks(added_chunks[-1]["content"])
 
 check("新增 chunk 只请求 1 条", sum(len(batch) for batch in new_calls) == 1, f"total={sum(len(b) for b in new_calls)}")
-check("新增 chunk 立刻可检索", rag_service._EMBEDDING_CACHE.get("全新加入的知识点 xyz") is not None)
+check(
+    "新增 chunk 立刻可检索",
+    rag_service._EMBEDDING_CACHE.get(vector_cache.chunk_hash("全新加入的知识点 xyz")) is not None,
+)
 
 # 6. 某一批失败：报错带批次信息、保留已成功的缓存、不写伪向量、可重试
 rag_service._EMBEDDING_CACHE.clear()
@@ -207,7 +218,7 @@ check("失败时检索返回空（不把半成品当完整知识库）", failed_
 check("失败前的批次已保留在缓存", len(rag_service._EMBEDDING_CACHE) == 32, f"cached={len(rag_service._EMBEDDING_CACHE)}")
 check(
     "失败的批次内容没有写入伪向量",
-    not any(fail_chunks[32]["content"] == text for text in rag_service._EMBEDDING_CACHE),
+    vector_cache.chunk_hash(fail_chunks[32]["content"]) not in rag_service._EMBEDDING_CACHE,
 )
 
 # 直接调用底层函数，检查异常信息
@@ -309,5 +320,8 @@ rag_service._EMBEDDING_CACHE.clear()
 with patched(load_chunks=lambda: ten_chunks):
     context = rag_service.retrieve_context(ten_chunks[0]["content"])
 check("retrieve_context 仍返回字符串", isinstance(context, str) and len(context) > 0, f"len={len(context)}")
+
+shutil.rmtree(CACHE_FIXTURE, ignore_errors=True)
+check("测试缓存目录已清理", not CACHE_FIXTURE.exists())
 
 print("\n全部用例通过")
