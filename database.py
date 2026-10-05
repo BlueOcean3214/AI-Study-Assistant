@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 
@@ -85,6 +86,67 @@ def get_feedback_list():
             FROM feedbacks ORDER BY id
             """
         ).fetchall()
+    return [
+        {
+            "id": row[0], "task": row[1], "estimated_minutes": row[2],
+            "actual_minutes": row[3], "status": row[4], "reason": row[5],
+            "completed_subtasks": row[6], "total_subtasks": row[7],
+            "completed_questions": row[8], "total_questions": row[9],
+            "created_at": row[10],
+        }
+        for row in rows
+    ]
+
+
+def _clamp_int(value, default, minimum, maximum):
+    """把参数钳制到 [minimum, maximum]；非法值（非整数/布尔）回退默认值。"""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+
+    return max(minimum, min(value, maximum))
+
+
+def _normalize_days(value):
+    """days 归一化：非整数/布尔、或小于 1 都视为非法，回退 7；大于 30 钳制到 30。"""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return 7
+
+    return min(value, 30)
+
+
+def get_feedback_since(days=7, limit=20):
+    """返回最近 days 天内的反馈，按 created_at 倒序，最多 limit 条。
+
+    - days 默认 7，范围 1~30：非整数/布尔或小于 1 回退 7，大于 30 钳制到 30。
+      调用方即使已经校验过，这里仍然再兜底一次。
+    - limit 默认 20，钳制到 1~20：数据库层不返回无限历史。
+    - created_at 是 datetime.now().isoformat() 写入的“本地无时区”字符串，
+      同格式下字典序等价于时间序，所以这里直接做字符串比较（本阶段不重构时间系统）。
+    - 返回结构与 get_feedback_list() 一致（含 id）；摘要由上层负责，数据库层不做摘要。
+    - 不改动 get_feedback_list()，现有 API 继续依赖它。
+    """
+
+    days = _normalize_days(days)
+    limit = _clamp_int(limit, 20, 1, 20)
+
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, task, estimated_minutes, actual_minutes, status, reason,
+                   completed_subtasks, total_subtasks, completed_questions,
+                   total_questions, created_at
+            FROM feedbacks
+            WHERE created_at >= ?
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (cutoff, limit),
+        ).fetchall()
+
     return [
         {
             "id": row[0], "task": row[1], "estimated_minutes": row[2],

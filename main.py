@@ -24,6 +24,8 @@ from database import (
     migrate_json_to_db,
 )
 
+from feedback_service import calculate_summary
+
 
 app = FastAPI()
 
@@ -40,64 +42,6 @@ app.mount(
 
 init_db()
 migrate_json_to_db()
-
-
-
-def calculate_summary(feedback_list):
-    total_count = len(feedback_list)
-
-    if total_count == 0:
-        return {
-            "total_count": 0,
-            "completed_count": 0,
-            "partial_count": 0,
-            "not_completed_count": 0,
-            "too_difficult_count": 0,
-            "average_estimated_minutes": 0,
-            "average_actual_minutes": 0,
-        }
-
-
-    return {
-        "total_count": total_count,
-
-        "completed_count": sum(
-            item["status"] == "completed"
-            for item in feedback_list
-        ),
-
-        "partial_count": sum(
-            item["status"] == "partial"
-            for item in feedback_list
-        ),
-
-        "not_completed_count": sum(
-            item["status"] == "not_completed"
-            for item in feedback_list
-        ),
-
-        "too_difficult_count": sum(
-            item.get("reason") == "任务难度太高"
-            for item in feedback_list
-        ),
-
-        "average_estimated_minutes": round(
-            sum(
-                item["estimated_minutes"]
-                for item in feedback_list
-            ) / total_count,
-            1
-        ),
-
-        "average_actual_minutes": round(
-            sum(
-                item["actual_minutes"]
-                for item in feedback_list
-            ) / total_count,
-            1
-        ),
-    }
-
 
 
 
