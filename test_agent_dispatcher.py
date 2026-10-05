@@ -64,11 +64,11 @@ database.insert_feedback(
 try:
     # 1. 白名单
     check(
-        "白名单只有两个只读工具",
-        set(agent_dispatcher.TOOLS) == {"get_recent_feedback", "search_knowledge"},
+        "白名单为两个只读工具 + 受确认保护的 save_plan",
+        set(agent_dispatcher.TOOLS) == {"get_recent_feedback", "search_knowledge", "save_plan"},
         f"tools={sorted(agent_dispatcher.TOOLS)}",
     )
-    check("save_plan 不在白名单", "save_plan" not in agent_dispatcher.TOOLS)
+    check("save_plan 已加入白名单", "save_plan" in agent_dispatcher.TOOLS)
     for forbidden in ("insert_feedback", "delete_all_feedback", "init_db", "migrate_json_to_db",
                       "get_embedding", "get_embeddings", "compact_cache", "archive_cache",
                       "save_document", "call_ollama", "validate_plan_for_save"):
@@ -95,8 +95,8 @@ try:
     direct = agent_tools.get_recent_feedback(days=30)
     check("Tool Result 原样透传", outcome["ok"] is True and direct == agent_tools.get_recent_feedback(days=30))
 
-    # 4. 未知 Tool 被拒绝
-    for unknown in ("save_plan", "insert_feedback", "delete_all_feedback", "get_embedding", "随便写的"):
+    # 4. 未知 Tool 被拒绝（save_plan 已注册，不再属于未知工具）
+    for unknown in ("insert_feedback", "delete_all_feedback", "get_embedding", "随便写的"):
         outcome = agent_dispatcher.dispatch({"name": unknown, "arguments": {}})
         check(
             f"未知工具被拒绝: {unknown}",
@@ -172,16 +172,16 @@ try:
     # 7. 返回结构稳定（成功/失败字段完全一致）
     expected_keys = {"ok", "tool", "result", "error", "error_type"}
     success = agent_dispatcher.dispatch({"name": "get_recent_feedback", "arguments": {}})
-    unknown = agent_dispatcher.dispatch({"name": "save_plan", "arguments": {}})
+    invalid_save = agent_dispatcher.dispatch({"name": "save_plan", "arguments": {}})
     invalid = agent_dispatcher.dispatch({"name": "search_knowledge", "arguments": {}})
     check("成功路径结构稳定", set(success) == expected_keys)
-    check("未知工具路径结构稳定", set(unknown) == expected_keys)
+    check("参数不足路径结构稳定", set(invalid_save) == expected_keys)
     check("非法参数路径结构稳定", set(invalid) == expected_keys)
     check(
         "成功时 error 为 None、result 非空",
         success["error"] is None and success["result"] is not None and success["tool"] == "get_recent_feedback",
     )
-    check("失败时 result 为 None", unknown["result"] is None and invalid["result"] is None)
+    check("失败时 result 为 None", invalid_save["result"] is None and invalid["result"] is None)
 
     # 8. 不允许动态执行方式
     dispatcher_source = (PROJECT_DIR / "agent_dispatcher.py").read_text(encoding="utf-8")

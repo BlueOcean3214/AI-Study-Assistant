@@ -6,18 +6,21 @@
 原则：
 - 显式白名单：不使用 getattr / eval / globals / __import__ 这类动态执行方式
 - Schema 负责告诉模型怎么调用，Dispatcher 负责真正拦截非法调用
-- 白名单之外的名字一律拒绝（例如 save_plan、insert_feedback、delete_all_feedback）
+- 白名单之外的名字一律拒绝（例如 insert_feedback、delete_all_feedback）
+- save_plan 是唯一写入口，且没有任何"用户已确认"布尔参数——
+  写权限由服务端确认状态决定，模型参数决定不了（见 confirmation_service）
 - 不破坏 Tool 自身返回结构：成功时 result 原样透传
 """
 
 from agent_schema import ARGUMENT_RULES, TOOL_NAMES
-from agent_tools import get_recent_feedback, search_knowledge
+from agent_tools import get_recent_feedback, save_plan, search_knowledge
 
 
 # 显式白名单：Agent 产生的 tool name 必须在这里
 TOOLS = {
     "get_recent_feedback": get_recent_feedback,
     "search_knowledge": search_knowledge,
+    "save_plan": save_plan,
 }
 
 
@@ -89,6 +92,10 @@ def _validate_arguments(tool_name, arguments):
 
             if len(value) > rule["max_length"]:
                 return None, f"{name} 过长（最多 {rule['max_length']} 个字符）"
+
+        elif rule["type"] == "object":
+            if not isinstance(value, dict):
+                return None, f"{name} 必须是对象"
 
         cleaned[name] = value
 

@@ -1,25 +1,35 @@
 """Agent Tool 层：把现有项目能力包装成少量、稳定、受控的 Tool 接口。
 
-本阶段只做 Tool Layer 基础建设，不实现 Agent Loop、不实现 Tool Calling、不用 LLM 决定调用。
-
-对外只提供三个函数：
+对外提供四个函数：
     get_recent_feedback(days=7)        只读：最近学习反馈 + 确定性统计
     search_knowledge(query, top_k=3)   只读：知识库语义检索（内部复用 rag_service）
     validate_plan_for_save(plan)       只读校验：计划保存前的确定性校验入口
+    save_plan(plan, plan_date, confirmation_id)  唯一写入口：保存"用户已确认"的计划
+
+save_plan 与其他工具的本质区别：
+- 它是 Agent 唯一的写能力，但写权限不来自模型参数
+- 没有 confirmed_by_user 参数：模型输出 true 不构成用户确认
+- confirmation_id 是服务端签发的凭证，由 confirmation_service 校验
+  （存在 / 已确认 / 未过期 / 与 plan+plan_date 绑定匹配），任何一项不满足都拒绝
+- 业务规则（validate_plan、difficult_previous_task、当天 active 唯一）
+  全部由 plan_service 强制执行，本层不做任何放行
 
 设计原则：
 - 薄包装：本层只做参数校验/钳制、结果清洗、错误语义统一，不重新实现数据库或检索逻辑
-- 不暴露底层：不返回数据库 id、向量、缓存、维度、模型指纹，也不提供任何写入/删除入口
-- 不调用 LLM：本层只提供事实，不生成学习内容
+- 不暴露底层：不返回数据库 id（plans 除外，保存成功返回 plan_id）、向量、缓存、维度、模型指纹，
+  也不提供删除入口
+- 不调用 LLM：本层只提供事实与受控写入口，不生成学习内容
 - 参数上限由程序固定，Agent 不能越过（例如不能调低 MIN_SCORE、不能决定是否放宽计划规则）
 
 明确不暴露（见架构审计结论）：
     delete_all_feedback / insert_feedback / init_db / migrate_json_to_db
     embedding_service.get_embedding(s) / vector_cache.* / document_service.*
     call_ollama / generate_next_plan / analyze_feedback / rag_service 的私有函数
+    plan_service.save_plan（旧 API 路径，confirmed_by_user 参数不允许出现在 Agent 工具面）
 """
 
 import embedding_service
+import plan_service
 import rag_service
 import ai_service
 
@@ -286,4 +296,64 @@ def validate_plan_for_save(plan):
     return {
         "valid": bool(validation.get("valid")),
         "reason": validation.get("reason"),
+    }
+
+
+def _save_tool_failure(error_type, message):
+    """save_plan Tool 的统一失败结构（ok/saved/error_type 与成功路径字段兼容）。"""
+
+    return {
+        "ok": False,
+        "saved": False,
+        "error_type": error_type,
+        "error": message,
+    }
+
+
+def save_plan(plan, plan_date, confirmation_id):
+    """Tool：保存一份已经由用户确认的学习计划（Agent 唯一写入口）。
+
+    - 没有 confirmed_by_user 参数：模型输出 true 不构成用户确认，
+      写权限完全来自服务端的确认状态（confirmation_service）
+    - confirmation_id 必须是服务端签发、已被用户确认、未过期、
+      且与 plan+plan_date 绑定匹配的真实凭证；任何一项不满足都拒绝
+    - 保存成功返回 plan_id；确认类失败返回稳定 error_type，不会写库
+    - 业务规则（validate_plan / difficult_previous_task / 当天 active 唯一）
+      全部由 plan_service 强制执行
+
+    返回（统一带 ok + saved）：
+        成功 {"ok": True, "saved": True, "plan_id", "plan_date", "plan"}
+        失败 {"ok": False, "saved": False, "error_type", "error"}
+            error_type:
+              confirmation_required   未确认 / 凭证待确认
+              confirmation_not_found  凭证不存在（伪造 id 也会落到这里）
+              confirmation_expired    凭证已过期
+              confirmation_mismatch   计划或日期与确认凭证不匹配
+              confirmation_already_used  凭证已被使用（一次性）
+              invalid_argument        参数类型非法
+              其余为 plan_service 的稳定错误（validation_error 等）
+    """
+
+    if not isinstance(plan, dict):
+        return _save_tool_failure("invalid_argument", "plan 必须是对象")
+
+    if not isinstance(plan_date, str) or not plan_date.strip():
+        return _save_tool_failure("invalid_argument", "plan_date 必须是非空字符串")
+
+    if not isinstance(confirmation_id, str) or not confirmation_id.strip():
+        return _save_tool_failure(
+            "confirmation_required",
+            "缺少 confirmation_id：保存计划需要用户确认后由系统签发的凭证",
+        )
+
+    result = plan_service.save_plan_with_confirmation(plan, plan_date.strip(), confirmation_id.strip())
+
+    if result.get("saved"):
+        return {"ok": True, **result}
+
+    return {
+        "ok": False,
+        "saved": False,
+        "error_type": result.get("error_type"),
+        "error": result.get("message"),
     }

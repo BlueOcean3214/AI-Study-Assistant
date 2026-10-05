@@ -320,6 +320,102 @@
             border-radius: 14px;
             background: #fff1f1;
             color: #a33;
+            margin-bottom: 14px;
+        }
+
+        /* 草案与确认（第三阶段 C2） */
+
+        .saved-tag {
+            display: none;
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 20px;
+            padding: 4px 9px;
+            font-size: 12px;
+        }
+
+        .draft-card {
+            background: #28513b;
+            color: white;
+            border-radius: 20px;
+            padding: 20px;
+            margin-bottom: 12px;
+        }
+
+        .draft-status-tag {
+            display: inline-block;
+            background: rgba(255,255,255,0.18);
+            border-radius: 20px;
+            padding: 5px 10px;
+            font-size: 12px;
+            margin-bottom: 12px;
+        }
+
+        .draft-answer {
+            background: #eaf3ec;
+            color: #56705f;
+            border-radius: 18px;
+            padding: 16px;
+            margin-bottom: 14px;
+            font-size: 14px;
+            line-height: 1.7;
+        }
+
+        .draft-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 16px;
+        }
+
+        .confirm-button {
+            flex: 1.4;
+            padding: 14px;
+            border: none;
+            border-radius: 13px;
+            background: white;
+            color: #28513b;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .regenerate-button {
+            flex: 1;
+            padding: 14px;
+            border: 1px solid rgba(255,255,255,0.45);
+            border-radius: 13px;
+            background: transparent;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .confirm-button:disabled,
+        .regenerate-button:disabled,
+        .generate-button:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+
+        .generate-button {
+            width: 100%;
+            padding: 15px;
+            border: none;
+            border-radius: 14px;
+            background: #28513b;
+            color: white;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        .idle-hint {
+            background: white;
+            border-radius: 18px;
+            padding: 18px;
+            margin-bottom: 14px;
+            color: #666;
+            font-size: 14px;
+            line-height: 1.7;
         }
 
     </style>
@@ -486,15 +582,131 @@
     </div>
 
 
-    <!-- AI任务 -->
+    <!-- AI任务（第三阶段 C2：服务端优先 + 草案确认闭环） -->
+
+    <div
+        id="planError"
+        class="error"
+        style="display:none;"
+    >
+    </div>
 
     <div
         id="loading"
         class="loading"
     >
-        正在生成今日计划...
+        正在加载今日计划...
     </div>
 
+
+    <!-- 视图一：无计划（可生成草案） -->
+
+    <div
+        id="idleContent"
+        style="display:none;"
+    >
+
+        <div class="idle-hint">
+            今天还没有学习计划。<br>
+            AI 会先读取你最近的学习反馈，生成一份计划草案；你确认后才会保存。
+        </div>
+
+        <button
+            id="generateButton"
+            class="generate-button"
+            onclick="generatePlanDraft()"
+        >
+            生成今日计划草案
+        </button>
+
+    </div>
+
+
+    <!-- 视图二：待确认草案（尚未保存） -->
+
+    <div
+        id="draftContent"
+        style="display:none;"
+    >
+
+        <div class="section-header">
+
+            <strong>
+                AI 为你生成了今日计划
+            </strong>
+
+        </div>
+
+        <div class="draft-answer" id="draftAnswer">
+        </div>
+
+        <div class="draft-card">
+
+            <div class="important-top">
+
+                <div class="draft-status-tag">
+                    待确认 · 尚未保存
+                </div>
+
+                <div class="do-first">
+                    先做这一件
+                </div>
+
+            </div>
+
+
+            <div
+                id="draftTask"
+                class="task-title"
+            >
+            </div>
+
+
+            <div
+                id="draftMeta"
+                class="task-meta"
+                style="color: rgba(255,255,255,0.85); font-size: 13px; margin-bottom: 14px;"
+            >
+            </div>
+
+
+            <div id="draftSubtasks">
+            </div>
+
+
+            <div
+                id="draftCriteria"
+                style="font-size: 12px; opacity: 0.85; line-height: 1.6; margin-top: 12px;"
+            >
+            </div>
+
+
+            <div class="draft-actions">
+
+                <button
+                    id="confirmButton"
+                    class="confirm-button"
+                    onclick="confirmAndSavePlan()"
+                >
+                    确认并保存
+                </button>
+
+                <button
+                    id="regenerateButton"
+                    class="regenerate-button"
+                    onclick="generatePlanDraft()"
+                >
+                    重新生成
+                </button>
+
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- 视图三：已保存计划（服务端恢复） -->
 
     <div
         id="planContent"
@@ -523,8 +735,12 @@
                         数学二 · 今日最重要任务
                     </div>
 
-                    <div class="do-first">
-                        先做这一件
+                    <div
+                        id="savedTag"
+                        class="saved-tag"
+                        style="display:none;"
+                    >
+                        已保存
                     </div>
 
                 </div>
@@ -563,167 +779,23 @@
 
         </div>
 
-
-        <!-- 其他任务 -->
-
-        <div class="other-section">
-
-            <div class="section-header">
-
-                <strong>
-                    其他学习任务
-                </strong>
-
-                <span>
-                    2项 · 共75分钟
-                </span>
-
-            </div>
-
-
-            <div class="other-task">
-
-                <div>
-
-                    <div class="other-title">
-                        精读一篇阅读，整理生词
-                    </div>
-
-                    <div class="other-meta">
-                        英语二 · 45分钟 · 未开始
-                    </div>
-
-                </div>
-
-                <div class="other-icon">
-                    📖
-                </div>
-
-            </div>
-
-
-            <div class="other-task">
-
-                <div>
-
-                    <div class="other-title">
-                        复习唯物论，完成10道选择题
-                    </div>
-
-                    <div class="other-meta">
-                        思想政治理论 · 30分钟 · 未开始
-                    </div>
-
-                </div>
-
-                <div class="other-icon">
-                    📝
-                </div>
-
-            </div>
-
-
-            <div class="other-note">
-                设计专业基础今天不加任务，留到明天再安排。
-            </div>
-
-        </div>
-
     </div>
 
 
 </div>
 
 
+<script src="/app/plan-confirmation.js"></script>
+
 <script>
 
+    /*
+     * 第三阶段 C2：
+     * - 计划的生成 / 确认 / 保存流程在 plan-confirmation.js
+     * - 页面加载：GET /plan（服务端优先恢复）-> 无计划则进入草案流程
+     */
 
-async function loadPlan() {
-
-    try {
-
-        const response =
-            await fetch("/next-plan");
-
-        const data =
-            await response.json();
-
-        if (!response.ok || !data.next_plan) {
-            throw new Error(
-                data.message || "服务器没有返回有效的学习计划"
-            );
-        }
-
-        const plan =
-            data.next_plan;
-
-
-        /*
-         * 保存当前计划
-         * 后面的任务详情、学习中、反馈页面
-         * 都使用这一份计划。
-         */
-
-        sessionStorage.setItem(
-            "current_plan",
-            JSON.stringify(data.next_plan)
-        );
-
-
-        document.getElementById("loading")
-            .style.display = "none";
-
-        document.getElementById("planContent")
-            .style.display = "block";
-
-
-        document.getElementById("taskTitle")
-            .textContent = plan.task;
-
-
-        document.getElementById("taskMeta")
-            .textContent =
-                "数学二 · 预计"
-                + plan.estimated_minutes
-                + "分钟 · 未开始";
-
-
-        document.getElementById("taskReason")
-            .textContent =
-                plan.reason;
-
-
-    } catch (error) {
-
-        document.getElementById("loading")
-            .style.display = "none";
-
-        document.getElementById("planContent")
-            .style.display = "block";
-
-        document.getElementById("planContent")
-            .innerHTML =
-                '<div class="error">'
-                + '暂时无法生成今日计划：'
-                + error.message
-                + '</div>';
-
-        console.error(error);
-
-    }
-
-}
-
-
-function startTask() {
-
-    window.location.href =
-        "/app/detail.html";
-
-}
-
-
-loadPlan();
+    initPlanPage();
 
 </script>
 

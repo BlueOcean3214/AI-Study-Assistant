@@ -17,6 +17,9 @@ feedback_backup.json
 # Embedding 向量缓存（本地生成，可随时删除重建）
 .rag_cache/
 
+# Agent 评测运行归档（本地生成）
+agent_eval_runs/
+
 # Test/build artifacts
 .pytest_cache/
 .coverage

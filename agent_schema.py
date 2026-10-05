@@ -3,12 +3,17 @@
 只描述工具，不包含执行逻辑：
     执行在 agent_tools.py，派发在 agent_dispatcher.py。
 
-当前只开放两个只读工具：
-    get_recent_feedback
-    search_knowledge
+当前开放的工具：
+    get_recent_feedback          只读：学习反馈
+    search_knowledge             只读：知识库检索
+    save_plan                    写入：保存"用户已确认"的计划（凭证由服务端校验）
 
-validate_plan_for_save 暂不作为 LLM Tool：它是内部确定性校验能力，
-本阶段没有 save_plan，开放它只会浪费一次 Tool Call。
+save_plan 的 Schema 里只有 plan / plan_date / confirmation_id 三个参数，
+刻意不出现 confirmed_by_user：模型输出 true 不构成用户确认，
+confirmation_id 只是"凭证引用"，服务端负责判断它是否真实存在且已确认。
+
+validate_plan_for_save 仍不作为 LLM Tool：它是内部确定性校验能力，
+开放它只会浪费一次 Tool Call。
 
 Schema 中不出现：embedding / vector / cache / MIN_SCORE / SQLite / 数据库路径 / 内部函数名。
 参数范围直接引用 agent_tools 里的常量，避免说明书和真实实现脱节。
@@ -66,11 +71,45 @@ TOOL_SCHEMAS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_plan",
+            "description": (
+                "保存一份已经由用户确认的学习计划。必须提供系统签发且用户已确认的 "
+                "confirmation_id；没有有效确认时保存会被拒绝，此时应告知用户先在界面上确认计划"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "object",
+                        "description": (
+                            "要保存的计划对象，字段与规则和计划草案一致"
+                            "（task、estimated_minutes、difficulty、question_count、"
+                            "reason、completion_criteria、subtasks）"
+                        ),
+                    },
+                    "plan_date": {
+                        "type": "string",
+                        "description": "计划日期，YYYY-MM-DD 格式",
+                    },
+                    "confirmation_id": {
+                        "type": "string",
+                        "description": (
+                            "用户确认后由系统签发的确认凭证；自己编造的 id 无效"
+                        ),
+                    },
+                },
+                "required": ["plan", "plan_date", "confirmation_id"],
+            },
+        },
+    },
 ]
 
 
 # 开放给 LLM 的工具名（白名单的唯一来源）
-TOOL_NAMES = ("get_recent_feedback", "search_knowledge")
+TOOL_NAMES = ("get_recent_feedback", "search_knowledge", "save_plan")
 
 
 # Dispatcher 用的参数守门规则（与上面的 parameters 描述一一对应，
@@ -96,6 +135,24 @@ ARGUMENT_RULES = {
             "min": 1,
             "max": MAX_TOP_K,
             "required": False,
+        },
+    },
+    "save_plan": {
+        "plan": {
+            "type": "object",
+            "required": True,
+        },
+        "plan_date": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 10,
+            "required": True,
+        },
+        "confirmation_id": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 128,
+            "required": True,
         },
     },
 }

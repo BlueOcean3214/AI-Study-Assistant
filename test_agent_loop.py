@@ -77,7 +77,7 @@ def scripted(responses, fallback=None):
 
     seen = []
 
-    def fake(messages, tools=None):
+    def fake(messages, tools=None, deadline=None):
         seen.append(copy.deepcopy(messages))
         index = len(seen) - 1
 
@@ -215,7 +215,7 @@ try:
     check("检索结果进入 steps", result["steps"][0]["result"]["count"] >= 0)
 
     # 1.4 第二个 Tool 由第一个 Tool Result 动态决定
-    def dynamic_llm(messages, tools=None):
+    def dynamic_llm(messages, tools=None, deadline=None):
         tool_results = [m for m in messages if m.get("role") == "tool"]
 
         if not tool_results:
@@ -372,13 +372,14 @@ try:
     check("异常后仍然完成回答", result["stopped_reason"] == "final_answer" and "工具出错" in result["final_answer"])
 
     # 1.10 未注册 Tool 被拒绝，且不产生任何写操作
+    #（save_plan 已在第三阶段 C1 注册为受确认保护的写入工具，这里改用真正的破坏性工具名）
     rows_before = database.get_feedback_list()
     fake, seen = scripted([
-        tool_call("save_plan", {"plan": {"task": "x"}}),
-        final("我不能保存学习计划。"),
+        tool_call("insert_feedback", {"task": "x"}),
+        final("我不能写入学习反馈。"),
     ])
     with stub_llm(fake):
-        result = agent_loop.run_agent("帮我保存计划", verbose=False)
+        result = agent_loop.run_agent("帮我把这条反馈写进数据库", verbose=False)
 
     check(
         "未注册工具被拒绝",
@@ -389,7 +390,7 @@ try:
     check("未注册工具没有造成写操作", database.get_feedback_list() == rows_before)
 
     # 1.11 LLM 调用失败
-    def failing_llm(messages, tools=None):
+    def failing_llm(messages, tools=None, deadline=None):
         return None, "无法连接 Ollama（ConnectionError）"
 
     with stub_llm(failing_llm):
@@ -424,7 +425,18 @@ try:
         set(agent_dispatcher.TOOLS) == set(agent_schema.TOOL_NAMES),
         f"dispatcher={sorted(agent_dispatcher.TOOLS)}",
     )
-    check("save_plan 不在任何工具面", "save_plan" not in agent_dispatcher.TOOLS and "save_plan" not in agent_schema.TOOL_NAMES)
+    check(
+        "save_plan 已注册且受确认保护（Tool 面无 confirmed_by_user）",
+        "save_plan" in agent_dispatcher.TOOLS
+        and "save_plan" in agent_schema.TOOL_NAMES
+        and "confirmed_by_user" not in json.dumps(agent_schema.TOOL_SCHEMAS, ensure_ascii=False),
+    )
+    check(
+        "破坏性工具仍然不在工具面",
+        "insert_feedback" not in agent_dispatcher.TOOLS
+        and "delete_all_feedback" not in agent_dispatcher.TOOLS
+        and "insert_feedback" not in agent_schema.TOOL_NAMES,
+    )
 
     # 1.15 只读：脚本化整段跑完后数据库与知识库没变
     seed_feedback()
@@ -444,6 +456,162 @@ try:
     check("Loop 不写数据库", database.get_feedback_list() == rows_before)
     check(
         "Loop 不修改知识库",
+        sorted(
+            (path.relative_to(KNOWLEDGE_DIR).as_posix(), path.stat().st_size)
+            for path in KNOWLEDGE_DIR.rglob("*.txt")
+        ) == knowledge_before,
+    )
+
+    # ==========================
+    # 1.16 来源完整性：Prompt 里必须有对应规则
+    # ==========================
+
+    prompt = agent_loop.SYSTEM_PROMPT
+    check("Prompt 含来源完整性规则", "不得声称答案来自知识库" in prompt)
+    check("Prompt 含检索失败必须说明", "知识库检索当前不可用" in prompt)
+    check("Prompt 仍允许通用概念直接回答", "通用概念问题" in prompt and "直接回答" in prompt)
+    check("Prompt 保留了明确要求知识库时必须调用", "必须真实调用 search_knowledge" in prompt)
+    check("Prompt 没有写成“概念问题一律不检索”", "一律不" not in prompt)
+
+    # ==========================
+    # 1.17 墙钟预算（确定性，不真的等待）
+    # ==========================
+
+    class FakeClock:
+        """可手动推进的单调时钟。"""
+
+        def __init__(self, now=0.0):
+            self.now = now
+
+        def __call__(self):
+            return self.now
+
+        def advance(self, seconds):
+            self.now += seconds
+
+    # 1.17.1 正常 Run 不受影响
+    fake, seen = scripted([final("正常回答")])
+    with stub_llm(fake):
+        result = agent_loop.run_agent("随便问", verbose=False, clock=FakeClock())
+
+    check("正常 Run 不触发超时", result["stopped_reason"] == "final_answer" and result["error_type"] is None)
+
+    # 1.17.2 单次慢 LLM 会被 deadline 截断（真实等待只需要 0.3 秒）
+    def slow_llm(messages, tools=None, deadline=None):
+        time.sleep(5)
+        return final("慢回答"), None
+
+    started = time.monotonic()
+    with stub_llm(slow_llm):
+        result = agent_loop.run_agent("随便问", verbose=False, max_run_seconds=0.3)
+    elapsed = time.monotonic() - started
+
+    check("慢 LLM 被 deadline 截断", result["stopped_reason"] == "run_timeout", f"reason={result['stopped_reason']}")
+    check("慢 LLM 截断耗时接近预算", elapsed < 3, f"elapsed={elapsed:.2f}s")
+    check("慢 LLM 超时有稳定错误类型", result["error_type"] == agent_loop.AGENT_TIMEOUT)
+    check("慢 LLM 超时错误信息明确", "Agent run exceeded" in result["error"], f"error={result['error']}")
+    check(
+        "超时回答是确定性说明且不声称知识库",
+        "超时" in result["final_answer"] and "知识库" not in result["final_answer"],
+        f"answer={result['final_answer'][:60]}",
+    )
+
+    # 1.17.3 单次慢 Tool 会被 deadline 截断
+    original_tools = dict(agent_dispatcher.TOOLS)
+
+    def slow_tool(**kwargs):
+        time.sleep(5)
+        return {"slow": True}
+
+    agent_dispatcher.TOOLS["get_recent_feedback"] = slow_tool
+    try:
+        fake, seen = scripted([tool_call("get_recent_feedback", {"days": 7})])
+        started = time.monotonic()
+        with stub_llm(fake):
+            result = agent_loop.run_agent("看看最近情况", verbose=False, max_run_seconds=0.3)
+        elapsed = time.monotonic() - started
+    finally:
+        agent_dispatcher.TOOLS.clear()
+        agent_dispatcher.TOOLS.update(original_tools)
+
+    check("慢 Tool 被 deadline 截断", result["stopped_reason"] == "run_timeout", f"reason={result['stopped_reason']}")
+    check("慢 Tool 截断耗时接近预算", elapsed < 3, f"elapsed={elapsed:.2f}s")
+    check("被截断的 Tool 没有计入 steps", result["steps"] == [] and result["tool_calls"] == 0)
+
+    # 1.17.4 连续多个正常步骤累计超过 deadline -> 停止（且不再调用 Tool）
+    clock = FakeClock()
+    dispatch_calls = {"count": 0}
+    original_dispatch = agent_loop.dispatch
+
+    def counting_dispatch(tool_call):
+        dispatch_calls["count"] += 1
+        return original_dispatch(tool_call)
+
+    def advancing_llm(messages, tools=None, deadline=None):
+        clock.advance(50)
+        return tool_call("get_recent_feedback", {"days": 7}), None
+
+    agent_loop.dispatch = counting_dispatch
+    try:
+        with stub_llm(advancing_llm):
+            result = agent_loop.run_agent("看看最近情况", verbose=False, max_run_seconds=120, clock=clock)
+    finally:
+        agent_loop.dispatch = original_dispatch
+
+    check("累计超时被截断", result["stopped_reason"] == "run_timeout", f"reason={result['stopped_reason']}")
+    check("累计超时后不再调用 Tool", result["tool_calls"] == 2 and dispatch_calls["count"] == 2, f"tool_calls={result['tool_calls']}")
+
+    # 1.17.5 timeout 后错误结构稳定
+    check(
+        "超时结果字段稳定",
+        {"ok", "final_answer", "stopped_reason", "error", "error_type", "tool_calls", "loop_turns",
+         "wrap_up_used", "steps", "messages"} <= set(result),
+        f"keys={sorted(result)}",
+    )
+    check("超时 ok=False", result["ok"] is False)
+    check("超时不会被误判成没有知识", result["error_type"] != "embedding_service_unavailable")
+
+    # 1.17.6 wrap-up 同样受 deadline 约束
+    clock = FakeClock()
+    llm_calls = {"count": 0}
+    two_tools = multi_tool_call(
+        ("get_recent_feedback", {"days": 7}),
+        ("search_knowledge", {"query": "定积分"}),
+    )
+
+    def budget_llm(messages, tools=None, deadline=None):
+        llm_calls["count"] += 1
+        clock.advance(45)
+        return two_tools, None
+
+    with stub_llm(budget_llm):
+        result = agent_loop.run_agent("随便问", verbose=False, max_run_seconds=120, clock=clock)
+
+    check("wrap-up 被 deadline 阻止", result["wrap_up_used"] is False, f"wrap_up={result['wrap_up_used']}")
+    check("wrap-up 没有发出额外 LLM 调用", llm_calls["count"] == 3, f"llm_calls={llm_calls['count']}")
+    check("wrap-up 被阻止时报告超时", result["stopped_reason"] == "run_timeout", f"reason={result['stopped_reason']}")
+
+    # 1.17.7 超时不会产生数据库/知识库写入
+    seed_feedback()
+    rows_before = database.get_feedback_list()
+    knowledge_before = sorted(
+        (path.relative_to(KNOWLEDGE_DIR).as_posix(), path.stat().st_size)
+        for path in KNOWLEDGE_DIR.rglob("*.txt")
+    )
+
+    clock = FakeClock()
+
+    def slow_tool_llm(messages, tools=None, deadline=None):
+        clock.advance(200)
+        return tool_call("get_recent_feedback", {"days": 7}), None
+
+    with stub_llm(slow_tool_llm):
+        result = agent_loop.run_agent("看看最近情况", verbose=False, max_run_seconds=120, clock=clock)
+
+    check("超时路径确实触发", result["stopped_reason"] == "run_timeout")
+    check("超时没有写数据库", database.get_feedback_list() == rows_before)
+    check(
+        "超时没有改知识库",
         sorted(
             (path.relative_to(KNOWLEDGE_DIR).as_posix(), path.stat().st_size)
             for path in KNOWLEDGE_DIR.rglob("*.txt")

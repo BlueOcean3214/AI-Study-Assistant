@@ -9,7 +9,7 @@
 - 结束时会校验真实 feedback.db / knowledge/ / .rag_cache 完全没有被改动
 
 覆盖：get_recent_feedback（11 项）、search_knowledge（12 项）、validate_plan_for_save（7 项）
-以及架构约束（Tool 面只有三个函数、不得暴露禁用函数、main 只做 import）。
+以及架构约束（Tool 面为三个只读函数 + 受确认保护的 save_plan、不得暴露禁用函数、main 只做 import）。
 """
 
 import gc
@@ -536,8 +536,10 @@ try:
         and getattr(value, "__module__", None) == agent_tools.__name__
     }
     check(
-        "Tool 面只有三个函数",
-        public_tools == {"get_recent_feedback", "search_knowledge", "validate_plan_for_save"},
+        "Tool 面为三个只读函数 + 受确认保护的 save_plan",
+        public_tools == {
+            "get_recent_feedback", "search_knowledge", "validate_plan_for_save", "save_plan",
+        },
         f"public={sorted(public_tools)}",
     )
 

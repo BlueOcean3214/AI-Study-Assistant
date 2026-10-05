@@ -21,10 +21,10 @@ schemas = agent_schema.get_tool_schemas()
 by_name = {schema["function"]["name"]: schema for schema in schemas}
 
 # 1. 工具名称正确
-check("Schema 数量为 2", len(schemas) == 2, f"n={len(schemas)}")
+check("Schema 数量为 3", len(schemas) == 3, f"n={len(schemas)}")
 check(
     "工具名称正确",
-    set(by_name) == {"get_recent_feedback", "search_knowledge"},
+    set(by_name) == {"get_recent_feedback", "search_knowledge", "save_plan"},
     f"names={sorted(by_name)}",
 )
 check("TOOL_NAMES 与 Schema 一致", set(agent_schema.TOOL_NAMES) == set(by_name))
@@ -67,10 +67,34 @@ check(
     f"schema={sorted(by_name)} dispatcher={sorted(DISPATCHER_TOOLS)}",
 )
 check("validate_plan_for_save 未作为 LLM Tool", "validate_plan_for_save" not in by_name)
-check("save_plan 未作为 LLM Tool", "save_plan" not in by_name)
+check("save_plan 已作为受确认保护的 Tool", "save_plan" in by_name)
 check(
     "没有多余工具",
-    set(agent_schema.TOOL_NAMES) == {"get_recent_feedback", "search_knowledge"},
+    set(agent_schema.TOOL_NAMES) == {"get_recent_feedback", "search_knowledge", "save_plan"},
+)
+
+# 4.1 save_plan 的参数面：只有 plan/plan_date/confirmation_id，绝不出现 confirmed_by_user
+save_params = by_name["save_plan"]["function"]["parameters"]
+check(
+    "save_plan 只有 plan/plan_date/confirmation_id",
+    set(save_params["properties"]) == {"plan", "plan_date", "confirmation_id"},
+    f"properties={sorted(save_params['properties'])}",
+)
+check(
+    "save_plan 三个参数全部必填",
+    save_params.get("required") == ["plan", "plan_date", "confirmation_id"],
+    f"required={save_params.get('required')}",
+)
+check(
+    "save_plan 参数声明类型正确",
+    save_params["properties"]["plan"]["type"] == "object"
+    and save_params["properties"]["plan_date"]["type"] == "string"
+    and save_params["properties"]["confirmation_id"]["type"] == "string",
+)
+check(
+    "save_plan 守门规则与 Schema 对齐",
+    set(agent_schema.ARGUMENT_RULES["save_plan"]) == {"plan", "plan_date", "confirmation_id"}
+    and all(rule.get("required") for rule in agent_schema.ARGUMENT_RULES["save_plan"].values()),
 )
 
 # 5. Schema 不暴露内部细节
@@ -132,8 +156,10 @@ check(
 # 9. describe_tools 供系统 Prompt 使用
 description = agent_schema.describe_tools()
 check(
-    "describe_tools 包含两个工具",
-    "get_recent_feedback" in description and "search_knowledge" in description,
+    "describe_tools 包含三个工具",
+    "get_recent_feedback" in description
+    and "search_knowledge" in description
+    and "save_plan" in description,
 )
 
 print("\n全部用例通过")

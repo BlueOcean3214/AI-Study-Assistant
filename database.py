@@ -1,11 +1,24 @@
 import json
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 
 
-DATABASE_PATH = Path(__file__).resolve().parent / "feedback.db"
+# 数据库路径：默认项目根目录下的 feedback.db。
+# 可用环境变量 FEEDBACK_DB_PATH 覆盖（测试隔离 / 部署配置用，与 RAG_CACHE_DIR 同一风格）。
+DATABASE_PATH = Path(
+    os.environ.get("FEEDBACK_DB_PATH")
+    or (Path(__file__).resolve().parent / "feedback.db")
+)
 BACKUP_PATH = Path(__file__).resolve().parent / "feedback_backup.json"
+
+# plans.status 允许值
+PLAN_STATUS_ACTIVE = "active"
+
+
+class ActivePlanExistsError(RuntimeError):
+    """同一天已经存在 active plan。"""
 
 
 def init_db():
@@ -42,6 +55,36 @@ def init_db():
             conn.execute(
                 f"ALTER TABLE feedbacks ADD COLUMN {column_name} {column_definition}"
             )
+
+    # 学习计划（与 feedbacks 暂时是两个独立实体，不互相引用）
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_date TEXT NOT NULL,
+            task TEXT NOT NULL,
+            estimated_minutes INTEGER NOT NULL,
+            difficulty TEXT NOT NULL,
+            question_count INTEGER NOT NULL,
+            reason TEXT,
+            completion_criteria TEXT,
+            subtasks_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    # 同一天最多一条 active plan：用 partial unique index，而不是 UNIQUE(plan_date)，
+    # 这样将来同一天可以同时保留 completed / cancelled 的历史计划。
+    # （当前 SQLite 3.50.4 支持 partial index，无需退化为“事务 + 检查”）
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_active_date
+        ON plans(plan_date) WHERE status = 'active'
+        """
+    )
+
     conn.commit()
     conn.close()
 
@@ -182,3 +225,106 @@ def insert_feedback(feedback_data, created_at):
 def delete_all_feedback():
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.execute("DELETE FROM feedbacks")
+
+
+# ==========================
+# plans：学习计划持久化
+# ==========================
+
+
+def _plan_row_to_dict(row):
+    """plans 行 -> 业务字典（subtasks_json 原样返回，由上层解析）。"""
+
+    return {
+        "id": row[0],
+        "plan_date": row[1],
+        "task": row[2],
+        "estimated_minutes": row[3],
+        "difficulty": row[4],
+        "question_count": row[5],
+        "reason": row[6],
+        "completion_criteria": row[7],
+        "subtasks_json": row[8],
+        "status": row[9],
+        "created_at": row[10],
+    }
+
+
+def get_active_plan_row(plan_date):
+    """读取指定日期的 active plan，返回 dict 或 None。"""
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT id, plan_date, task, estimated_minutes, difficulty, question_count,
+                   reason, completion_criteria, subtasks_json, status, created_at
+            FROM plans
+            WHERE plan_date = ? AND status = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (plan_date, PLAN_STATUS_ACTIVE),
+        ).fetchone()
+
+    return _plan_row_to_dict(row) if row else None
+
+
+def insert_plan(plan_date, plan, created_at, status=PLAN_STATUS_ACTIVE):
+    """在同一个写事务里检查“当天 active plan 唯一”并插入，返回新的 plan id。
+
+    plan 是已归一化的计划字典，必须包含：
+        task / estimated_minutes / difficulty / question_count /
+        reason / completion_criteria / subtasks_json
+
+    - 显式 BEGIN IMMEDIATE：写事务立即取锁，避免并发下两个请求都通过检查
+    - 事务内先 SELECT 检查，再 INSERT；partial unique index 是最后一道防线
+    - 冲突抛 ActivePlanExistsError；其他 sqlite3 错误原样抛出（由上层转 database_error）
+    """
+
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.isolation_level = None  # 手动管理事务
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = conn.execute(
+            "SELECT id FROM plans WHERE plan_date = ? AND status = ?",
+            (plan_date, PLAN_STATUS_ACTIVE),
+        ).fetchone()
+
+        if existing:
+            conn.rollback()
+            raise ActivePlanExistsError(f"{plan_date} 已经存在 active plan")
+
+        cursor = conn.execute(
+            """
+            INSERT INTO plans
+            (plan_date, task, estimated_minutes, difficulty, question_count,
+             reason, completion_criteria, subtasks_json, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan_date, plan["task"], plan["estimated_minutes"], plan["difficulty"],
+                plan["question_count"], plan["reason"], plan["completion_criteria"],
+                plan["subtasks_json"], status, created_at,
+            ),
+        )
+
+        conn.commit()
+
+        return cursor.lastrowid
+    except ActivePlanExistsError:
+        raise
+    except sqlite3.IntegrityError as error:
+        conn.rollback()
+
+        # 只有唯一索引冲突才是“当天已有 active plan”，其他约束错误照实抛出
+        if "UNIQUE" in str(error).upper():
+            raise ActivePlanExistsError(f"{plan_date} 已经存在 active plan") from error
+
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
