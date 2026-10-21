@@ -1,0 +1,33 @@
+# 敏感与本地数据：绝不进入镜像
+.env
+.env.*
+!.env.example
+feedback.db
+feedback.db-*
+feedback_backup.json
+*.sqlite
+*.sqlite3
+
+# 向量缓存 / 运行时产物
+.rag_cache/
+agent_eval_runs/
+rag_metrics.jsonl
+rag_mode_eval_results.json
+agent_compare_results*.json
+_test_*
+_test_cache_*
+_reg*.txt
+*.bak
+
+# 开发环境
+.venv/
+__pycache__/
+*.py[cod]
+.idea/
+.pip_tmp/
+.workbuddy/
+.git/
+.pytest_cache/
+Dockerfile
+.dockerignore
+README.md

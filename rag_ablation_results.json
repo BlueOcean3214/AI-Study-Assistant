@@ -1,0 +1,53 @@
+{
+  "generated_at": "2026-10-19T20:09:40",
+  "mode": "mock-rerank",
+  "top_k": 3,
+  "n_cases": 22,
+  "skipped_configs": [],
+  "summary": {
+    "vector": {
+      "n_answered": 18,
+      "n_expect_empty": 4,
+      "recall@1": 1.0,
+      "recall@3": 1.0,
+      "precision@3": 0.7222,
+      "mrr": 1.0,
+      "ndcg@3": 1.0,
+      "empty_accuracy": 1.0,
+      "latency_ms_p50": 2070.8
+    },
+    "hybrid": {
+      "n_answered": 18,
+      "n_expect_empty": 4,
+      "recall@1": 1.0,
+      "recall@3": 1.0,
+      "precision@3": 0.7407,
+      "mrr": 1.0,
+      "ndcg@3": 1.0,
+      "empty_accuracy": 1.0,
+      "latency_ms_p50": 2070.1
+    },
+    "vector+rerank": {
+      "n_answered": 18,
+      "n_expect_empty": 4,
+      "recall@1": 1.0,
+      "recall@3": 1.0,
+      "precision@3": 0.7222,
+      "mrr": 1.0,
+      "ndcg@3": 1.0,
+      "empty_accuracy": 1.0,
+      "latency_ms_p50": 2067.1
+    },
+    "hybrid+rerank": {
+      "n_answered": 18,
+      "n_expect_empty": 4,
+      "recall@1": 1.0,
+      "recall@3": 1.0,
+      "precision@3": 0.7407,
+      "mrr": 1.0,
+      "ndcg@3": 1.0,
+      "empty_accuracy": 1.0,
+      "latency_ms_p50": 2075.2
+    }
+  }
+}

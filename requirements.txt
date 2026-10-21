@@ -3,3 +3,14 @@ pydantic>=2.7,<3.0
 python-multipart>=0.0.18,<1.0
 requests>=2.31,<3.0
 uvicorn[standard]>=0.30,<1.0
+# 线上 OpenAI 兼容 API 模式（LLM_PROVIDER=openai_compatible）复用官方 SDK
+openai>=3.19,<4.0
+# 混合检索：中文分词 + BM25 关键词检索（RAG_RETRIEVAL_MODE=hybrid）
+jieba>=0.42,<1.0
+rank-bm25>=0.2.2,<0.3
+# LangChain 只读 Agent 实验路径（阶段 D，默认不启用）
+langchain>=1.4,<2.0
+langchain-openai>=1.7,<2.0
+# LangGraph 计划草案工作流（实验路径）与 LlamaIndex RAG 适配（实验路径）
+langgraph>=1.2,<2.0
+llama-index-core>=0.14,<1.0

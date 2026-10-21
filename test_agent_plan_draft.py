@@ -16,6 +16,14 @@
 - 最多修正 2 次，仍失败返回稳定 plan_error
 """
 
+import os
+
+# 测试夹具：真实模型/Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
+
 import contextlib
 import copy
 import gc
@@ -23,6 +31,7 @@ import json
 import shutil
 import sqlite3
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import agent_dispatcher
@@ -51,6 +60,14 @@ def check(name, condition, detail=""):
     if not condition:
         raise AssertionError(f"FAILED: {name} {detail}")
     print(f"PASS: {name} {detail}")
+
+
+def days_ago(days, hour=9):
+    """夹具时间戳：相对“今天”生成，保证 get_recent_feedback(days=7) 的时间窗内始终有效。"""
+
+    moment = datetime.now() - timedelta(days=days)
+
+    return moment.replace(hour=hour, minute=0, second=0, microsecond=0).isoformat()
 
 
 def info(name, detail):
@@ -191,7 +208,7 @@ def seed_difficult_latest():
             "completed_questions": 4,
             "total_questions": 4,
         },
-        "2026-10-04T20:00:00",
+        days_ago(2, hour=20),
     )
     database.insert_feedback(
         {
@@ -205,7 +222,7 @@ def seed_difficult_latest():
             "completed_questions": 2,
             "total_questions": 4,
         },
-        "2026-10-05T09:00:00",
+        days_ago(1),
     )
 
 
@@ -225,7 +242,7 @@ def seed_easy_latest():
             "completed_questions": 3,
             "total_questions": 3,
         },
-        "2026-10-05T09:00:00",
+        days_ago(1),
     )
 
 

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>知识问答 - AI Study Assistant</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; background: #f5f6f8; color: #222; }
+  header { background: #2c5f8a; color: #fff; padding: 14px 24px; }
+  header a { color: #cfe3f5; margin-right: 16px; text-decoration: none; }
+  main { max-width: 860px; margin: 24px auto; padding: 0 16px; }
+  .card { background: #fff; border-radius: 10px; padding: 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); margin-bottom: 16px; }
+  textarea { width: 100%; box-sizing: border-box; border: 1px solid #ccd5dd; border-radius: 8px; padding: 10px; font-size: 15px; resize: vertical; min-height: 70px; }
+  .actions { margin-top: 10px; display: flex; gap: 10px; }
+  button { border: 0; border-radius: 8px; padding: 9px 22px; font-size: 15px; cursor: pointer; }
+  #askBtn { background: #2c5f8a; color: #fff; }
+  #askBtn:disabled { background: #93a7b8; cursor: not-allowed; }
+  #stopBtn { background: #c0504d; color: #fff; display: none; }
+  #answer { white-space: pre-wrap; line-height: 1.75; font-size: 15px; min-height: 40px; }
+  .status { color: #6a7a89; font-size: 13px; margin-bottom: 8px; }
+  .status.error { color: #c0504d; }
+  ul.sources { margin: 8px 0 0; padding-left: 18px; color: #45596b; font-size: 13px; }
+  .cursor { display: inline-block; width: 7px; background: #2c5f8a; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+</style>
+</head>
+<body>
+<header>
+  <strong>AI Study Assistant · 知识问答</strong>
+  <span style="float:right">
+    <a href="/app/plan.html">今日计划</a>
+    <a href="/app/detail.html">任务详情</a>
+    <a href="/app/feedback.html">学习反馈</a>
+    <a href="/docs">API</a>
+  </span>
+</header>
+<main>
+  <div class="card">
+    <textarea id="question" placeholder="例如：定积分的学习步骤是什么？">定积分的学习步骤是什么？</textarea>
+    <div class="actions">
+      <button id="askBtn">提问（流式）</button>
+      <button id="stopBtn">停止</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="status" id="status">就绪。回答将逐段显示。</div>
+    <div id="answer"></div>
+    <div id="sourcesBox" style="display:none">
+      <div class="status" style="margin-top:12px">知识库来源：</div>
+      <ul class="sources" id="sources"></ul>
+    </div>
+  </div>
+</main>
+<script>
+(function () {
+  var questionEl = document.getElementById("question");
+  var askBtn = document.getElementById("askBtn");
+  var stopBtn = document.getElementById("stopBtn");
+  var answerEl = document.getElementById("answer");
+  var statusEl = document.getElementById("status");
+  var sourcesBox = document.getElementById("sourcesBox");
+  var sourcesEl = document.getElementById("sources");
+  var controller = null;
+
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = "status" + (isError ? " error" : "");
+  }
+
+  function reset() {
+    answerEl.textContent = "";
+    sourcesEl.innerHTML = "";
+    sourcesBox.style.display = "none";
+  }
+
+  function renderSources(sources) {
+    if (!sources || !sources.length) return;
+    sourcesBox.style.display = "block";
+    sources.forEach(function (item) {
+      var li = document.createElement("li");
+      li.textContent = item.source + "（相关度 " + item.score + "）";
+      sourcesEl.appendChild(li);
+    });
+  }
+
+  function parseSseChunk(buffer, onEvent) {
+    // SSE 帧以空行分隔；event/data 行解析
+    var frames = buffer.split("\n\n");
+    for (var i = 0; i < frames.length - 1; i++) {
+      var name = "message";
+      var data = "";
+      frames[i].split("\n").forEach(function (line) {
+        if (line.indexOf("event: ") === 0) name = line.slice(7).trim();
+        if (line.indexOf("data: ") === 0) data += line.slice(6);
+      });
+      if (data) {
+        try { onEvent(name, JSON.parse(data)); } catch (e) { /* 忽略坏帧 */ }
+      }
+    }
+    return frames[frames.length - 1];
+  }
+
+  async function ask() {
+    var question = questionEl.value.trim();
+    if (!question) return;
+
+    reset();
+    controller = new AbortController();
+    askBtn.disabled = true;
+    stopBtn.style.display = "inline-block";
+    setStatus("检索知识库并生成回答中……");
+
+    try {
+      var response = await fetch("/ask/stream?question=" + encodeURIComponent(question), {
+        signal: controller.signal
+      });
+
+      if (!response.ok) {
+        setStatus("请求失败（HTTP " + response.status + "）", true);
+        return;
+      }
+
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder();
+      var buffer = "";
+      var cursor = document.createElement("span");
+      cursor.className = "cursor";
+      cursor.innerHTML = "&nbsp;";
+      answerEl.textContent = "";
+      answerEl.appendChild(cursor);
+
+      function appendText(text) {
+        cursor.insertAdjacentText("beforebegin", text);
+      }
+
+      var finished = false;
+
+      while (true) {
+        var result = await reader.read();
+        if (result.done) break;
+        buffer += decoder.decode(result.value, { stream: true });
+        buffer = parseSseChunk(buffer, function (name, data) {
+          if (name === "sources") {
+            renderSources(data.sources);
+          } else if (name === "delta") {
+            setStatus("正在生成回答……");
+            appendText(data.text);
+          } else if (name === "done") {
+            finished = true;
+            var usage = data.usage || {};
+            setStatus(
+              "回答完成（" + (data.elapsed_seconds || "?") + "s" +
+              (usage.available ? "，tokens " + usage.prompt_tokens + "/" + usage.completion_tokens : "，token 用量不可用") +
+              "）"
+            );
+          } else if (name === "error") {
+            finished = true;
+            setStatus("生成失败：" + data.error + "（" + data.error_type + "）", true);
+          }
+        });
+      }
+
+      cursor.remove();
+      if (!finished) setStatus("连接结束（可能被服务端或网络中断）", true);
+    } catch (error) {
+      if (error.name === "AbortError") {
+        setStatus("已停止生成（上游请求已中断）", true);
+      } else {
+        setStatus("请求异常：" + error.message, true);
+      }
+    } finally {
+      askBtn.disabled = false;
+      stopBtn.style.display = "none";
+      controller = null;
+    }
+  }
+
+  askBtn.addEventListener("click", ask);
+  stopBtn.addEventListener("click", function () {
+    if (controller) controller.abort();
+  });
+  questionEl.addEventListener("keydown", function (event) {
+    if ((event.ctrlKey || event.metaKey) && event.key === "Enter") ask();
+  });
+})();
+</script>
+</body>
+</html>

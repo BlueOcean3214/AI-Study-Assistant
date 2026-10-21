@@ -87,27 +87,10 @@ FEEDBACK_CLAIM_MARKERS = (
 # 最后一次模型原始输出在错误结果里最多保留的字符数
 MAX_LAST_RAW_CHARS = 2000
 
-DRAFT_SYSTEM_PROMPT = """你是 AI Study Assistant 的学习计划起草模块。
+# 文案集中在 prompt_registry（任务 plan_draft_system，支持版本切换做对照实验）
+import prompt_registry
 
-任务：依据程序在用户消息中提供的真实数据（最近学习反馈、知识库检索结果），起草一份结构化学习计划草案。草案只交给程序校验，当前阶段不会保存，也不会写入任何数据。
-
-输出要求：
-- 只输出一个 JSON 对象，不要 Markdown、不要解释文字。
-- 外层结构：{"answer": "给用户阅读的自然语言说明", "plan": {计划对象}}。
-- plan 必须包含用户消息中要求的全部字段，并严格遵守其中的数值规则。
-
-数值一致性（最常见的校验失败点，输出前务必逐条自查）：
-1. 所有 minutes / question_count / estimated_minutes 必须是非负整数。
-2. 子任务的 minutes 之和必须不超过 estimated_minutes。
-3. 子任务的 question_count 之和必须等于顶层 question_count。
-4. completion_criteria 必须用数字明确写出与 question_count 一致的题数（例如"完成4道指定题目"）；question_count 为 0 时不要写任何题数。
-
-来源完整性（硬规则）：
-1. 只能依据用户消息中程序提供的真实数据。
-2. 没有真实知识库检索结果时，answer 与 plan.reason 不得声称依据知识库或资料。
-3. 知识库检索失败时，必须如实说明检索不可用，不得假装检索成功。
-4. 没有真实反馈数据时，不得声称"根据你最近的反馈"。
-"""
+DRAFT_SYSTEM_PROMPT = prompt_registry.render("plan_draft_system")
 
 
 def _log(verbose, tag, message):

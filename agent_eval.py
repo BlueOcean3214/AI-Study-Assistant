@@ -778,6 +778,8 @@ def print_report(report):
 
 
 def main(argv=None):
+    import model_usage
+    model_usage.install()
     parser = argparse.ArgumentParser(description="只读 Agent 评测基线")
     parser.add_argument("--real-data", action="store_true", help="使用真实 feedback.db（只读，不播种）")
     parser.add_argument("--only", action="append", default=None, help="只跑指定用例 id（可重复）")

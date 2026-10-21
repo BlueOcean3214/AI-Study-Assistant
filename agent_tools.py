@@ -36,7 +36,6 @@ import ai_service
 from database import get_feedback_list, get_feedback_since
 from feedback_service import calculate_summary
 
-
 # ---- 参数上限（Agent 不可越过） ----
 
 DEFAULT_FEEDBACK_DAYS = 7
@@ -259,8 +258,8 @@ def _derive_difficult_previous_task():
     latest = feedback_list[-1]
 
     difficult = (
-        latest.get("status") == "partial"
-        and latest.get("reason") == "任务难度太高"
+            latest.get("status") == "partial"
+            and latest.get("reason") == "任务难度太高"
     )
 
     return difficult, None

@@ -2,14 +2,17 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import json
+
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, model_validator
 
 import ai_service
 import agent_plan_draft
 import confirmation_service
+import context_builder
 import document_service
 import plan_service
 
@@ -31,9 +34,7 @@ from database import (
 
 from feedback_service import calculate_summary
 
-
 app = FastAPI()
-
 
 app.mount(
     "/app",
@@ -44,14 +45,15 @@ app.mount(
     name="static",
 )
 
-
 init_db()
 migrate_json_to_db()
 
+# 注册模型用量记录（model_usage 表）：记录失败绝不影响任何请求
+import model_usage
+model_usage.install()
 
 
 class Feedback(BaseModel):
-
     task: str = Field(min_length=1)
 
     estimated_minutes: int = Field(ge=0)
@@ -61,7 +63,6 @@ class Feedback(BaseModel):
     status: str
 
     reason: str | None = None
-
 
     completed_subtasks: int = Field(
         default=0,
@@ -83,7 +84,6 @@ class Feedback(BaseModel):
         ge=0
     )
 
-
     @model_validator(mode="after")
     def check_progress_counts(self):
 
@@ -92,82 +92,127 @@ class Feedback(BaseModel):
                 "completed_subtasks 不能大于 total_subtasks"
             )
 
-
         if self.completed_questions > self.total_questions:
             raise ValueError(
                 "completed_questions 不能大于 total_questions"
             )
 
-
         return self
-
-
 
 
 @app.get("/")
 def home():
-
     return {
         "message": "AI Study Assistant"
     }
 
 
+# ==========================
+# 健康检查 / 就绪检查（轻量：不调用任何付费模型）
+# ==========================
 
+
+@app.get("/health")
+def health():
+    """存活检查：进程可响应即 200，附配置摘要（不含任何密钥）。"""
+
+    import embedding_service
+    import llm_client
+
+    def describe(settings_getter):
+        try:
+            settings = settings_getter()
+            return {"configured": True, "provider": settings.provider, "model": settings.model}
+        except Exception as error:  # noqa: BLE001 - 健康检查必须永远返回 200 结构
+            return {"configured": False, "error": str(error)}
+
+    return {
+        "status": "ok",
+        "llm": describe(llm_client.get_settings),
+        "embedding": describe(embedding_service.get_settings),
+    }
+
+
+@app.get("/ready")
+def ready():
+    """就绪检查：数据库可读 + 配置完整即就绪；不调用付费模型、不产生费用。"""
+
+    import sqlite3
+
+    import database as database_module
+    import embedding_service
+    import llm_client
+
+    checks = {}
+
+    try:
+        conn = sqlite3.connect(database_module.DATABASE_PATH)
+        try:
+            conn.execute("SELECT 1").fetchone()
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+        finally:
+            conn.close()
+        checks["database"] = {"ready": True, "schema_version": version}
+    except Exception as error:  # noqa: BLE001
+        checks["database"] = {"ready": False, "error": f"{type(error).__name__}: {error}"}
+
+    for name, getter in (("llm", llm_client.get_settings), ("embedding", embedding_service.get_settings)):
+        try:
+            settings = getter()
+            checks[name] = {"ready": True, "provider": settings.provider}
+        except Exception as error:  # noqa: BLE001
+            checks[name] = {"ready": False, "error": f"{type(error).__name__}: {error}"}
+
+    is_ready = all(item.get("ready") for item in checks.values())
+
+    body = {"ready": is_ready, "checks": checks}
+
+    if is_ready:
+        return body
+
+    return JSONResponse(status_code=503, content=body)
 
 
 # ==========================
 # Mini RAG 问答接口
 # ==========================
 
+def retrieve_for_ask(question):
+    """问答检索入口：RAG_BACKEND=llamaindex 走 LlamaIndex 实验路径，默认自研主路径。
+
+    RAG_RERANK_ENABLED=1 时对候选做第二阶段重排（失败按 RERANK_FALLBACK 回退并标注）。
+    """
+
+    import llamaindex_rag
+    import rerank_service
+
+    if llamaindex_rag.is_enabled():
+        chunks = llamaindex_rag.retrieve_chunks(question)
+    else:
+        chunks = retrieve_chunks(question)
+
+    if rerank_service.is_enabled() and chunks:
+        outcome = rerank_service.rerank(question, chunks)
+        chunks = outcome.get("results") or chunks
+
+    return chunks
+
+
 @app.get("/ask")
 def ask(question):
-
     # 1. 检索知识库
-    chunks = retrieve_chunks(question)
+    chunks = retrieve_for_ask(question)
 
-
-    # 2. 拼接上下文
-    context = "\n".join(
-        item["content"]
-        for item in chunks
-    )
-
+    # 2. 组装上下文（P1-A：(source, content) 去重 + 字符预算 + 来源标签；
+    #    与 /ask/stream 共用 context_builder，两条路径上下文完全一致）
+    context, _context_info = context_builder.build_context(chunks)
 
     # 3. 构造 Prompt
-
-    if context:
-
-        prompt = f"""
-你是一个学习助手。
-
-请参考下面资料回答问题：
-
-{context}
-
-
-用户问题：
-
-{question}
-
-
-要求：
-
-1. 优先根据资料回答。
-2. 如果资料没有相关内容，可以使用自己的知识补充。
-3. 不要编造资料不存在的信息。
-"""
-
-    else:
-
-        prompt = question
-
-
+    prompt = build_ask_prompt(question, context)
 
     # 4. 调用大模型
 
     content, error = call_ollama(prompt)
-
-
 
     # 5. 返回答案 + 来源
 
@@ -178,7 +223,62 @@ def ask(question):
     }
 
 
+def build_ask_prompt(question, context):
+    """问答 Prompt（流式与非流式共用，保证两条路径行为一致）。
 
+    文案集中在 prompt_registry（任务 ask_rag / ask_plain，支持版本切换）。
+    """
+
+    import prompt_registry
+
+    if context:
+        return prompt_registry.render("ask_rag", question=question, context=context)
+
+    return prompt_registry.render("ask_plain", question=question)
+
+
+def sse_event(name, payload):
+    """SSE 事件帧（data 为 JSON 单行）。"""
+
+    return f"event: {name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+@app.get("/ask/stream")
+def ask_stream(question):
+    """流式问答（SSE）：先发 sources，再逐段发 delta，最后 done / error。
+
+    客户端断开时上游生成器被关闭，模型流式连接随之释放。
+    """
+
+    import llm_client
+
+    chunks = retrieve_for_ask(question)
+    context, _context_info = context_builder.build_context(chunks)
+    prompt = build_ask_prompt(question, context)
+
+    def event_stream():
+        yield sse_event("sources", {"sources": chunks})
+
+        for event in llm_client.chat_stream([{"role": "user", "content": prompt}]):
+            if event["type"] == "delta":
+                yield sse_event("delta", {"text": event["text"]})
+            elif event["type"] == "done":
+                yield sse_event("done", {
+                    "usage": event.get("usage"),
+                    "model": event.get("model"),
+                    "elapsed_seconds": event.get("elapsed_seconds"),
+                })
+            else:
+                yield sse_event("error", {
+                    "error": event.get("error"),
+                    "error_type": event.get("error_type"),
+                })
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ==========================
@@ -190,7 +290,6 @@ MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
 
 def upload_error(message):
-
     return JSONResponse(
         status_code=400,
         content={
@@ -201,28 +300,22 @@ def upload_error(message):
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-
     # 1. 只取文件名本身，防止客户端传入路径或 ../ 写到 knowledge 之外
 
     filename = Path(file.filename).name if file.filename else ""
 
     if not filename:
-
         return upload_error("文件名不能为空")
 
     if Path(filename).suffix.lower() != ".txt":
-
         return upload_error("目前只支持 .txt 文件")
-
 
     # 2. 读取 bytes，并限制大小
 
     contents = await file.read()
 
     if len(contents) > MAX_UPLOAD_BYTES:
-
         return upload_error("文件过大，当前最大支持 2 MB")
-
 
     # 3. 保存进知识库（编码识别、文件名校验、切片都在 document_service 里）
 
@@ -236,7 +329,6 @@ async def upload_document(file: UploadFile = File(...)):
     except document_service.DocumentError as error:
 
         return upload_error(str(error))
-
 
     # 4. 复用 document_service 统计这篇文档切成了多少 chunk
 
@@ -254,7 +346,6 @@ async def upload_document(file: UploadFile = File(...)):
 
         chunk_count = 0
 
-
     # 5. 返回结果；向量由 rag_service 在下次检索时按需生成
 
     return {
@@ -265,19 +356,14 @@ async def upload_document(file: UploadFile = File(...)):
     }
 
 
-
-
 @app.post("/feedback")
 def feedback(data: Feedback):
-
     created_at = datetime.now().isoformat()
-
 
     insert_feedback(
         data.model_dump(),
         created_at
     )
-
 
     return {
         "message": "反馈保存成功",
@@ -288,75 +374,51 @@ def feedback(data: Feedback):
     }
 
 
-
-
-
 @app.get("/feedback")
 def get_feedback():
-
     return {
         "feedback": get_feedback_list()
     }
 
 
-
-
-
 @app.get("/analyze")
 def analyze():
-
     feedback_list = get_feedback_list()
 
-
     if not feedback_list:
-
         return {
             "message": "还没有学习反馈数据"
         }
 
-
-
     summary = calculate_summary(feedback_list)
-
 
     analysis, error = analyze_feedback(
         feedback_list,
         summary
     )
 
-
     if error:
-
         return {
             "message": error
         }
-
 
     return {
         "analysis": analysis
     }
 
 
-
-
-
 @app.get("/next-plan")
 def next_plan():
-
     feedback_list = get_feedback_list()
 
-
     if not feedback_list:
-
         return {
             "message": "还没有学习反馈数据"
         }
 
-
     summary = calculate_summary(
         feedback_list
     )
-
 
     return generate_next_plan(
         feedback_list,
@@ -364,20 +426,13 @@ def next_plan():
     )
 
 
-
-
-
 @app.delete("/feedback")
 def delete_feedback():
-
     delete_all_feedback()
-
 
     return {
         "message": "所有反馈数据已清空"
     }
-
-
 
 
 # ==========================
@@ -403,7 +458,6 @@ PLAN_ERROR_STATUS = {
 
 
 class PlanRequest(BaseModel):
-
     # 故意不做字段级强校验：计划内容统一交给 plan_service / validate_plan 判定，
     # 保证错误类型稳定（而不是 FastAPI 的 422 结构）。
     plan: Any = None
@@ -420,19 +474,16 @@ class PlanRequest(BaseModel):
 
 
 class ConfirmationRequest(BaseModel):
-
     plan: Any = None
 
     plan_date: Any = None
 
 
 class ConfirmRequest(BaseModel):
-
     confirmation_id: Any = None
 
 
 def plan_error_response(result):
-
     status_code = PLAN_ERROR_STATUS.get(
         result.get("error_type"),
         400
@@ -446,14 +497,12 @@ def plan_error_response(result):
 
 @app.get("/plan")
 def get_plan(date: str | None = None):
-
     # 不传 date 时默认查询今天（本地日期）
     target_date = date if date is not None else plan_service.today_string()
 
     result = plan_service.get_active_plan(target_date)
 
     if result.get("error_type"):
-
         return plan_error_response(result)
 
     return result
@@ -461,7 +510,6 @@ def get_plan(date: str | None = None):
 
 @app.post("/plan")
 def create_plan(data: PlanRequest):
-
     # 二选一（核心要求：写库前必须存在服务端认可的确认）：
     # - confirmation_id：服务端签发且用户已确认的凭证（新路径）
     # - confirmed_by_user：旧 API 兼容参数，仅代表用户本人直连提交
@@ -482,7 +530,6 @@ def create_plan(data: PlanRequest):
         )
 
     if not result.get("saved"):
-
         return plan_error_response(result)
 
     return result
@@ -503,14 +550,22 @@ def plan_draft():
     - 保存必须由用户在前端点击确认，走 /plan/confirmation -> /confirm -> /plan
     - 草案失败（plan_error）统一 503，不向浏览器泄漏内部细节
     """
+    # PLAN_DRAFT_ENGINE=langgraph 时走 LangGraph 工作流（实验路径，默认 native）
+    import os
 
-    result = agent_plan_draft.run_plan_draft(
-        "帮我根据最近的学习情况，制定今天的学习计划草案。",
-        verbose=False,
-    )
+    if (os.getenv("PLAN_DRAFT_ENGINE") or "native").strip().lower() == "langgraph":
+        import langgraph_plan_workflow
+
+        result = langgraph_plan_workflow.run_plan_draft_graph(
+            "帮我根据最近的学习情况，制定今天的学习计划草案。",
+        )
+    else:
+        result = agent_plan_draft.run_plan_draft(
+            "帮我根据最近的学习情况，制定今天的学习计划草案。",
+            verbose=False,
+        )
 
     if result.get("type") == agent_plan_draft.TYPE_PLAN_DRAFT:
-
         return {
             "ok": True,
             "type": result["type"],
@@ -580,3 +635,67 @@ def confirm_plan(data: ConfirmRequest):
         return plan_error_response({"saved": False, **result})
 
     return result
+
+
+# ==========================
+# LangChain 只读 Agent 实验路由（默认关闭）
+# LANGCHAIN_EXPERIMENT_ENABLED=1 才启用；只读，不提供任何写操作
+# ==========================
+
+
+class LangChainAskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500)
+
+
+@app.post("/experiment/langchain/ask")
+def langchain_ask(data: LangChainAskRequest):
+    import langchain_agent
+
+    if not langchain_agent.is_experiment_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={
+                "ok": False,
+                "error": "LangChain 实验入口未启用（设置 LANGCHAIN_EXPERIMENT_ENABLED=1 后重启）",
+                "error_type": "experiment_disabled",
+            },
+        )
+
+    result = langchain_agent.run_langchain_agent(data.question)
+
+    return result
+
+
+class LangChainAnalyzeRequest(BaseModel):
+    feedback_list: list = Field(default_factory=list)
+    summary: dict = Field(default_factory=dict)
+
+
+@app.post("/experiment/langchain/analyze")
+def langchain_analyze(data: LangChainAnalyzeRequest):
+    """LangChain 组件版反馈分析（ChatPromptTemplate + ChatOpenAI；只读，默认关闭）。"""
+
+    import langchain_service
+
+    if not langchain_agent_enabled():
+        return JSONResponse(
+            status_code=403,
+            content={
+                "ok": False,
+                "error": "LangChain 实验入口未启用（设置 LANGCHAIN_EXPERIMENT_ENABLED=1 后重启）",
+                "error_type": "experiment_disabled",
+            },
+        )
+
+    answer, error = langchain_service.analyze_feedback_langchain(data.feedback_list, data.summary)
+
+    if error:
+        return JSONResponse(status_code=502, content={"ok": False, "error": error})
+
+    return {"ok": True, "answer": answer, "engine": "langchain"}
+
+
+def langchain_agent_enabled():
+    import langchain_agent
+
+    return langchain_agent.is_experiment_enabled()

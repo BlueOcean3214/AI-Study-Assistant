@@ -7,6 +7,13 @@
 保存/覆盖/幂等、递归读取、以及 rag_service 的向后兼容。
 """
 
+import os
+
+# 测试夹具：语义检索用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+
 import shutil
 from pathlib import Path
 

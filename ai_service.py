@@ -1,36 +1,35 @@
 import json
 import re
 
-import requests
+import llm_client
 
 
-OLLAMA_URL = "http://localhost:11434/api/chat"
-OLLAMA_MODEL = "qwen3.5:4b"
+# 兼容旧配置导出：实际生效值来自环境变量（LLM_MODEL / OLLAMA_MODEL / OLLAMA_URL / LLM_BASE_URL）
+OLLAMA_URL = llm_client.ollama_chat_url()
+OLLAMA_MODEL = llm_client.default_model()
+
+# 普通问答路径的单次调用 read timeout（历史行为为 60 秒）
+CALL_LLM_READ_TIMEOUT = 60
 
 
 def call_ollama(prompt):
 
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                "model": OLLAMA_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "think": False,
-                "stream": False,
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-        data = response.json()
-        content = data.get("message", {}).get("content")
-        if not isinstance(content, str):
-            return None, "Ollama 返回内容格式异常"
-        return content, None
-    except requests.exceptions.RequestException:
-        return None, "无法连接 Ollama，请确认 Ollama 已启动"
-    except (ValueError, AttributeError):
-        return None, "Ollama 返回内容格式异常"
+    result, error = llm_client.chat(
+        [{"role": "user", "content": prompt}],
+        tools=None,
+        deadline=None,
+        read_timeout=CALL_LLM_READ_TIMEOUT,
+    )
+
+    if error:
+        return None, error
+
+    content = result["message"].get("content")
+
+    if not isinstance(content, str):
+        return None, "模型返回内容格式异常"
+
+    return content, None
 
 def ask_with_rag(question, context):
         if context:
@@ -56,29 +55,13 @@ def ask_with_rag(question, context):
         return call_ollama(prompt)
 
 def analyze_feedback(feedback_list, summary):
-    prompt = f"""
-你是 AI Study Assistant 的学习数据分析助手。
+    import prompt_registry
 
-下面是用户真实的历史学习反馈：
-{json.dumps(feedback_list, ensure_ascii=False, indent=2)}
-
-下面是 Python 根据历史数据计算出的统计结果：
-{json.dumps(summary, ensure_ascii=False, indent=2)}
-
-请严格按照以下原则分析：
-1. 只陈述数据中明确存在的事实。
-2. “实际时间低于预计时间”只能描述为“实际用时低于预计用时”，不能直接判断学习效率高低。
-3. 不要推测用户的心理状态。
-4. 不要推测用户为什么提前结束任务。
-5. “任务难度太高”只能说明这是用户主动选择的反馈原因。
-6. 不要把“部分完成”解释成用户一定遇到了具体困难，除非数据明确说明。
-7. 所有建议必须能够与历史数据对应。
-
-请严格按照以下格式回答：
-### 1. 已知事实
-### 2. 可观察的问题
-### 3. 下一次计划建议
-"""
+    prompt = prompt_registry.render(
+        "analyze_feedback",
+        feedback_json=json.dumps(feedback_list, ensure_ascii=False, indent=2),
+        summary_json=json.dumps(summary, ensure_ascii=False, indent=2),
+    )
     return call_ollama(prompt)
 
 
@@ -174,6 +157,8 @@ def validate_plan(plan, difficult_previous_task=False):
 
 
 def build_plan_prompt(feedback_list, summary, difficult_previous_task, correction=None):
+    import prompt_registry
+
     dynamic_rules = ""
     if difficult_previous_task:
         dynamic_rules = """
@@ -188,36 +173,13 @@ def build_plan_prompt(feedback_list, summary, difficult_previous_task, correctio
 你之前的计划不符合系统规则，原因：{correction}
 请重新生成完整计划并修正问题。不要只回复解释。
 """
-    return f"""
-你是 AI Study Assistant 的学习规划助手。根据真实历史反馈生成下一次学习任务。
-历史反馈：
-{json.dumps(feedback_list, ensure_ascii=False, indent=2)}
-统计结果：
-{json.dumps(summary, ensure_ascii=False, indent=2)}
-
-只能根据数据判断，不要推测心理状态，也不要把实际用时较短解释为效率高。
-任务时长不得超过60分钟。difficulty 只能为 easy、medium、hard。
-必须有2到4个具体可执行的 subtasks，每个包含 title、minutes、question_count、description。
-所有数量和分钟数必须是非负整数；子任务分钟总和不得超过 estimated_minutes；
-子任务题数总和必须等于 question_count。completion_criteria 必须明确写出准确题数，
-且与 question_count 一致；question_count 为0时不要写需要完成多少道题。
-{dynamic_rules}
-{correction_text}
-只返回合法 JSON，不要 Markdown 或其他文字，格式如下：
-{{
-  "task": "任务名称",
-  "estimated_minutes": 45,
-  "difficulty": "easy",
-  "question_count": 4,
-  "reason": "为什么这样调整",
-  "completion_criteria": "完成4道指定题目，并完成所有子任务后即可结束。",
-  "subtasks": [
-    {{"title": "复习公式", "minutes": 10, "question_count": 0, "description": "复习指定基础公式"}},
-    {{"title": "基础练习", "minutes": 15, "question_count": 2, "description": "完成两道指定基础题"}},
-    {{"title": "错题整理", "minutes": 15, "question_count": 2, "description": "完成两道指定练习并订正"}}
-  ]
-}}
-"""
+    return prompt_registry.render(
+        "plan_generate",
+        feedback_json=json.dumps(feedback_list, ensure_ascii=False, indent=2),
+        summary_json=json.dumps(summary, ensure_ascii=False, indent=2),
+        dynamic_rules=dynamic_rules,
+        correction_text=correction_text,
+    )
 
 
 def generate_next_plan(feedback_list, summary):

@@ -4,6 +4,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 
+import env_loader
+
+# 启动时自动读取根目录 .env（FEEDBACK_DB_PATH 等配置可能来自 .env）
+env_loader.load_env()
+
 
 # 数据库路径：默认项目根目录下的 feedback.db。
 # 可用环境变量 FEEDBACK_DB_PATH 覆盖（测试隔离 / 部署配置用，与 RAG_CACHE_DIR 同一风格）。
@@ -21,8 +26,17 @@ class ActivePlanExistsError(RuntimeError):
     """同一天已经存在 active plan。"""
 
 
-def init_db():
-    conn = sqlite3.connect(DATABASE_PATH)
+# ==========================
+# 版本化迁移（PRAGMA user_version）
+# ==========================
+
+# 当前 schema 版本：每次结构变更追加一个迁移函数，禁止修改已有迁移
+SCHEMA_VERSION = 5
+
+
+def _migration_v1_feedbacks(conn):
+    """v1：feedbacks 主表。"""
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS feedbacks (
@@ -41,7 +55,10 @@ def init_db():
         """
     )
 
-    # Add fields to an older table without removing or changing existing data.
+
+def _migration_v2_feedback_progress_columns(conn):
+    """v2：给旧版 feedbacks 补进度字段（只加列，不删改既有数据）。"""
+
     columns = conn.execute("PRAGMA table_info(feedbacks)").fetchall()
     column_names = {column[1] for column in columns}
     new_columns = {
@@ -55,6 +72,10 @@ def init_db():
             conn.execute(
                 f"ALTER TABLE feedbacks ADD COLUMN {column_name} {column_definition}"
             )
+
+
+def _migration_v3_plans(conn):
+    """v3：plans 表 + 当天 active 唯一的部分唯一索引。"""
 
     # 学习计划（与 feedbacks 暂时是两个独立实体，不互相引用）
     conn.execute(
@@ -77,7 +98,6 @@ def init_db():
 
     # 同一天最多一条 active plan：用 partial unique index，而不是 UNIQUE(plan_date)，
     # 这样将来同一天可以同时保留 completed / cancelled 的历史计划。
-    # （当前 SQLite 3.50.4 支持 partial index，无需退化为“事务 + 检查”）
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_active_date
@@ -85,8 +105,90 @@ def init_db():
         """
     )
 
-    conn.commit()
-    conn.close()
+
+def _migration_v4_query_indexes(conn):
+    """v4：按实际查询补索引（最近反馈时间排序 / 计划日期+状态）。"""
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feedbacks_created_at ON feedbacks(created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_plans_date_status ON plans(plan_date, status)"
+    )
+
+
+def _migration_v5_model_usage(conn):
+    """v5：模型用量记录表（token 用量/耗时/状态；不存 Prompt、回答、密钥）。"""
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS model_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            total_tokens INTEGER,
+            usage_available INTEGER NOT NULL DEFAULT 0,
+            elapsed_seconds REAL,
+            ok INTEGER NOT NULL,
+            error_type TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_model_usage_created_at ON model_usage(created_at)"
+    )
+
+
+# 迁移按版本号升序执行；每个迁移都必须可重复执行（IF NOT EXISTS / 存在性检查）
+MIGRATIONS = (
+    (1, _migration_v1_feedbacks),
+    (2, _migration_v2_feedback_progress_columns),
+    (3, _migration_v3_plans),
+    (4, _migration_v4_query_indexes),
+    (5, _migration_v5_model_usage),
+)
+
+
+def init_db():
+    """初始化 / 升级数据库（唯一启动入口，可重复执行）。
+
+    - 用 PRAGMA user_version 记录 schema 版本；高版本库拒绝启动（禁止降级写入）
+    - 迁移全部是幂等的（IF NOT EXISTS / 存在性检查）：每次都顺序执行，
+      因此重复调用不重复加列/索引，个别表被误删后还能自动补回
+    - 旧库（含只有 feedbacks 的库、user_version=0 的库）升级不删任何数据
+    - 迁移失败抛 RuntimeError（信息里带路径与版本号），启动方能清晰报错
+    """
+
+    conn = sqlite3.connect(DATABASE_PATH)
+
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"数据库版本 {version} 高于程序支持的 {SCHEMA_VERSION}，"
+                "请升级程序，禁止降级写入"
+            )
+
+        for target_version, migration in MIGRATIONS:
+            migration(conn)
+
+        if version != SCHEMA_VERSION:
+            # PRAGMA 不支持参数绑定；SCHEMA_VERSION 是本模块内的整数常量
+            conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+
+        conn.commit()
+    except sqlite3.Error as error:
+        current = conn.execute("PRAGMA user_version").fetchone()[0]
+        conn.rollback()
+        raise RuntimeError(
+            f"数据库迁移失败（DATABASE_PATH={DATABASE_PATH}，user_version={current}）：{error}"
+        ) from error
+    finally:
+        conn.close()
 
 
 def migrate_json_to_db():

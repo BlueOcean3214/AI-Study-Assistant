@@ -20,9 +20,21 @@ feedback_backup.json
 # Agent 评测运行归档（本地生成）
 agent_eval_runs/
 
+# 检索/对照实验输出与指标日志（本地生成；rag_eval_labels.json 标注数据保留入库）
+rag_metrics.jsonl
+rag_mode_eval_results.json
+agent_compare_results*.json
+
 # Test/build artifacts
 .pytest_cache/
 .coverage
 htmlcov/
 build/
 dist/
+# 本地回归/冒烟的临时输出与日志
+_reg*.txt
+_test_*.log
+_agent_eval_delivery_run.txt
+jieba.cache
+.pip_tmp/
+.workbuddy/

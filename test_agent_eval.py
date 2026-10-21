@@ -4,6 +4,14 @@
 否则基线本身不可信。
 """
 
+import os
+
+# 测试夹具：真实模型/Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
+
 import contextlib
 import io
 import json

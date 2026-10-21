@@ -8,6 +8,13 @@
 - v2.0 升级：embedding 语义检索、余弦相似度、embedding 缓存
 """
 
+import os
+
+# 测试夹具：真实 Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+
 import shutil
 from pathlib import Path
 

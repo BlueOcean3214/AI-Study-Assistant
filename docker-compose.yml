@@ -1,0 +1,22 @@
+# AI Study Assistant — Docker Compose 部署
+# 用法：docker compose up -d --build
+# 密钥来自 .env（运行时注入，不进镜像）；数据在 app-data 卷，容器重建不丢。
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # 数据库与向量缓存固定到挂载卷（覆盖 .env 中的本地路径）
+      FEEDBACK_DB_PATH: /app/data/feedback.db
+      RAG_CACHE_DIR: /app/data/.rag_cache
+    volumes:
+      - app-data:/app/data
+      - ./knowledge:/app/knowledge
+    restart: unless-stopped
+
+volumes:
+  app-data:

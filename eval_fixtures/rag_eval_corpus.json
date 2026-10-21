@@ -1,0 +1,107 @@
+{
+  "_synthetic": true,
+  "_说明": "合成评测语料（与生产 knowledge/ 完全独立，仅供检索指标评测，不进入 /ask 检索范围）。主题为虚构的 PyCache 缓存服务配置手册。documents[].chunks 为显式检索分块（chunk_id 在文档内唯一）。标注口径：source 级用 expected_source（来源名列表）；chunk 级用 expected_chunks（chunk_id 列表，ID 形如 '文件名#序号'）。多来源/多分块问题标注全部相关项，禁止只标一个。expect_empty=true 表示语料没有充分证据，期望检索为空。",
+  "_category说明": {
+    "lexical": "词面直接匹配（查询词与原文高度重合）",
+    "paraphrase": "语义改写（意思相同、措辞不同）",
+    "keyword": "技术关键词（函数名/配置项/错误码）",
+    "distractor": "干扰文档（词面相似但不相关，观察误召回）",
+    "cross_chunk": "跨分块（答案需关联同一文档的多个分块）",
+    "multi_source": "多来源（答案确实需要多个文档）",
+    "no_answer": "无答案（语料无关，期望为空）",
+    "boundary": "边界情况（空查询/重复内容/同来源多分块/极短查询）"
+  },
+  "documents": [
+    {
+      "source": "pycache_intro.txt",
+      "chunks": [
+        { "chunk_id": "pycache_intro.txt#1", "content": "PyCache 是一个轻量级进程内缓存服务，用于加速热点数据读取。PyCache 的核心思想是把频繁读取、很少变化的数据放在内存里，避免每次请求都回源到数据库或磁盘。" },
+        { "chunk_id": "pycache_intro.txt#2", "content": "适用场景包括：配置表缓存、会话信息缓存、页面片段缓存。不适用场景包括：大对象存储、需要强一致性的账务数据、写多读少的流水数据。" },
+        { "chunk_id": "pycache_intro.txt#3", "content": "PyCache 以库的形式集成进应用进程，不需要单独部署服务。" }
+      ]
+    },
+    {
+      "source": "pycache_config.txt",
+      "chunks": [
+        { "chunk_id": "pycache_config.txt#1", "content": "PyCache 配置说明（第一部分）：MAX_ENTRIES：缓存条目数量上限。超过上限后按 LRU 规则淘汰最久未使用的条目。默认值 1000，必须为正整数。TTL_SECONDS：条目过期时间（秒）。写入后超过该时间的条目视为失效，读取时返回未命中。默认值 300，设为 0 表示永不过期。" },
+        { "chunk_id": "pycache_config.txt#2", "content": "PyCache 配置说明（第二部分）：BACKEND：存储后端类型。可选值为 memory（进程内内存）与 disk（本地磁盘文件）。默认 memory。选择 disk 时数据在进程重启后仍然保留。CACHE_MODE：缓存工作模式。可选值为 strict（严格模式，过期立即删除）与 lazy（懒惰模式，读取时才清理过期条目）。默认 lazy。配置通过环境变量或配置文件传入，环境变量优先级更高。" }
+      ]
+    },
+    {
+      "source": "pycache_api.txt",
+      "chunks": [
+        { "chunk_id": "pycache_api.txt#1", "content": "PyCache API 说明：cache_get(key)：读取缓存。命中返回值；未命中返回 None，不抛异常。cache_set(key, value, ttl=None)：写入缓存。ttl 覆盖全局 TTL_SECONDS，写入成功返回 True。cache_invalidate(key)：主动删除指定缓存条目。删除成功返回 True；条目不存在返回 False。" },
+        { "chunk_id": "pycache_api.txt#2", "content": "cache_stats()：返回运行指标字典，包含 hit_rate（命中率）、entries（当前条目数）、evictions（淘汰次数）、errors（错误计数）。所有 API 在同一进程内线程安全。" }
+      ]
+    },
+    {
+      "source": "pycache_errors.txt",
+      "chunks": [
+        { "chunk_id": "pycache_errors.txt#1", "content": "PyCache 错误码说明：ERR_CACHE_MISS：读取未命中。这不是故障，表示 key 不存在或已过期，调用方应回源加载。ERR_BACKEND_TIMEOUT：后端存储访问超时。常见原因是磁盘 IO 缓慢或后端负载过高，需要检查后端状态并调整超时配置。" },
+        { "chunk_id": "pycache_errors.txt#2", "content": "ERR_QUOTA_EXCEEDED：配额超限。缓存占用超出配额时触发，需要提高配额或降低 MAX_ENTRIES。错误码通过 cache_get / cache_set 的返回值或日志输出，不会中断主流程。" }
+      ]
+    },
+    {
+      "source": "pycache_troubleshoot.txt",
+      "chunks": [
+        { "chunk_id": "pycache_troubleshoot.txt#1", "content": "PyCache 排障指南：第一步：确认命中率。用 cache_stats() 查看 hit_rate，命中率长期低于 50% 说明缓存配置或数据访问模式有问题。第二步：检查过期配置。TTL_SECONDS 过短会导致条目频繁失效；MAX_ENTRIES 过小会引发频繁淘汰。" },
+        { "chunk_id": "pycache_troubleshoot.txt#2", "content": "第三步：检查后端状态。出现 ERR_BACKEND_TIMEOUT 时，先确认磁盘或后端负载，再核对超时相关配置。第四步：检查配额。出现 ERR_QUOTA_EXCEEDED 时，对比当前 entries 与配额上限。恢复手段：cache_invalidate 清理问题 key，或重启进程（memory 后端会清空，disk 后端保留数据）。" }
+      ]
+    },
+    {
+      "source": "distractor_redis.txt",
+      "chunks": [
+        { "chunk_id": "distractor_redis.txt#1", "content": "Redis 使用备忘（与 PyCache 无关的另一款缓存软件）：Redis 的 maxmemory 配置决定实例内存上限，超出后按淘汰策略处理。Redis 支持多种淘汰策略，例如 allkeys-lru 与 volatile-ttl。" },
+        { "chunk_id": "distractor_redis.txt#2", "content": "Redis 的 TTL 通过 EXPIRE 命令设置，过期后数据删除。缓存穿透、缓存击穿与缓存雪崩是 Redis 实践中的常见问题，通常配合布隆过滤器与互斥锁解决。Redis 是独立部署的服务器程序，与进程内缓存库的集成方式完全不同。" }
+      ]
+    },
+    {
+      "source": "distractor_memo.txt",
+      "chunks": [
+        { "chunk_id": "distractor_memo.txt#1", "content": "开发备忘录（非技术文档）：今天讨论了缓存相关的技术选型，会议记录稍后整理。今天讨论了缓存相关的技术选型，会议记录稍后整理。" },
+        { "chunk_id": "distractor_memo.txt#2", "content": "提醒：下周和数据库组对齐一致性方案，记得带笔记本。提醒：下周和数据库组对齐一致性方案，记得带笔记本。" }
+      ]
+    }
+  ],
+  "cases": [
+    { "id": "L1", "query": "MAX_ENTRIES 配置项的作用是什么", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1"], "category": "lexical", "verified": true },
+    { "id": "L2", "query": "cache_invalidate 函数怎么使用", "expected_source": ["pycache_api.txt"], "expected_chunks": ["pycache_api.txt#1"], "category": "lexical", "verified": true },
+    { "id": "L3", "query": "ERR_CACHE_MISS 错误是什么原因", "expected_source": ["pycache_errors.txt"], "expected_chunks": ["pycache_errors.txt#1"], "category": "lexical", "verified": true },
+    { "id": "L4", "query": "TTL_SECONDS 默认值是多少", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1"], "category": "lexical", "verified": true },
+    { "id": "L5", "query": "cache_stats 返回哪些指标", "expected_source": ["pycache_api.txt"], "expected_chunks": ["pycache_api.txt#2"], "category": "lexical", "verified": true },
+    { "id": "P1", "query": "缓存条目数量上限怎么调整", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1"], "category": "paraphrase", "verified": true },
+    { "id": "P2", "query": "怎么主动清掉已经存进去的缓存", "expected_source": ["pycache_api.txt"], "expected_chunks": ["pycache_api.txt#1"], "category": "paraphrase", "verified": true },
+    { "id": "P3", "query": "后端连不上会报什么错", "expected_source": ["pycache_errors.txt"], "expected_chunks": ["pycache_errors.txt#1"], "category": "paraphrase", "verified": true },
+    { "id": "P4", "query": "数据放多久会自动失效", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1"], "category": "paraphrase", "verified": true },
+    { "id": "P5", "query": "怎么看缓存运行的健康状态", "expected_source": ["pycache_api.txt"], "expected_chunks": ["pycache_api.txt#2"], "category": "paraphrase", "verified": true },
+    { "id": "K1", "query": "BACKEND 支持哪些取值", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#2"], "category": "keyword", "verified": true },
+    { "id": "K2", "query": "cache_get 和 cache_set 的区别", "expected_source": ["pycache_api.txt"], "expected_chunks": ["pycache_api.txt#1"], "category": "keyword", "verified": true },
+    { "id": "K3", "query": "ERR_QUOTA_EXCEEDED 触发条件", "expected_source": ["pycache_errors.txt"], "expected_chunks": ["pycache_errors.txt#2"], "category": "keyword", "verified": true },
+    { "id": "K4", "query": "CACHE_MODE 有哪几种模式", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#2"], "category": "keyword", "verified": true },
+    { "id": "K5", "query": "cache_stats 的 hit_rate 是什么", "expected_source": ["pycache_api.txt"], "expected_chunks": ["pycache_api.txt#2"], "category": "keyword", "verified": true },
+    { "id": "D1", "query": "PyCache 的内存淘汰策略有哪些", "expected_source": [], "expect_empty": true, "category": "distractor", "note": "distractor_redis.txt#1 含'淘汰策略'词面但属另一产品", "verified": true },
+    { "id": "D2", "query": "缓存和数据库的一致性怎么保证", "expected_source": [], "expect_empty": true, "category": "distractor", "note": "distractor_memo.txt#2 提到'一致性'但无实质答案", "verified": true },
+    { "id": "D3", "query": "PyCache 支持 Redis 作为后端吗", "expected_source": [], "expect_empty": true, "category": "distractor", "note": "语料中 BACKEND 只有 memory/disk；distractor_redis.txt 是干扰", "verified": true },
+    { "id": "D4", "query": "TTL 过期后缓存数据去哪了", "expected_source": [], "expect_empty": true, "category": "distractor", "note": "config/errors 未说明过期数据去向", "verified": true },
+    { "id": "D5", "query": "缓存穿透问题怎么解决", "expected_source": [], "expect_empty": true, "category": "distractor", "note": "'缓存穿透'只出现在 distractor_redis.txt#2（另一产品）", "verified": true },
+    { "id": "N1", "query": "Python 的 GIL 是什么", "expected_source": [], "expect_empty": true, "category": "no_answer", "verified": true },
+    { "id": "N2", "query": "怎么申请 SSL 证书", "expected_source": [], "expect_empty": true, "category": "no_answer", "verified": true },
+    { "id": "N3", "query": "PyCache 的发布日期是哪天", "expected_source": [], "expect_empty": true, "category": "no_answer", "verified": true },
+    { "id": "N4", "query": "支持哪些编程语言的 SDK", "expected_source": [], "expect_empty": true, "category": "no_answer", "verified": true },
+    { "id": "N5", "query": "PyCache 的开源许可证是什么", "expected_source": [], "expect_empty": true, "category": "no_answer", "verified": true },
+    { "id": "C1", "query": "缓存条目上限和过期时间分别用什么配置项控制", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1"], "category": "cross_chunk", "note": "两个配置项都在 config#1；跨块需求由 C2/C3 覆盖", "verified": true },
+    { "id": "C2", "query": "条目过期时间和缓存工作模式分别有哪些选项", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1", "pycache_config.txt#2"], "category": "cross_chunk", "note": "TTL 在 config#1、CACHE_MODE 在 config#2，答案需跨块", "verified": true },
+    { "id": "C3", "query": "缓存命中率低的时候按什么顺序排查", "expected_source": ["pycache_troubleshoot.txt"], "expected_chunks": ["pycache_troubleshoot.txt#1", "pycache_troubleshoot.txt#2"], "category": "cross_chunk", "note": "排障步骤跨 troubleshoot 的两个分块", "verified": true },
+    { "id": "C4", "query": "PyCache 是什么以及不适合用在哪些场景", "expected_source": ["pycache_intro.txt"], "expected_chunks": ["pycache_intro.txt#1", "pycache_intro.txt#2"], "category": "cross_chunk", "verified": true },
+    { "id": "M1", "query": "怎么定位 ERR_BACKEND_TIMEOUT 并调整相关配置", "expected_source": ["pycache_errors.txt", "pycache_troubleshoot.txt"], "expected_chunks": ["pycache_errors.txt#1", "pycache_troubleshoot.txt#2"], "category": "multi_source", "verified": true },
+    { "id": "M2", "query": "cache_invalidate 之后读取还是 ERR_CACHE_MISS 该怎么理解", "expected_source": ["pycache_api.txt", "pycache_errors.txt"], "expected_chunks": ["pycache_api.txt#1", "pycache_errors.txt#1"], "category": "multi_source", "verified": true },
+    { "id": "M3", "query": "PyCache 的核心功能和典型使用场景", "expected_source": ["pycache_intro.txt", "pycache_api.txt"], "expected_chunks": ["pycache_intro.txt#2", "pycache_api.txt#1"], "category": "multi_source", "verified": true },
+    { "id": "M4", "query": "调整 MAX_ENTRIES 时应该参考哪些运行指标", "expected_source": ["pycache_config.txt", "pycache_api.txt"], "expected_chunks": ["pycache_config.txt#1", "pycache_api.txt#2"], "category": "multi_source", "verified": true },
+    { "id": "M5", "query": "出现 ERR_QUOTA_EXCEEDED 时怎么排查和恢复", "expected_source": ["pycache_errors.txt", "pycache_troubleshoot.txt"], "expected_chunks": ["pycache_errors.txt#2", "pycache_troubleshoot.txt#2"], "category": "multi_source", "verified": true },
+    { "id": "B1", "query": "", "expected_source": [], "expect_empty": true, "category": "boundary", "note": "空查询：评测必须单独处理，不得计入指标", "verified": true },
+    { "id": "B2", "query": "备忘录里重复提到的事项是什么", "expected_source": ["distractor_memo.txt"], "expected_chunks": ["distractor_memo.txt#1", "distractor_memo.txt#2"], "category": "boundary", "note": "重复来源与重复分块：两个分块内容各自重复且都相关", "verified": true },
+    { "id": "B3", "query": "PyCache 有哪些配置项", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1", "pycache_config.txt#2"], "category": "boundary", "note": "同来源多分块：验证来源级只计 1 个来源、chunk 级计 2 个分块", "verified": true },
+    { "id": "B4", "query": "TTL_SECONDS", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1"], "category": "boundary", "note": "极短单关键词查询", "verified": true },
+    { "id": "B5", "query": "缓存上限默认值和淘汰规则是什么", "expected_source": ["pycache_config.txt"], "expected_chunks": ["pycache_config.txt#1"], "category": "boundary", "note": "答案位于分块内部的边界位置", "verified": true }
+  ]
+}

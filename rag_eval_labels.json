@@ -1,0 +1,36 @@
+{
+  "_说明": "标注依据：已通读 knowledge/math.txt 与 knowledge/条件概率.txt 的完整内容。basic/exact_keyword/paraphrase/threshold_boundary 类的答案可从 expected_source 指向的文件中找到；partial_match 类主题相关但文档内容不足以完整回答（用于观察检索是否召回相关文档）；expect_empty=true 表示知识库中确实没有相关内容，期望检索结果为空。verified=true 表示标注经过人工核对。category 用于分组分析，不参与指标计算。",
+  "_category说明": {
+    "basic": "常规语义查询",
+    "exact_keyword": "包含确切术语/公式名/专有名词",
+    "paraphrase": "语义相近但用词不同",
+    "partial_match": "主题相关但文档内容不足以完整回答",
+    "no_answer": "知识库中没有答案（期望为空）",
+    "irrelevant": "完全不相关（期望为空）",
+    "threshold_boundary": "相似度可能落在阈值附近的边界观察样本"
+  },
+  "cases": [
+    { "id": "R01", "query": "定积分的学习步骤是什么？", "expected_source": ["math.txt"], "category": "basic", "verified": true },
+    { "id": "R02", "query": "牛顿-莱布尼茨公式应该怎么掌握？", "expected_source": ["math.txt"], "category": "basic", "verified": true },
+    { "id": "R03", "query": "定积分有哪些常见的计算方法？", "expected_source": ["math.txt"], "category": "basic", "verified": true },
+    { "id": "R04", "query": "学定积分遇到困难应该怎么办？", "expected_source": ["math.txt"], "category": "basic", "verified": true },
+    { "id": "R05", "query": "定积分的定义和几何意义应该怎么理解？", "expected_source": ["math.txt"], "category": "basic", "verified": true },
+    { "id": "R06", "query": "换元积分法和分部积分法是什么？", "expected_source": ["math.txt"], "category": "basic", "verified": true },
+    { "id": "R07", "query": "定积分应该先练基础还是直接做综合题？", "expected_source": ["math.txt"], "category": "basic", "verified": true },
+    { "id": "R08", "query": "什么是条件概率？", "expected_source": ["条件概率.txt"], "category": "basic", "verified": true },
+    { "id": "R09", "query": "条件概率表示什么含义？", "expected_source": ["条件概率.txt"], "category": "basic", "verified": true },
+    { "id": "R10", "query": "概率论里的条件概率概念怎么理解？", "expected_source": ["条件概率.txt"], "category": "basic", "verified": true },
+    { "id": "R11", "query": "牛顿-莱布尼茨公式", "expected_source": ["math.txt"], "category": "exact_keyword", "verified": true },
+    { "id": "R12", "query": "换元积分法", "expected_source": ["math.txt"], "category": "exact_keyword", "verified": true },
+    { "id": "R13", "query": "分部积分法", "expected_source": ["math.txt"], "category": "exact_keyword", "verified": true },
+    { "id": "R14", "query": "积分能用来求什么？", "expected_source": ["math.txt"], "category": "paraphrase", "verified": true },
+    { "id": "R15", "query": "知道一件事已经发生，另一件事发生的可能性怎么衡量？", "expected_source": ["条件概率.txt"], "category": "paraphrase", "verified": true },
+    { "id": "R16", "query": "分部积分法具体怎么操作？", "expected_source": ["math.txt"], "category": "partial_match", "verified": true },
+    { "id": "R17", "query": "条件概率的计算公式是什么？", "expected_source": ["条件概率.txt"], "category": "partial_match", "verified": true },
+    { "id": "R18", "query": "如何用 Python 写一个爬虫？", "expected_source": [], "expect_empty": true, "category": "no_answer", "verified": true },
+    { "id": "R19", "query": "英语六级备考计划怎么制定？", "expected_source": [], "expect_empty": true, "category": "no_answer", "verified": true },
+    { "id": "R20", "query": "红烧肉怎么做才好吃？", "expected_source": [], "expect_empty": true, "category": "irrelevant", "verified": true },
+    { "id": "R21", "query": "推荐一部科幻电影", "expected_source": [], "expect_empty": true, "category": "irrelevant", "verified": true },
+    { "id": "R22", "query": "数学分析中有哪些重要内容？", "expected_source": ["math.txt"], "category": "threshold_boundary", "verified": true }
+  ]
+}

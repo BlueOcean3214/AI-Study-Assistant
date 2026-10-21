@@ -18,6 +18,11 @@ knowledge/**/*.txt
 下面这几个同名函数为了保持向后兼容而保留。
 """
 
+import json
+import os
+import time
+from pathlib import Path
+
 import requests
 
 from document_service import (
@@ -31,6 +36,7 @@ from document_service import (
 # 用模块名调用 split_into_batches（批大小常量在 embedding_service 里）；
 # 同时按名字导入 get_embeddings，保持现有测试可以打桩替换它。
 import embedding_service
+import sparse_service
 import vector_cache
 from embedding_service import EmbeddingError, get_embedding, get_embeddings
 
@@ -41,7 +47,21 @@ TOP_K = 3
 # 相似度低于这个值的 chunk 不返回，避免无关问题也把资料塞进 Prompt。
 # bge-m3 的相似度整体偏高：实测无关问题 <= 0.49，相关问题 >= 0.52，所以取 0.5。
 # 如果想无条件返回 Top-3，把它改成 0.0 即可。
+# 该阈值始终只约束向量检索；BM25 通道用“必须含查询词（分数>0）”作为自己的候选规则。
 MIN_SCORE = 0.5
+
+# 检索模式（环境变量 RAG_RETRIEVAL_MODE）：
+# - vector（默认基线）：纯向量检索，返回结构与历史版本完全一致
+# - hybrid：向量 + BM25 两路排名用 RRF 融合（返回结构增加 score_type 等元数据）
+RETRIEVAL_MODE_VECTOR = "vector"
+RETRIEVAL_MODE_HYBRID = "hybrid"
+
+# RRF（Reciprocal Rank Fusion）常数：score = Σ 1/(RRF_K + rank)。
+# RRF 分数是“排名融合分”，与余弦相似度不是同一个量纲，只用于排序，绝不互相替代。
+RRF_K = 60
+
+# BM25 候选池大小 = top_k * 该倍数（融合前两路各取自己的排名列表）
+BM25_CANDIDATE_MULTIPLIER = 3
 
 # 取模型 digest 用（判断模型是否被就地更新过）
 OLLAMA_TAGS_URL = "http://localhost:11434/api/tags"
@@ -80,13 +100,26 @@ def _fetch_model_digest():
 
 
 def current_model_digest():
-    """当前模型指纹（每个进程只取一次）。"""
+    """当前模型指纹（每个进程只取一次）。
+
+    只有本地 Ollama 能提供权重 digest；云端 Provider 无此信息返回 None
+    （云端模型变更由 cache_identity 里的 provider/model/dimensions 标识兜底）。
+    """
 
     global _MODEL_DIGEST, _MODEL_DIGEST_FETCHED
 
     if not _MODEL_DIGEST_FETCHED:
         _MODEL_DIGEST_FETCHED = True
-        _MODEL_DIGEST = _fetch_model_digest()
+
+        try:
+            provider = embedding_service.get_settings().provider
+        except embedding_service.EmbeddingConfigError:
+            provider = None
+
+        if provider == embedding_service.PROVIDER_OLLAMA:
+            _MODEL_DIGEST = _fetch_model_digest()
+        else:
+            _MODEL_DIGEST = None
 
     return _MODEL_DIGEST
 
@@ -118,7 +151,7 @@ def ensure_cache_loaded():
 
     usable, reason = vector_cache.check_meta(
         meta,
-        model=embedding_service.EMBEDDING_MODEL,
+        model=embedding_service.cache_identity(),
         model_digest=current_model_digest(),
     )
 
@@ -201,7 +234,7 @@ def _prepare_cache_for_write(dim):
 
     _META_WRITTEN = vector_cache.write_meta(
         vector_cache.build_meta(
-            model=embedding_service.EMBEDDING_MODEL,
+            model=embedding_service.cache_identity(),
             dim=dim,
             model_digest=current_model_digest(),
             chunk_max_chars=CHUNK_MAX_CHARS,
@@ -307,12 +340,218 @@ def _chunk_vectors(chunks):
     return [_EMBEDDING_CACHE[content_hash] for content_hash in chunk_hashes]
 
 
+def _log_retrieval_metrics(query, top_results, elapsed_seconds, mode):
+    """检索埋点：追加写 rag_metrics.jsonl，供 eval_rag_metrics.py 离线计算
+    Recall@3 / MRR / 检索延迟。记录失败绝不影响检索本身。"""
+    try:
+        record = {
+            "ts": time.time(),
+            "query": query,
+            "mode": mode,
+            "latency_ms": round(elapsed_seconds * 1000, 2),
+            "sources": [chunk["source"] for chunk in top_results],
+            "scores": [chunk["score"] for chunk in top_results],
+        }
+        metrics_path = Path(__file__).resolve().parent / "rag_metrics.jsonl"
+        with metrics_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass  # 指标记录是可观测性功能，任何异常都不让检索失败
+
+
+def retrieval_mode():
+    """当前检索模式（每次读取环境变量）。
+
+    - vector（默认）：纯向量基线
+    - hybrid：向量 + BM25 + RRF
+    - 其他取值直接报配置错误，不静默回退到某个模式
+    """
+
+    mode = (os.getenv("RAG_RETRIEVAL_MODE") or RETRIEVAL_MODE_VECTOR).strip().lower()
+
+    if mode not in {RETRIEVAL_MODE_VECTOR, RETRIEVAL_MODE_HYBRID}:
+        raise ValueError(
+            f"RAG_RETRIEVAL_MODE 取值非法：{mode!r}，只支持 vector 或 hybrid"
+        )
+
+    return mode
+
+
+def _vector_scored(query, chunks):
+    """全部 chunk 的余弦相似度 [(chunk, cosine)]，降序，不做阈值过滤。
+
+    Embedding 失败原样抛 EmbeddingError，由调用方决定降级。
+    """
+
+    query_vector = get_embedding(query.strip())
+    ensure_cache_loaded()
+    _validate_cache_dim(len(query_vector))
+    vectors = _chunk_vectors(chunks)
+
+    scored = [
+        (chunk, round(_cosine_similarity(query_vector, vector), 4))
+        for chunk, vector in zip(chunks, vectors)
+    ]
+
+    scored.sort(key=lambda item: item[1], reverse=True)
+
+    return scored
+
+
+def _vector_ranked(query, chunks, limit):
+    """向量候选排名列表 [(chunk, cosine)]。
+
+    - MIN_SCORE 只在这里生效（阈值始终约束向量检索）
+    - 按余弦降序，最多 limit 条
+    """
+
+    passed = [
+        (chunk, score)
+        for chunk, score in _vector_scored(query, chunks)
+        if score >= MIN_SCORE
+    ]
+
+    return passed[:limit]
+
+
+def _bm25_ranked(query, chunks, limit):
+    """BM25 排名列表 [(chunk, bm25_score)]（分数 > 0，即至少命中一个查询词）。
+
+    失败抛 sparse_service.SparseError，由调用方决定降级。
+    """
+
+    index = sparse_service.get_index(chunks)
+
+    return [(chunks[index_position], score)
+            for index_position, score in index.search(query, limit)]
+
+
+def _retrieve_vector(query, chunks, top_k):
+    """纯向量模式：返回结构与历史版本完全一致 [{content, source, score}]。"""
+
+    try:
+        ranked = _vector_ranked(query, chunks, top_k)
+    except EmbeddingError as error:
+        # embedding 不可用时当作“没有检索到资料”，不影响 /ask 继续回答问题
+        print("embedding 调用失败:", error)
+        return []
+
+    return [
+        {"content": chunk["content"], "source": chunk["source"], "score": score}
+        for chunk, score in ranked
+    ]
+
+
+def _retrieve_hybrid(query, chunks, top_k):
+    """混合模式：向量 + BM25 两路排名做 RRF 融合。
+
+    - 同一 (source, content) 片段两路都命中时去重，融合分数相加，matched_by 记录命中通道
+    - MIN_SCORE 只约束向量通道；BM25 通道的候选规则是“至少命中一个查询词（分数>0）”
+    - score 是 RRF 排名融合分（score_type="rrf_fusion"），vector_score 才是余弦相似度，
+      两者量纲不同，不做数值混合
+    - 单路失败只降级不致命：向量失败用 BM25 结果，BM25 失败用向量结果；
+      两路都失败/都无结果返回 []（工具层据此区分“服务故障”与“确实没有相关内容”）
+    """
+
+    vector_all = []
+    vector_ranked = []
+    vector_error = None
+
+    try:
+        vector_all = _vector_scored(query, chunks)
+        vector_ranked = [
+            (chunk, score) for chunk, score in vector_all if score >= MIN_SCORE
+        ][:top_k]
+    except EmbeddingError as error:
+        vector_error = error
+
+    bm25_ranked = []
+    bm25_error = None
+
+    try:
+        bm25_ranked = _bm25_ranked(query, chunks, top_k * BM25_CANDIDATE_MULTIPLIER)
+    except sparse_service.SparseError as error:
+        bm25_error = error
+
+    if vector_error is not None:
+        print("embedding 调用失败（hybrid 向量通道降级）:", vector_error)
+
+    if bm25_error is not None:
+        print("关键词检索失败（hybrid BM25 通道降级）:", bm25_error)
+
+    if vector_error is not None and bm25_error is not None:
+        return []
+
+    fused = {}
+
+    def entry_for(chunk):
+        key = (chunk.get("source"), chunk.get("content"))
+
+        if key not in fused:
+            fused[key] = {
+                "chunk": chunk,
+                "fusion": 0.0,
+                "vector_score": None,
+                "matched_by": [],
+            }
+
+        return fused[key]
+
+    # vector_score 记录真实余弦（含低于 MIN_SCORE 的），只有过阈值进入候选排名的才算命中向量通道
+    cosine_by_key = {
+        (chunk.get("source"), chunk.get("content")): score
+        for chunk, score in vector_all
+    }
+
+    for rank, (chunk, cosine) in enumerate(vector_ranked, start=1):
+        entry = entry_for(chunk)
+        entry["fusion"] += 1.0 / (RRF_K + rank)
+        entry["vector_score"] = cosine
+
+        if "vector" not in entry["matched_by"]:
+            entry["matched_by"].append("vector")
+
+    for rank, (chunk, _score) in enumerate(bm25_ranked, start=1):
+        entry = entry_for(chunk)
+        entry["fusion"] += 1.0 / (RRF_K + rank)
+
+        if "bm25" not in entry["matched_by"]:
+            entry["matched_by"].append("bm25")
+
+    # 仅 BM25 命中的片段也补上真实余弦（向量通道算过的话），便于观察阈值边界
+    for key, entry in fused.items():
+        if entry["vector_score"] is None:
+            entry["vector_score"] = cosine_by_key.get(key)
+
+    merged = sorted(fused.values(), key=lambda item: item["fusion"], reverse=True)
+
+    results = []
+
+    for entry in merged[:top_k]:
+        chunk = entry["chunk"]
+
+        results.append({
+            "content": chunk["content"],
+            "source": chunk["source"],
+            "score": round(entry["fusion"], 6),
+            "score_type": "rrf_fusion",
+            "vector_score": entry["vector_score"],
+            "matched_by": entry["matched_by"],
+        })
+
+    return results
+
+
 def retrieve_chunks(query, top_k=TOP_K):
-    """用 embedding + 余弦相似度返回最相关的前 top_k 个片段。
+    """检索最相关的前 top_k 个片段（模式由 RAG_RETRIEVAL_MODE 决定）。
 
     返回格式：
-    [{"content": "知识片段内容", "source": "math.txt", "score": 0.8}]
+    - vector 模式：[{"content", "source", "score"}]（score = 余弦相似度）
+    - hybrid 模式：[{...同上, "score_type", "vector_score", "matched_by"}]
+      （score = RRF 融合分，仅用于排序）
     """
+
+    started = time.perf_counter()
 
     if not isinstance(query, str) or not query.strip():
         return []
@@ -322,33 +561,16 @@ def retrieve_chunks(query, top_k=TOP_K):
     if not chunks:
         return []
 
-    try:
-        query_vector = get_embedding(query.strip())
-        ensure_cache_loaded()
-        _validate_cache_dim(len(query_vector))
-        vectors = _chunk_vectors(chunks)
-    except EmbeddingError as error:
-        # embedding 不可用时当作“没有检索到资料”，不影响 /ask 继续回答问题
-        print("embedding 调用失败:", error)
-        return []
+    mode = retrieval_mode()
 
-    results = []
+    if mode == RETRIEVAL_MODE_HYBRID:
+        results = _retrieve_hybrid(query, chunks, top_k)
+    else:
+        results = _retrieve_vector(query, chunks, top_k)
 
-    for chunk, vector in zip(chunks, vectors):
-        score = round(_cosine_similarity(query_vector, vector), 4)
+    _log_retrieval_metrics(query, results, time.perf_counter() - started, mode)
 
-        if score >= MIN_SCORE:
-            results.append(
-                {
-                    "content": chunk["content"],
-                    "source": chunk["source"],
-                    "score": score,
-                }
-            )
-
-    results.sort(key=lambda item: item["score"], reverse=True)
-
-    return results[:top_k]
+    return results
 
 
 def format_context(chunks):

@@ -9,6 +9,14 @@
 结束时校验真实 feedback.db / knowledge/ / .rag_cache 未被改动。
 """
 
+import os
+
+# 测试夹具：真实模型/Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
+
 import contextlib
 import copy
 import gc
@@ -16,6 +24,7 @@ import io
 import json
 import shutil
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import agent_dispatcher
@@ -39,6 +48,14 @@ def check(name, condition, detail=""):
     if not condition:
         raise AssertionError(f"FAILED: {name} {detail}")
     print(f"PASS: {name} {detail}")
+
+
+def days_ago(days, hour=9):
+    """夹具时间戳：相对“今天”生成，保证 get_recent_feedback(days=7) 的时间窗内始终有效。"""
+
+    moment = datetime.now() - timedelta(days=days)
+
+    return moment.replace(hour=hour, minute=0, second=0, microsecond=0).isoformat()
 
 
 def info(name, detail):
@@ -136,7 +153,7 @@ def seed_feedback():
             "completed_questions": 2,
             "total_questions": 4,
         },
-        "2026-10-04T20:00:00",
+        days_ago(2, hour=20),
     )
     database.insert_feedback(
         {
@@ -150,7 +167,7 @@ def seed_feedback():
             "completed_questions": 4,
             "total_questions": 4,
         },
-        "2026-10-05T09:00:00",
+        days_ago(1),
     )
 
 
@@ -256,7 +273,7 @@ try:
             "completed_questions": 0,
             "total_questions": 0,
         },
-        "2026-10-05T09:00:00",
+        days_ago(1),
     )
     try:
         with stub_llm(dynamic_llm):

@@ -15,9 +15,7 @@ import json
 import threading
 import time
 
-import requests
-
-from ai_service import OLLAMA_MODEL, OLLAMA_URL
+import llm_client
 
 from agent_dispatcher import dispatch
 from agent_schema import describe_tools, get_tool_schemas
@@ -28,12 +26,6 @@ MAX_LOOP_TURNS = 3
 
 # 整个 Agent Run 的墙钟预算（从进入 Loop 开始计时）
 MAX_RUN_SECONDS = 120
-
-# 单次 HTTP 调用的连接/读取间隔超时。
-# 注意：requests 的 read timeout 是“两次读取之间”的超时，服务端持续滴流时
-# 总耗时不会被它限制，所以它不能当成 Run 的总预算——真正的总预算由 _Deadline 负责。
-OLLAMA_CONNECT_TIMEOUT = 10
-OLLAMA_READ_TIMEOUT = 30
 
 STOP_FINAL_ANSWER = "final_answer"
 STOP_TOOL_BUDGET = "tool_budget_exceeded"
@@ -110,34 +102,19 @@ def _call_with_deadline(func, deadline):
 
 
 def build_system_prompt():
-    """系统 Prompt：角色、目标、可用工具（来自 Schema）与行为规则。"""
+    """系统 Prompt：角色、目标、可用工具（来自 Schema）与行为规则。
 
-    return f"""你是 AI Study Assistant Agent。
+    文案集中在 prompt_registry（任务 agent_system，支持版本切换）。
+    """
 
-目标：
-根据用户要求，帮助用户分析学习情况、查询知识库，并回答问题。
+    import prompt_registry
 
-可用工具：
-{describe_tools()}
-
-规则：
-1. 不要编造用户历史反馈。
-2. 需要真实历史时调用 get_recent_feedback。
-3. 需要知识库内容时调用 search_knowledge。
-4. Tool Result 是外部真实结果，不得伪造。
-5. Tool 出现错误时，不得假装调用成功。
-6. 没有足够信息时直接说明缺少信息。
-7. 最多调用 {MAX_TOOL_CALLS} 次 Tool。
-8. 最多运行 {MAX_LOOP_TURNS} 轮。
-9. 除 save_plan 外，当前阶段禁止修改任何用户数据。
-10. save_plan 只能用于保存用户已经明确确认的计划：confirmation_id 必须来自"用户确认后由系统签发"的真实凭证；你自己生成的 confirmation_id 或 confirmed 类参数不构成用户确认。
-11. 没有有效 confirmation_id 时不要调用 save_plan；如果保存被拒绝（例如 confirmation_required），如实告诉用户需要先确认计划，不要编造凭证重试。
-12. 对于通用概念问题（例如“什么是 Embedding”），如果用户只要求简短解释、没有要求依据知识库，而你自己就能回答，就直接回答，不要调用 search_knowledge。
-13. 但如果用户明确要求“根据知识库”“结合我的资料”“在知识库中查找”，或者问题明显依赖本项目的专有资料（例如知识库里的具体学习步骤），则仍然必须调用 search_knowledge。
-14. 不要为了调用工具而调用工具：先判断这个问题需不需要外部信息，再决定是否调用。
-15. 来源完整性：用户明确要求“根据知识库”“根据我的资料”“知识库里说什么”时，必须真实调用 search_knowledge 取得资料；在没有 Tool Result 的情况下，不得声称答案来自知识库、资料或检索结果。
-16. 如果 search_knowledge 调用失败，必须明确告诉用户知识库检索当前不可用；不得把自己的模型知识说成知识库内容。
-"""
+    return prompt_registry.render(
+        "agent_system",
+        tools=describe_tools(),
+        max_tool_calls=MAX_TOOL_CALLS,
+        max_loop_turns=MAX_LOOP_TURNS,
+    )
 
 
 SYSTEM_PROMPT = build_system_prompt()
@@ -146,8 +123,9 @@ SYSTEM_PROMPT = build_system_prompt()
 def chat_with_tools(messages, tools=None, deadline=None):
     """本模块唯一的 LLM 边界，返回 (assistant_message, error)。
 
-    - 使用流式读取（Ollama NDJSON）：可以在每个数据块之间检查绝对 deadline，
-      一旦超过 Run 预算就立即关闭连接，而不是无限等待滴流响应。
+    - 底层统一走 llm_client（Provider 由 LLM_PROVIDER 选择：ollama / openai_compatible），
+      业务层不需要知道模型来自哪里。
+    - 流式读取期间每个数据块之间都检查绝对 deadline，超过 Run 预算立即关闭连接。
     - deadline 为 None 时不限时（测试用桩替换整个函数）。
     - 超时返回 (None, AGENT_TIMEOUT)，调用方据此产生稳定的超时错误结构。
     """
@@ -155,91 +133,12 @@ def chat_with_tools(messages, tools=None, deadline=None):
     if deadline is not None and deadline.expired():
         return None, AGENT_TIMEOUT
 
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": messages,
-        "stream": True,
-        "think": False,
-    }
+    result, error = llm_client.chat(messages, tools=tools, deadline=deadline)
 
-    if tools:
-        payload["tools"] = tools
+    if error:
+        return None, error
 
-    read_timeout = OLLAMA_READ_TIMEOUT
-
-    if deadline is not None:
-        # 单次静默等待也不会超过剩余预算
-        read_timeout = max(1, min(OLLAMA_READ_TIMEOUT, deadline.remaining()))
-
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json=payload,
-            stream=True,
-            timeout=(OLLAMA_CONNECT_TIMEOUT, read_timeout),
-        )
-    except requests.exceptions.Timeout:
-        return None, "Ollama 请求超时"
-    except requests.exceptions.RequestException as error:
-        return None, f"无法连接 Ollama（{type(error).__name__}）"
-
-    try:
-        response.raise_for_status()
-    except requests.exceptions.RequestException as error:
-        response.close()
-        return None, f"Ollama HTTP 错误（{type(error).__name__}）"
-
-    content_parts = []
-    tool_calls = []
-
-    try:
-        for line in response.iter_lines(decode_unicode=True):
-            # 每个数据块之间检查绝对 deadline：滴流响应也无法突破总预算
-            if deadline is not None and deadline.expired():
-                return None, AGENT_TIMEOUT
-
-            if not line:
-                continue
-
-            try:
-                chunk = json.loads(line)
-            except ValueError:
-                continue
-
-            message = chunk.get("message") or {}
-
-            if message.get("content"):
-                content_parts.append(message["content"])
-
-            # 流式响应可能把多个 tool_call 分散在不同数据块里，必须累积而不是覆盖
-            for item in message.get("tool_calls") or []:
-                identifier = item.get("id")
-
-                if identifier is not None and any(
-                    existing.get("id") == identifier for existing in tool_calls
-                ):
-                    continue
-
-                tool_calls.append(item)
-
-            if chunk.get("done"):
-                break
-    except requests.exceptions.Timeout:
-        return None, "Ollama 请求超时"
-    except requests.exceptions.RequestException as error:
-        return None, f"Ollama 连接中断（{type(error).__name__}）"
-    finally:
-        response.close()
-
-    assistant_message = {
-        "role": "assistant",
-        "content": "".join(content_parts),
-    }
-
-    if tool_calls:
-        assistant_message["tool_calls"] = tool_calls
-
-    return assistant_message, None
+    return result["message"], None
 
 
 def _parse_tool_calls(message):
@@ -280,6 +179,8 @@ def _log(verbose, tag, message):
 
 
 def _result(ok, final_answer, stopped_reason, error, state, steps, wrap_up_used=False, error_type=None):
+    started = state.get("started_perf")
+
     return {
         "ok": ok,
         "final_answer": final_answer,
@@ -291,6 +192,8 @@ def _result(ok, final_answer, stopped_reason, error, state, steps, wrap_up_used=
         "wrap_up_used": wrap_up_used,
         "steps": steps,
         "messages": state["messages"],
+        # 端到端耗时（用户请求 → 最终回答/草案），供评测与可观测使用
+        "elapsed_seconds": round(time.perf_counter() - started, 3) if started else None,
     }
 
 
@@ -383,10 +286,13 @@ def run_agent(
     """
 
     clock = clock if clock is not None else time.monotonic
+    run_started = time.perf_counter()
+
     deadline = _Deadline(max_run_seconds, clock)
 
     state = {
         "user_message": user_message,
+        "started_perf": run_started,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_message},

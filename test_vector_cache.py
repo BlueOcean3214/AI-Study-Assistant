@@ -11,6 +11,13 @@
 15 末行截断不崩           16 compact 压实         17+ 1000 chunk 规模验证
 """
 
+import os
+
+# 测试夹具：真实 Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+
 import array
 import contextlib
 import shutil
@@ -178,8 +185,8 @@ try:
     check("jsonl 行数等于 chunk 数", line_count == 10, f"lines={line_count}")
     disk_meta = vector_cache.read_meta()
     check(
-        "meta 记录了模型和维度",
-        disk_meta["model"] == embedding_service.EMBEDDING_MODEL and disk_meta["dim"] == 1024,
+        "meta 记录了缓存身份（provider:model@dim）和维度",
+        disk_meta["model"] == embedding_service.cache_identity() and disk_meta["dim"] == 1024,
         f"{disk_meta['model']}/{disk_meta['dim']}",
     )
     check("meta 记录了 chunk_max_chars", disk_meta["chunk_max_chars"] == 400)
@@ -268,8 +275,8 @@ try:
         rag_service.retrieve_chunks("模型测试内容")
     check("模型不一致时重新 embedding", len(model_calls) == 1, f"calls={len(model_calls)}")
     check(
-        "重新生成后 meta 已更新为新模型",
-        vector_cache.read_meta()["model"] == embedding_service.EMBEDDING_MODEL,
+        "重新生成后 meta 已更新为新模型身份",
+        vector_cache.read_meta()["model"] == embedding_service.cache_identity(),
     )
     check(
         "旧缓存已归档备份",

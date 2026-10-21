@@ -12,6 +12,13 @@
 以及架构约束（Tool 面为三个只读函数 + 受确认保护的 save_plan、不得暴露禁用函数、main 只做 import）。
 """
 
+import os
+
+# 测试夹具：真实 Embedding 探测用例显式回退本地 Ollama（代码默认云端百炼）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+
 import gc
 import re
 import shutil

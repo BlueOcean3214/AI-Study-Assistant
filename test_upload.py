@@ -9,6 +9,12 @@
 """
 
 import os
+
+# 测试夹具：检索验证用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+os.environ.setdefault("LLM_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
+os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+
 import shutil
 import socket
 import subprocess

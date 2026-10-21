@@ -1,0 +1,90 @@
+{
+  "generated_at": "2026-10-19T19:54:13",
+  "mode": "real",
+  "scenarios": [
+    {
+      "id": "S1_basic",
+      "message": "根据我最近的学习情况，制定明天的学习计划草案。"
+    },
+    {
+      "id": "S2_knowledge",
+      "message": "结合知识库里的定积分学习步骤和我的反馈，制定学习计划草案。"
+    },
+    {
+      "id": "S3_plain",
+      "message": "随便帮我制定一个学习计划草案。"
+    }
+  ],
+  "rows": [
+    {
+      "id": "S1_basic",
+      "variant": "v1",
+      "mode": "real",
+      "completed": true,
+      "schema_first_pass": true,
+      "corrections_used": 0,
+      "elapsed_seconds": 43.128
+    },
+    {
+      "id": "S1_basic",
+      "variant": "v2",
+      "mode": "real",
+      "completed": true,
+      "schema_first_pass": true,
+      "corrections_used": 0,
+      "elapsed_seconds": 19.233
+    },
+    {
+      "id": "S2_knowledge",
+      "variant": "v1",
+      "mode": "real",
+      "completed": true,
+      "schema_first_pass": true,
+      "corrections_used": 0,
+      "elapsed_seconds": 18.842
+    },
+    {
+      "id": "S2_knowledge",
+      "variant": "v2",
+      "mode": "real",
+      "completed": true,
+      "schema_first_pass": true,
+      "corrections_used": 0,
+      "elapsed_seconds": 18.606
+    },
+    {
+      "id": "S3_plain",
+      "variant": "v1",
+      "mode": "real",
+      "completed": true,
+      "schema_first_pass": true,
+      "corrections_used": 0,
+      "elapsed_seconds": 19.321
+    },
+    {
+      "id": "S3_plain",
+      "variant": "v2",
+      "mode": "real",
+      "completed": true,
+      "schema_first_pass": true,
+      "corrections_used": 0,
+      "elapsed_seconds": 15.905
+    }
+  ],
+  "summary": {
+    "v1": {
+      "n": 3,
+      "task_completion_rate": 1.0,
+      "schema_first_pass_rate": 1.0,
+      "avg_corrections": 0.0,
+      "avg_elapsed_seconds": 27.1
+    },
+    "v2": {
+      "n": 3,
+      "task_completion_rate": 1.0,
+      "schema_first_pass_rate": 1.0,
+      "avg_corrections": 0.0,
+      "avg_elapsed_seconds": 17.91
+    }
+  }
+}
