@@ -1,4 +1,4 @@
-# 第二阶段：学习记忆管理 —— 方案设计（v7）
+# 第二阶段：学习记忆管理 —— 方案设计（v8）
 
 - 基线：`main` @ `fb22365`（第一阶段已合并）
 - 代码阅读范围：`database.py`、`main.py`、`feedback_service.py`、`agent_tools.py`、`agent_loop.py`、`agent_schema.py`、`agent_dispatcher.py`、`agent_plan_draft.py`、`context_builder.py`、`langgraph_plan_workflow.py`、`rag_service.py`、`plan_service.py`、`prompt_registry.py`、`static/feedback.html`，以及 `test_agent_tools.py` / `test_agent_loop.py` / `test_database_migrations.py` / `test_feedback_plan_link.py`
@@ -7,7 +7,20 @@
 
 ## 0. 修订记录
 
-### v6 → v7（本轮，外部审查 P0/P1）
+### v7 → v8（本轮，预审复核 P1/P2）
+
+| # | 审查意见 | 处理 |
+| --- | --- | --- |
+| P1-1 | `REQUIRED` 已改按 samples，但 `STABLE` 与封顶仍按 `supports`，低完成率时「初步观察」期被拉长到双倍门槛 | §5.5 表：`STABLE` 与 `REQUIRED` **同单位**（task_performance 6 samples、time_pattern 8 samples）；公式引入 `unit`，`base` 与封顶都用 `unit` |
+| P1-2 | §5.3.5 写入 `pending_started_at`，DDL 里没有这个字段 | 删掉该赋值，pending 只用 `pending_episode` + `pending_start_feedback_id` |
+| P1-3 | §5.3.8「能复现」清单未限定 `now`，与末尾 now pass 自相矛盾 | 改为「**两侧注入同一 `now` 时**能复现：…」，并在"不能复现"里显式点名 now pass 的 `archived` 与事件 |
+| P1-4 | neutral 与 direction 统计量的关系没写死，实现可能把 neutral 剔出中位数/完成率 | §5.2 补一句：**neutral 只影响 relation 与两个计数，不影响 direction 的统计量**；完成率分母与中位 ratio 用全部有效候选 |
+| P2-1 | `episode_start_feedback_id = MIN(新轮 supports …)` 与 §5.3.1 定义不一致（首条证据可能是 contradicts） | 改为 `MIN(新轮全部 evidence 的 feedback_id)` |
+| P2-2 | §5.2 第 5 条留着"或至少保证同事务一致"的退路，与"一律 COUNT"并存 | 删掉退路半句；并补 `last_supported_at` 与计数**同源**（取 supports 证据的 `MAX(created_at)`） |
+| P2-3 | 用例数 131 应为 130 | §8.2 改「约 130 例」 |
+| P2-4 | §10 括号里写「任务 3 +0.8」，实际 +0.1 | 改为 v7 +0.1、v8 +0（只改口径） |
+
+### v6 → v7（已完成）
 
 | # | 审查意见 | 处理 |
 | --- | --- | --- |
@@ -188,7 +201,7 @@ langgraph_plan_workflow
 - `time_pattern` → `{difficulty_label} 任务近期 {samples} 次实际用时约为预估的 {ratio:.1f} 倍`
 - `task_topic` → `「{subject}」近期反馈中 {appearances} 次出现`
 
-同一份证据永远渲染同一句；`supports < STABLE` 时前缀「初步观察：」。
+同一份证据永远渲染同一句；`unit < STABLE` 时前缀「初步观察：」（`unit` 按 §5.5 的计入单位取 `supports` 或 `samples`）。
 
 ### 2.4 与第三阶段的分工
 
@@ -390,7 +403,7 @@ memory_context.py                   ← collect_short_term(I/O) + render_short_t
 2. 用 `insert_evidence(memory_id, feedback_id, plan_id, episode, relation, created_at=候选反馈的 created_at, weight)` 写入，SQL 是 `INSERT OR IGNORE`；
 3. `inserted=False` 时**必须读回既有行**（`get_evidence(memory_id, feedback_id)`），逐字段核对 `relation / episode / plan_id`；
 4. 核对不一致 → 返回 `data_inconsistency`，**不覆盖、不累加**；一致 → 视为幂等成功，不写事件；
-5. `evidence_count` / `contradict_count` **一律由正式 `memory_evidence` 重新 `COUNT`**（`WHERE episode=当前 AND relation=...`），或至少保证"插行 + 计数"在同一事务内严格一致——**禁止"只更新计数、不保存原始证据"**；
+5. `evidence_count` / `contradict_count` **一律由正式 `memory_evidence` 重新 `COUNT`**（`WHERE episode=当前 AND relation=...`），`last_supported_at` 同源取 `MAX(created_at WHERE relation='supports')`——**禁止"只更新计数、不保存原始证据"**，也禁止把 `last_supported_at` 直接赋成 `as_of`；
 6. 同一 `feedback_id` 重复调用**不能增加计数**：靠唯一索引 + 第 3 步核对共同保证；
 7. **晋升路径（pending → 正式）同样适用**：晋升时一次性写入的每条证据都走同一套写入与核对（§5.3.3 第 4 步）；
 8. **`episode` 必须与写入时的轮次一致**：当前轮写 `episode`，晋升轮写 `pending_episode`，不允许写 `episode+1` 之外的推测值。
@@ -408,7 +421,7 @@ memory_context.py                   ← collect_short_term(I/O) + render_short_t
 | `time_pattern` | `direction=slow` 时 `ratio ≥1.5`；`direction=fast` 时 `ratio ≤0.4` | 反方向且 ratio 有效 | `0.4 < ratio < 1.5` |
 | `task_topic` | 恒 `supports` | 无 | 无 |
 
-**neutral 候选（v6 修正 P0-3）**：既不是 `supports` 也不是 `contradicts` 的样本（上表第 4 列）**不写入 `memory_evidence`**、分子分母都不计；晋升时随缓冲区一起删除，计 `info.neutral_dropped`。绝不允许把 neutral 一律当 `contradicts`——那会凭空制造 weakened/resolved。
+**neutral 候选（v6 修正 P0-3，v8 补统计口径）**：既不是 `supports` 也不是 `contradicts` 的样本（上表第 4 列）**不写入 `memory_evidence`**、分子分母（`supports`/`contradicts` 计数）都不计；晋升时随缓冲区一起删除，计 `info.neutral_dropped`。绝不允许把 neutral 一律当 `contradicts`——那会凭空制造 weakened/resolved。**但 neutral 仍参与方向统计量的计算**：`task_performance` 的完成率分母、`time_pattern` 的中位 `ratio` 都必须用**全部有效候选**（含 neutral）计算——否则中位数会变、方向会跟着变，连"这条记忆该不该建"都会变。一句话：**neutral 只影响 relation 与两个计数，不影响 direction 的统计量**。
 
 **`direction` 在本轮创建时固定**（写进 `value_json`），本轮内不改——这正是"证据不可变"能成立的前提；`direction` 需要变时只能通过 `rebuild_all()` 全量重建。
 
@@ -454,7 +467,7 @@ UNIQUE(memory_id, feedback_id)
 2. 按新 direction 逐条判定最终 `relation`（映射表见 §5.2）；判定为 **neutral** 的候选直接丢弃（计 `info.neutral_dropped`，不写证据）；
 3. **一次性 INSERT 正式 `memory_evidence`**（带最终 relation 与 `episode = pending_episode`，`created_at` = 该反馈的 `created_at`），每条都走 §5.2 第 3–4 步的 `inserted` 核对；**绝不先写占位再 UPDATE**；
 4. 删除本轮对应 pending 行（含 neutral 与超窗行，晋升后缓冲区清空）；
-5. 更新记忆：`episode = pending_episode`、`episode_start_feedback_id = MIN(新轮 supports 的 feedback_id)`、`episode_started_at = as_of`、计数与 `value_json` / `content` / `strength` 按新轮重算、`status = active`、清空 `pending_*`、`last_supported_at = as_of`、`updated_at = as_of`；
+5. 更新记忆：`episode = pending_episode`、`episode_start_feedback_id = MIN(新轮全部 evidence 的 feedback_id)`（v8 修正 P2-1：新轮首条证据可能是 contradicts，不能取"supports 的最小 id"）、`episode_started_at = as_of`、计数与 `value_json` / `content` / `strength` 按新轮重算、`status = active`、清空 `pending_*`、`last_supported_at = 新轮 supports 证据的 MAX(created_at)`、`updated_at = as_of`；
 6. 写事件 `reopened` / `reopened_from_archived`，`detail_json` 含 `as_of` 与 `evidence_ids`。
 
 **注意**：第 0 步的清理发生在**每次调用 `_try_promote` 时**，而不是只在晋升成功时——方向迟迟不可定的记忆，其过期行也会在每个新反馈到来时被清掉。
@@ -481,7 +494,7 @@ is_stale(memory, as_of) = (as_of − last_supported_at) > STALE_DAYS(60)
 | `active` | 新 `supports` | `active` | **追加一行正式证据**（relation=`supports`、episode=当前轮）+ 计数按 `COUNT` 重算 + `last_supported_at=as_of` + `strength` 重算 + 写 `strengthened` |
 | `active` | 新 `contradicts`（未达推翻） | `weakened` | **追加一行正式证据**（relation=`contradicts`）+ 计数按 `COUNT` 重算 + `strength` 重算 + 写 `weakened` |
 | `active`/`weakened` | 新 neutral 样本 | 不变 | **不写证据**、不计分子分母，计 `info.neutral_dropped` |
-| `weakened` | `contradicts ≥ 3` 且全部晚于最后一次 `supports` | `resolved` | 内容改写、固定 `pending_*`（`pending_episode = episode+1`、`pending_start_feedback_id = MAX(全部轮 evidence.feedback_id)`、`pending_started_at = as_of`；若已存在则沿用不重置）、写 `resolved` |
+| `weakened` | `contradicts ≥ 3` 且全部晚于最后一次 `supports` | `resolved` | 内容改写、固定 `pending_*`（`pending_episode = episode+1`、`pending_start_feedback_id = MAX(全部轮 evidence.feedback_id)`；若已存在则沿用不重置）、写 `resolved` |
 | `resolved` | `_materialize_stale`（as_of 超 60 天） | `archived` | 写 `archived`（`reason=stale_as_of`）；**保留既有 `pending_*` 与缓冲区，不重置**（v6 修正 P1-4） |
 | `weakened` | 新 `supports` 使 `strength ≥ 0.5` | `active` | 写 `strengthened`（不换轮） |
 | `active` / `weakened` | `_materialize_stale`（as_of 超 60 天） | `archived` | 固定 `pending_*`、写 `archived`（`reason=stale_as_of`） |
@@ -532,8 +545,8 @@ def subject_key_for(mtype, trigger):
 
 #### 5.3.8 重建一致性的承诺边界
 
-- **能复现**：episode 边界、pending 归属与晋升时刻、正式证据的 `relation`/`episode`、`status` 迁移序列、事件类型与 `memory_id` 序列；
-- **不能复现（重新生成）**：事件行 id、`recorded_at` 这类机械时间戳；
+- **两侧注入同一 `now` 时能复现**：episode 边界、pending 归属与晋升时刻、正式证据的 `relation`/`episode`、`status` 迁移序列、事件类型与 `memory_id` 序列；
+- **不能复现（重新生成）**：事件行 id、`recorded_at` 这类机械时间戳；**两个不同 `now` 之间，末尾 now pass 可能新增 `archived` 与其事件**，因此"迁移序列/事件序列相等"只在同一 `now` 下成立；
 - **受运行时时钟影响的一处**：回放末尾的 `_materialize_stale(all, now)` 可能新增 `archived` 与对应事件的 `as_of`。因此 `rebuild_all(now=None)` 允许注入固定 `now`：测试里两侧都用同一 `now` 时"逐表相等"成立（B1）；生产语义是"当前时间下应有的状态"（v6 修正 P1-3）；
 - **不再承诺**：用户历史上手动调用过几次 `archive_stale()`——归档已改为按 `as_of` 派生，调用次数不影响结果。
 
@@ -550,25 +563,28 @@ def subject_key_for(mtype, trigger):
 | 常量 | difficulty | task_performance | time_pattern | task_topic |
 | --- | --- | --- | --- | --- |
 | `REQUIRED`（生成门槛） | 2 | 3 | 4 | 3 |
-| **计入单位（v6 修正 P1-1）** | `supports`（难度失败条数） | **有效样本总数 samples** | **有效样本总数 samples** | 出现次数（= samples） |
-| `STABLE`（= 2×REQUIRED） | 4 | 6 | 8 | 6 |
+| **计入单位（v6 修正 P1-1，v8 全表统一）** | `supports`（难度失败条数） | **有效样本总数 samples** | **有效样本总数 samples** | 出现次数（= samples） |
+| `STABLE`（= 2×REQUIRED，**与 REQUIRED 同单位**） | 4 supports | 6 **samples** | 8 **samples** | 6 samples |
 
-**计入单位的理由（这是 v5 的真 bug）**：`task_performance` 的结论条件本身是「≥3 条反馈 **且** completion_rate ≤0.5 / ≥0.8」。若 `REQUIRED` 也去数 `supports`，low 方向下 3 条样本最多只有 2 条 supports，记忆**永远不会生成**（§8.2 的 S3「1/3 完成率」用例直接矛盾）。因此该类型的门槛数**样本**，`supports` 只用于算强度；`time_pattern` 同理由门槛数样本；`difficulty` 的门槛确实是"难度失败条数"，所以仍数 `supports`；`task_topic` 无方向，出现即支持。
+**计入单位的理由（这是 v5 的真 bug）**：`task_performance` 的结论条件本身是「≥3 条反馈 **且** completion_rate ≤0.5 / ≥0.8」。若 `REQUIRED` 也去数 `supports`，low 方向下 3 条样本最多只有 2 条 supports，记忆**永远不会生成**（§8.2 的 S3「1/3 完成率」用例直接矛盾），而且 `STABLE` 若仍按 supports 数，「初步观察」期会实际延长到双倍门槛（低完成率时 supports ≈ samples/2，要 12 条样本才摘掉前缀），与 S3/C5 的用例设计冲突。因此 `task_performance` 与 `time_pattern` 的 `REQUIRED` 和 `STABLE` **都以 samples 计**，`supports` 只用于 `contradicts` 惩罚与 `last_supported_at`；`difficulty` 的门槛确实是"难度失败条数"，故仍数 `supports`；`task_topic` 无方向，出现即支持。
 
 **方向不可定**：`task_performance` 的 `rate` 落在 `(0.5, 0.8)` 之间、或 `time_pattern` 的中位 `ratio` 落在 `(0.4, 1.5)` 之间 → 即使样本够也不晋升（保持 pending，计 `info.direction_undetermined`）。
 
 ```
+unit        = supports            # difficulty
+            = samples             # task_performance / time_pattern / task_topic（§5.5 表）
 supports    = 当前 episode 的 supports 计数
 contradicts = 当前 episode 的 contradicts 计数
-base    = min(1.0, supports / STABLE)
+base    = min(1.0, unit / STABLE)
 recency = 0.5 ** (days_since_last_support / 30)
 penalty = 0.6 ** contradicts
 raw     = clamp(base * recency * penalty, 0.05, 0.99)
-strength = min(raw, 0.6 if supports < STABLE else 0.9)
+strength = min(raw, 0.6 if unit < STABLE else 0.9)   # 封顶与 base 用同一个 unit
 ```
 
-- `REQUIRED ≤ supports < STABLE` → cap 0.6（「初步观察」期）；
-- `supports ≥ STABLE` → cap 0.9，永不给 1.0；
+- `REQUIRED ≤ unit < STABLE` → cap 0.6（「初步观察」期）；
+- `unit ≥ STABLE` → cap 0.9，永不给 1.0；
+- **base 与封顶必须用同一个 `unit`**（v8 修正 P1-1）：否则 `task_performance` 低完成率时 supports 只有样本数的一半，「初步观察」期会被动延长到 12 条样本；
 - 三个乘子职责单一，可分别构造用例；
 - 阈值与公式落常量；评测里做半衰期 30/60/90 敏感性检查（只进论文）。
 
@@ -673,7 +689,7 @@ reason: FeedbackReason | None = None
 
 自写脚本 `def test_xxx(): assert ...` + `__main__` 运行器；`check()` / `PASS:` 输出；夹具 `_test_*.db`，`FEEDBACK_DB_PATH` 切换（`database.py:15`），结束删除并断言真实 `feedback.db` 字节不变。
 
-### 8.2 用例矩阵（`test_learning_memory.py`，约 131 例）
+### 8.2 用例矩阵（`test_learning_memory.py`，约 130 例）
 
 | 组 | 编号 | 断言要点 |
 | --- | --- | --- |
@@ -750,7 +766,7 @@ reason: FeedbackReason | None = None
 | 8 | `agent_system` v2 + grounding 扩展 | P2 | 6 | 0.3 天 | 违规用例被判出 |
 | 9 | `docs/STAGE2-LEARNING-MEMORY.md` | P2 | 全部 | 0.3 天 | 含真实测试输出 |
 
-合计约 **8.0 人日**（v2 5.6 → v3 6.5 → v4 6.8 → v5 7.7 → v6 7.9 → v7 8.0：任务 3 +0.8（pending 缓冲区、过期清理、原子晋升、neutral 判定、key 分派与追加证据核对）；分项相加 0.3+0.8+0.3+3.6+1.0+0.6+0.5+0.3+0.3+0.3 = 8.0）。
+合计约 **8.0 人日**（v2 5.6 → v3 6.5 → v4 6.8 → v5 7.7 → v6 7.9 → v7 8.0（任务 3 +0.1）→ v8 8.0（只改口径与措辞，不加人日）；分项相加 0.3+0.8+0.3+3.6+1.0+0.6+0.5+0.3+0.3+0.3 = 8.0）。
 
 **交付节奏**：P0（任务 0–4）一个 PR；P1/P2 另一个 PR。任务 3 风险最高，建议单独 push 一次供中途审查。
 
