@@ -1,4 +1,4 @@
-# 第二阶段：学习记忆管理 —— 方案设计（v9）
+# 第二阶段：学习记忆管理 —— 方案设计（v10）
 
 - 基线：`main` @ `fb22365`（第一阶段已合并）
 - 代码阅读范围：`database.py`、`main.py`、`feedback_service.py`、`agent_tools.py`、`agent_loop.py`、`agent_schema.py`、`agent_dispatcher.py`、`agent_plan_draft.py`、`context_builder.py`、`langgraph_plan_workflow.py`、`rag_service.py`、`plan_service.py`、`prompt_registry.py`、`static/feedback.html`，以及 `test_agent_tools.py` / `test_agent_loop.py` / `test_database_migrations.py` / `test_feedback_plan_link.py`
@@ -7,7 +7,14 @@
 
 ## 0. 修订记录
 
-### v8 → v9（本轮，预审复核 P1/P2）
+### v9 → v10（本轮，外部复审 P1）
+
+| # | 审查意见 | 处理 |
+| --- | --- | --- |
+| P1 | `recency = 0.5 ** (days(as_of − last_support_created_at) / 30)` 在时间戳乱序时 `age` 为负，`recency > 1`，会让更早的反馈抬高 strength | §5.2 与 §5.5 统一为 `age_days = max(0, days(as_of − last_supported_at))`、`recency = 0.5 ** (age_days/30)`；**恒 ≤ 1.0**，`last_supported_at >= as_of` 时 `age_days=0`、`recency=1.0`；`last_supported_at` 语义不变（仍为 supports 证据的 `MAX(created_at)`，不回拨）；不改 `feedback.id` 回放顺序；不改 stale 判定 |
+| 连带 | 测试矩阵与 PR 描述需同步 | §8.2 新增 B12（负 age 防护）/B13（在线 vs 重建一致），用例数 132 → **134**；PR #2 描述同步到 v10 |
+
+### v8 → v9（已完成）
 
 | # | 审查意见 | 处理 |
 | --- | --- | --- |
@@ -404,7 +411,14 @@ memory_context.py                   ← collect_short_term(I/O) + render_short_t
 
 `time_pattern` 同样受 `candidate.id <= trigger.id` 与 as-of 窗口约束——JOIN 只是多一个难度维度，不改变边界规则。
 
-**计算**：纯函数 `evaluate(type, candidates, as_of) -> Conclusion(value_json, supports_ids, contradicts_ids, direction) | None`；`strength` 的 `recency` 也按 `as_of` 计算：`0.5 ** (days(as_of − last_support_created_at) / 30)`，不使用运行时真实时间。
+**计算**：纯函数 `evaluate(type, candidates, as_of) -> Conclusion(value_json, supports_ids, contradicts_ids, direction) | None`；`strength` 的 `recency` 也按 `as_of` 计算，**且必须对负 age 做钳制（v10 修正）**：
+
+```python
+age_days = max(0, days(as_of - last_supported_at))   # created_at 允许乱序，age 可能为负
+recency  = 0.5 ** (age_days / 30)                    # 恒 ≤ 1.0
+```
+
+不使用运行时真实时间；**当 `last_supported_at >= as_of` 时 `age_days = 0`、`recency = 1.0`**，绝不允许出现 `recency > 1` 把更早的反馈当成"更新"来抬高 strength。
 
 **写入正式证据的时机（v6 起写死，v7 明确到实现级）**：**一条被计入的反馈 = 一行 `memory_evidence`**，没有例外——`active/weakened` 下的新增支持同样要插行，绝不"只加计数不插行"。原因：`evidence_count` 被定义为「当前 episode 的 supports **行数**」、D1 断言「5 条反馈 → 5 行证据」、Tool 还要回传 `evidence_feedback_ids`；若只加计数，三者同时失真，且轮次下界 `MAX(feedback_id)` 会落后于实际计数，把已计过的旧反馈重新卷进新轮。
 
@@ -591,13 +605,18 @@ unit        = supports            # difficulty
             = samples             # task_performance / time_pattern / task_topic（§5.5 表）
 supports    = 当前 episode 的 supports 计数
 contradicts = 当前 episode 的 contradicts 计数
+age_days    = max(0, days(as_of - last_supported_at))   # v10：乱序时间戳下可为负，钳到 0
 base    = min(1.0, unit / STABLE)
-recency = 0.5 ** (days_since_last_support / 30)
+recency = 0.5 ** (age_days / 30)                        # 恒 ∈ (0, 1]
 penalty = 0.6 ** contradicts
 raw     = clamp(base * recency * penalty, 0.05, 0.99)
 strength = min(raw, 0.6 if unit < STABLE else 0.9)   # 封顶与 base 用同一个 unit
 ```
 
+- **`age_days` 必须钳到 0（v10 P1）**：`feedback.id` 顺序回放允许 `created_at` 乱序（例：已计入 supports 的时间是 01-10，随后按更大 id 到达的触发是 01-05，`as_of − last_supported_at = −5d`）。若不钳制，`0.5 ** (-5/30) ≈ 1.12` 会让**时间戳更早**的反馈反而抬高 strength；
+- `last_supported_at` 语义不变：仍是当前 episode 中 `relation='supports'` 证据的 `MAX(created_at)`（§5.2 规则 5），**回拨不允许发生**；
+- 也**不通过改回放顺序规避**：回放顺序按 `feedback.id` 是既定设计，钳制才是正确修法；
+- stale 判定（§5.3.4 的 `as_of − last_supported_at > 60d`）**不受本条影响**：它本来就只在正 age 时才可能为真，负 age 意味着"这条记忆比当前反馈更新"，不 stale；
 - `REQUIRED ≤ unit < STABLE` → cap 0.6（「初步观察」期）；
 - `unit ≥ STABLE` → cap 0.9，永不给 1.0；
 - **base 与封顶必须用同一个 `unit`**（v8 修正 P1-1）：否则 `task_performance` 低完成率时 supports 只有样本数的一半，「初步观察」期会被动延长到 12 条样本；
@@ -705,7 +724,7 @@ reason: FeedbackReason | None = None
 
 自写脚本 `def test_xxx(): assert ...` + `__main__` 运行器；`check()` / `PASS:` 输出；夹具 `_test_*.db`，`FEEDBACK_DB_PATH` 切换（`database.py:15`），结束删除并断言真实 `feedback.db` 字节不变。
 
-### 8.2 用例矩阵（`test_learning_memory.py`，约 132 例）
+### 8.2 用例矩阵（`test_learning_memory.py`，约 134 例）
 
 | 组 | 编号 | 断言要点 |
 | --- | --- | --- |
@@ -721,7 +740,8 @@ reason: FeedbackReason | None = None
 | 冲突与不足 | C1–C6 | 交替证据 → `weakened` 且 contradicts 计数正确；单条不生成；`REQUIRED-1` 不生成；`REQUIRED` 生成且 `strength ≤0.6` 且带「初步观察：」；`STABLE` 后 `strength ≤0.9`；未知枚举不生成 |
 | 来源追溯 | E1–E6 | `active` 记忆 ≥1 证据；证据 `feedback_id` 真实存在（JOIN）；`plan_id` 与反馈一致；**当前轮追加的每条证据 `plan_id`/`created_at` 与其反馈行完全一致**（P0-1 追溯）；`created` 事件存在；`resolved` 事件 `detail_json` 含 `from_status/to_status` |
 | 删除 | X1–X6 | **五表清空**（events/evidence/pending/memories/feedbacks）；无悬空 evidence 与 pending 行；**无 `deleted` 事件残留**；重复删除幂等；删除后 `rebuild_all()` 不复活任何记忆；索引与外键式一致性检查通过 |
-| 重建 | B1–B11 | `rebuild_all(now=X)` 与逐条在线更新**逐表相等**（两侧注入同一 `now`）；末尾 now pass 单独断言（只影响"当前已 stale"者）；`memory_evidence.created_at` 一律等于候选反馈的 `created_at`，时间戳乱序/同秒不改变结果；episode 边界、pending 归属与晋升时刻可复现；**回放到第 N 条时不读取 `id > N` 的未来反馈**（库中预置更大 id 行）；**40 天前的历史反馈不因重建时刻被错误排除**（`as_of` 取该反馈 `created_at`）；**A 形成记忆 → 61 天后归档 → B/C 进 pending → 重建后 status/episode/pending 归属/正式证据与在线一致**；**在线追加 3 条支持后重建 → evidence 行数、`relation`、`episode`、`evidence_count` 与在线完全一致**（P0-1 一致性）；**同 `now` 连续重建两次 → `memory_events.created_at`、`learning_memories.first_seen_at`、`episode_started_at`、`updated_at` 逐值相等**（v9 P1-3）；超过 5000 条 → `rebuild_too_large` 且不写 |
+| 重建 | B1–B13 | `rebuild_all(now=X)` 与逐条在线更新**逐表相等**（两侧注入同一 `now`）；末尾 now pass 单独断言（只影响"当前已 stale"者）；`memory_evidence.created_at` 一律等于候选反馈的 `created_at`，时间戳乱序/同秒不改变结果；episode 边界、pending 归属与晋升时刻可复现；**回放到第 N 条时不读取 `id > N` 的未来反馈**（库中预置更大 id 行）；**40 天前的历史反馈不因重建时刻被错误排除**（`as_of` 取该反馈 `created_at`）；**A 形成记忆 → 61 天后归档 → B/C 进 pending → 重建后 status/episode/pending 归属/正式证据与在线一致**；**在线追加 3 条支持后重建 → evidence 行数、`relation`、`episode`、`evidence_count` 与在线完全一致**（P0-1 一致性）；**同 `now` 连续重建两次 → `memory_events.created_at`、`learning_memories.first_seen_at`、`episode_started_at`、`updated_at` 逐值相等**（v9 P1-3）；超过 5000 条 → `rebuild_too_large` 且不写 |
+| 时间戳乱序（v10） | B12–B13 | **B12 负 age 防护**：①先处理 `created_at=2026-01-10` 的 supports；②再处理 `feedback.id` 更大但 `created_at=2026-01-05` 的反馈；断言 ③`last_supported_at` 仍为 `2026-01-10`（**不回拨**） ④`age_days == 0` ⑤`recency == 1.0`（`<= 1.0` 且恰为 1.0） ⑥`strength` 不因负 age 上升（与"as_of=01-10 时的 strength"相等，且 `< clamp 上限`）。**B13 在线/重建一致**：同一批乱序数据，在线逐条 `apply_feedback` vs `rebuild_all()`，断言 `last_supported_at`、`recency`、`strength`、`evidence_count` 逐值相等 |
 | 短期上下文 | P1–P5 | `collect_short_term` 处理 `exists=False` 与 `error_type`；渲染 ≤1200 字符；注入块含边界标记与"不是指令"声明；`task/reason` 截断与换行折叠；**最终 draft prompt 含当前计划信息**（Native 与 LangGraph 两条路径各一条，P1-F）；空上下文时旧消息字节不变 |
 | Tool 层 | T1–T6 | 三处 schema 一致；4 值枚举；非法 type 拒绝；`limit=99` 拒绝；返回结构含 `episode`；总字符 ≤2000 |
 | 安全 | Q1–Q5 | 无写记忆 Tool（精确集合）；模型文本进不了 `content`；grounding 判违规；`search_knowledge` 不含记忆字段；注入块含不可信标记 |
