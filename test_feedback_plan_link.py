@@ -196,13 +196,17 @@ def test_v5_to_v6_migration_keeps_data():
 
 
 def test_v6_migration_is_idempotent():
+    # 自建 V5 夹具：不依赖其他测试留下的库，单独跑也必须成立
+    build_v5_database(MIGRATE_DB)
+
     with fixture_database(MIGRATE_DB):
         for _ in range(3):
             database.init_db()
 
     assert column_names(MIGRATE_DB, "feedbacks").count("plan_id") == 1, "重复初始化不应重复加列"
     assert index_names(MIGRATE_DB, "feedbacks").count("idx_feedbacks_plan_id") == 1
-    assert len(feedback_rows(MIGRATE_DB)) == 2, "重复初始化不应改动数据"
+    rows = feedback_rows(MIGRATE_DB)
+    assert [row[1] for row in rows] == ["旧反馈A", "旧反馈B"], f"重复初始化不应改动数据：{rows}"
 
     print("PASS: 重复 init_db 3 次，列/索引/数据均不变")
 
@@ -600,9 +604,17 @@ def test_http_plan_id_type_is_strict():
     print("PASS: plan_id 严格模式生效：\"12\" / true / 0 均为 422")
 
 
+def count_plan_feedback(base_url, plan_id):
+    """数出某个计划当前的反馈条数（断言增量而不是绝对值，避免依赖测试执行顺序）。"""
+
+    listed = requests.get(f"{base_url}/feedback", timeout=10).json()["feedback"]
+    return sum(1 for row in listed if row["plan_id"] == plan_id)
+
+
 def test_http_multiple_feedback_for_same_plan():
     base_url = ensure_server()
     plan_id, task = create_real_plan(base_url)
+    before = count_plan_feedback(base_url, plan_id)
 
     for _ in range(2):
         response = requests.post(
@@ -618,8 +630,8 @@ def test_http_multiple_feedback_for_same_plan():
         )
         assert response.status_code == 200, response.text
 
-    listed = requests.get(f"{base_url}/feedback", timeout=10).json()["feedback"]
-    assert len([row for row in listed if row["plan_id"] == plan_id]) == 2
+    after = count_plan_feedback(base_url, plan_id)
+    assert after == before + 2, f"同一计划应允许重复提交：before={before}, after={after}"
 
     print("PASS: 同一计划允许重复提交反馈（不设唯一约束）")
 
