@@ -124,6 +124,16 @@ try:
           f"indexes={sorted(indexes)}")
 
     # ==========================
+    # 1.1 V6：feedbacks.plan_id 关联列
+    # ==========================
+
+    v6_columns = [row[1] for row in run_sql("PRAGMA table_info(feedbacks)")]
+
+    check("V6 新增 feedbacks.plan_id 列", "plan_id" in v6_columns, f"columns={v6_columns}")
+    check("V6 新增 plan_id 索引", "idx_feedbacks_plan_id" in indexes)
+    check("V6 plan_id 允许为空（历史数据兼容）", "plan_id" in v6_columns)
+
+    # ==========================
     # 2. 迁移重复执行
     # ==========================
 
@@ -173,6 +183,9 @@ try:
           {"completed_subtasks", "total_subtasks",
            "completed_questions", "total_questions"} <= columns)
     check("旧库存量反馈仍可读", rows == [("旧反馈", 0, 0)], f"rows={rows}")
+
+    old_plan_ids = [row[0] for row in run_sql("SELECT plan_id FROM feedbacks")]
+    check("旧反馈 plan_id 保持 NULL", old_plan_ids == [None], f"plan_id={old_plan_ids}")
 
     # ==========================
     # 4. feedback_backup.json 兼容迁移（migrate_json_to_db 只在空表时导入）

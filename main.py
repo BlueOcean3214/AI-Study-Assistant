@@ -27,6 +27,7 @@ from ai_service import (
 from database import (
     delete_all_feedback,
     get_feedback_list,
+    get_plan_by_id,
     init_db,
     insert_feedback,
     migrate_json_to_db,
@@ -82,6 +83,15 @@ class Feedback(BaseModel):
     total_questions: int = Field(
         default=0,
         ge=0
+    )
+
+    # 关联的学习计划主键（第一阶段新增，可选）：
+    # - 不提供 = 旧客户端行为，反馈照旧保存，plan_id 为 NULL
+    # - strict=True：只接受真正的 JSON 整数，"12" / true 一律 422，不做隐式转换
+    plan_id: int | None = Field(
+        default=None,
+        ge=1,
+        strict=True
     )
 
     @model_validator(mode="after")
@@ -356,8 +366,37 @@ async def upload_document(file: UploadFile = File(...)):
     }
 
 
+def _normalize_plan_task(value):
+    """任务名归一化：只折叠空白，不做模糊匹配（任务必须实质一致）。"""
+
+    return " ".join(str(value or "").split())
+
+
 @app.post("/feedback")
 def feedback(data: Feedback):
+    # 提供了 plan_id 就必须先验证，绝不把未经验证的 ID 写进数据库
+    if data.plan_id is not None:
+
+        plan_row = get_plan_by_id(data.plan_id)
+
+        if plan_row is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": "计划不存在，无法关联反馈",
+                    "error_type": "invalid_plan_id",
+                },
+            )
+
+        if _normalize_plan_task(plan_row["task"]) != _normalize_plan_task(data.task):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": "反馈任务与计划不一致，已拒绝关联",
+                    "error_type": "plan_task_mismatch",
+                },
+            )
+
     created_at = datetime.now().isoformat()
 
     insert_feedback(

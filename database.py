@@ -31,7 +31,7 @@ class ActivePlanExistsError(RuntimeError):
 # ==========================
 
 # 当前 schema 版本：每次结构变更追加一个迁移函数，禁止修改已有迁移
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 
 def _migration_v1_feedbacks(conn):
@@ -142,6 +142,20 @@ def _migration_v5_model_usage(conn):
     )
 
 
+def _migration_v6_feedback_plan_link(conn):
+    """v6：feedbacks 增加可空 plan_id，并建索引（历史数据保持 NULL）。"""
+
+    # 旧反馈没有可靠的计划来源，一律留 NULL：回填等于伪造关联
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(feedbacks)")}
+
+    if "plan_id" not in columns:
+        conn.execute("ALTER TABLE feedbacks ADD COLUMN plan_id INTEGER")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feedbacks_plan_id ON feedbacks(plan_id)"
+    )
+
+
 # 迁移按版本号升序执行；每个迁移都必须可重复执行（IF NOT EXISTS / 存在性检查）
 MIGRATIONS = (
     (1, _migration_v1_feedbacks),
@@ -149,6 +163,7 @@ MIGRATIONS = (
     (3, _migration_v3_plans),
     (4, _migration_v4_query_indexes),
     (5, _migration_v5_model_usage),
+    (6, _migration_v6_feedback_plan_link),
 )
 
 
@@ -227,7 +242,7 @@ def get_feedback_list():
             """
             SELECT id, task, estimated_minutes, actual_minutes, status, reason,
                    completed_subtasks, total_subtasks, completed_questions,
-                   total_questions, created_at
+                   total_questions, created_at, plan_id
             FROM feedbacks ORDER BY id
             """
         ).fetchall()
@@ -237,7 +252,7 @@ def get_feedback_list():
             "actual_minutes": row[3], "status": row[4], "reason": row[5],
             "completed_subtasks": row[6], "total_subtasks": row[7],
             "completed_questions": row[8], "total_questions": row[9],
-            "created_at": row[10],
+            "created_at": row[10], "plan_id": row[11],
         }
         for row in rows
     ]
@@ -283,7 +298,7 @@ def get_feedback_since(days=7, limit=20):
             """
             SELECT id, task, estimated_minutes, actual_minutes, status, reason,
                    completed_subtasks, total_subtasks, completed_questions,
-                   total_questions, created_at
+                   total_questions, created_at, plan_id
             FROM feedbacks
             WHERE created_at >= ?
             ORDER BY created_at DESC, id DESC
@@ -298,21 +313,27 @@ def get_feedback_since(days=7, limit=20):
             "actual_minutes": row[3], "status": row[4], "reason": row[5],
             "completed_subtasks": row[6], "total_subtasks": row[7],
             "completed_questions": row[8], "total_questions": row[9],
-            "created_at": row[10],
+            "created_at": row[10], "plan_id": row[11],
         }
         for row in rows
     ]
 
 
 def insert_feedback(feedback_data, created_at):
+    """写入一条学习反馈。
+
+    plan_id 用 .get() 读取：既有调用方（测试、agent_eval）传来的 dict 没有这个键，
+    必须保持“不带计划 ID 也能写”的旧行为。
+    """
+
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.execute(
             """
             INSERT INTO feedbacks
             (task, estimated_minutes, actual_minutes, status, reason,
              completed_subtasks, total_subtasks, completed_questions,
-             total_questions, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             total_questions, created_at, plan_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 feedback_data["task"], feedback_data["estimated_minutes"],
@@ -320,6 +341,7 @@ def insert_feedback(feedback_data, created_at):
                 feedback_data["reason"], feedback_data["completed_subtasks"],
                 feedback_data["total_subtasks"], feedback_data["completed_questions"],
                 feedback_data["total_questions"], created_at,
+                feedback_data.get("plan_id"),
             ),
         )
 
@@ -366,6 +388,31 @@ def get_active_plan_row(plan_date):
             LIMIT 1
             """,
             (plan_date, PLAN_STATUS_ACTIVE),
+        ).fetchone()
+
+    return _plan_row_to_dict(row) if row else None
+
+
+def get_plan_by_id(plan_id):
+    """按主键读取计划（不限状态）；非法 ID 或不存在返回 None。
+
+    反馈提交时需要验证 plan_id 真实存在，这里只做 IO，不做业务判断。
+    注意：严格只接受正整数，bool 不算（Python 里 True == 1）。
+    """
+
+    if isinstance(plan_id, bool) or not isinstance(plan_id, int) or plan_id < 1:
+        return None
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            """
+            SELECT id, plan_date, task, estimated_minutes, difficulty, question_count,
+                   reason, completion_criteria, subtasks_json, status, created_at
+            FROM plans
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (plan_id,),
         ).fetchone()
 
     return _plan_row_to_dict(row) if row else None
