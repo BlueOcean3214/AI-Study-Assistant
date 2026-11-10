@@ -1,4 +1,4 @@
-# 第二阶段：学习记忆管理 —— 方案设计（v5）
+# 第二阶段：学习记忆管理 —— 方案设计（v6）
 
 - 基线：`main` @ `fb22365`（第一阶段已合并）
 - 代码阅读范围：`database.py`、`main.py`、`feedback_service.py`、`agent_tools.py`、`agent_loop.py`、`agent_schema.py`、`agent_dispatcher.py`、`agent_plan_draft.py`、`context_builder.py`、`langgraph_plan_workflow.py`、`rag_service.py`、`plan_service.py`、`prompt_registry.py`、`static/feedback.html`，以及 `test_agent_tools.py` / `test_agent_loop.py` / `test_database_migrations.py` / `test_feedback_plan_link.py`
@@ -7,7 +7,23 @@
 
 ## 0. 修订记录
 
-### v4 → v5（本轮）
+### v5 → v6（本轮，预审修正）
+
+| # | 审查意见 | 处理 |
+| --- | --- | --- |
+| P0-1 | §5.2「增量只加计数不插行」与 `evidence_count` 定义、D1 断言、Tool 的 `evidence_feedback_ids` 直接矛盾；且轮次下界 `MAX(feedback_id)` 会落后，导致旧反馈被重新计入 | §5.2 写死「**一条被计入的反馈 = 一行 evidence**」，增量也插行；**所有计数一律 `COUNT` 重算，禁止 `+1`** |
+| P0-2 | `memory_evidence.created_at` 口径未定义，而「contradicts 全部晚于最后一次 supports」依赖它；用 `now()` 则重建不可复现 | `created_at = 该反馈的 created_at`（即 as_of），写入 DDL 注释与 §5.3.3 第 4 步；B 组补「时间戳乱序/同秒」用例 |
+| P0-3 | relation 映射有空档：`not_completed + reason=临时有事情`、`0.4<ratio<1.5` 既非 supports 也非 contradicts，实现只能自行猜 | §5.2 映射表新增 **neutral 列**并写死处理：不写证据、不计分子分母、晋升时删除并计 `info.neutral_dropped` |
+| P1-1 | `task_performance` 的「≥3 条样本」与「REQUIRED=supports」叠加错位，low 方向实际要 6 条才生成，S3 用例永远不成立 | §5.5 新增**计入单位**行：`difficulty` 数 `supports`，`task_performance`/`time_pattern` 数 **samples**，`task_topic` 数出现次数；S3 改为断言"3 样本/2 supports/rate 0.33 → 生成 low" |
+| P1-2 | 「重复计数在物理层不可能」不成立：pending 与 evidence 是两张表，重试旧反馈会先落缓冲区、晋升时撞唯一索引 | §5.3.2 新增第 7 条：写 pending 前查 evidence，已存在则跳过并计 `info.already_evidenced`；K 组断言改为"服务层拦截" |
+| P1-3 | B1「逐表相等」与末尾 `_materialize_stale(all, now)` 冲突（运行时时钟） | `rebuild_all(now=None)` 允许注入；B1 用同一 `now` 比较，末尾 pass 单独断言；§5.3.8 明确这是唯一受运行时时钟影响处 |
+| P1-4 | 迁移表缺 `resolved → archived`，且未说明既有 pending 缓冲区是否重置 | §5.3.5 补该行：保留既有 `pending_*` 与缓冲区，不重置；§5.3.4 同步「只在不存在时才固定」 |
+| P1-5 | §5.3.6 伪代码用 `subject_key(trigger)` 取所有类型的 key，而 `time_pattern` 的 key 是 `plans.difficulty`，照抄会永不命中 | 伪代码改为 `subject_key_for(mtype, trigger)` 分派：`time_pattern` 走 `plan_id→plans.difficulty`，空/非法则整类跳过 |
+| P2-1 | M1/M2 仍写「三表」；§5.3.4 第 3、4 条自相矛盾 | 统一"四张表"；改写为「不需要为归档补算事件，只需一次 now pass 让当前 stale 可见」 |
+| P2-2 | 用例数与工期算错（各组相加 124 例，文档写 78–88；分项相加 7.9，文档写 7.7） | §8.2 改「约 124 例」；§10 开列分项算式，合计 **7.9 人日** |
+| P2-3 | `test_feedback_plan_link.py` 行号写错 574；漏了 `:142` fixture 里的「时间不够」脏值 | 改为 `:575`；新增 `:142` 一行，明确**不修改**、作为 H/K 组脏数据来源 |
+
+### v4 → v5（已完成）
 
 | # | 审查意见 | 处理 |
 | --- | --- | --- |
@@ -212,7 +228,7 @@ CREATE TABLE IF NOT EXISTS memory_evidence (
     episode     INTEGER NOT NULL DEFAULT 1,
     relation    TEXT    NOT NULL,      -- supports / contradicts
     weight      REAL    NOT NULL DEFAULT 1.0,
-    created_at  TEXT    NOT NULL
+    created_at  TEXT    NOT NULL       -- = 该反馈的 created_at（as_of），不是插入时刻
 );
 
 -- 一条反馈对同一条记忆只能有一行；写入后 relation/episode 不可改（§5.1）
@@ -306,7 +322,7 @@ memory_context.py                   ← collect_short_term(I/O) + render_short_t
 | 归一化 | `normalize_subject(task) -> (key, label)` | 纯函数；空串 → `(None, None)`；key 截 120 字、label 截 60 字 |
 | 主入口 | `update_from_feedback(feedback_id) -> {"ok","memory_ids","created","updated","error_type"}` | 内部即 `apply_feedback(trigger, as_of=trigger.created_at)`（§5.3.6）；只走一条路径：当前轮写正式证据、resolved/archived 写 pending 缓冲区；`inserted=False` 触发核对，不一致 → `data_inconsistency` |
 | 单步处理（核心） | `apply_feedback(trigger, as_of=None) -> {...}` | **在线与重建的唯一入口**：`as_of` 缺省取 `trigger.created_at`；候选规则 §5.2、流程 §5.3.6 |
-| 重建 | `rebuild_all() -> {"ok","memories","evidences","pendings","events","error_type"}` | **派生数据全量重建**：单事务清空四张派生表 → `for row in feedbacks ORDER BY id ASC: apply_feedback(row, as_of=row["created_at"])` → 末尾 `_materialize_stale(all, now)`；事件 id 重新生成、**不承诺跨 rebuild 稳定**；`feedbacks` 超过 `REBUILD_MAX_FEEDBACKS = 5000` 返回 `rebuild_too_large` 且**不写数据** |
+| 重建 | `rebuild_all(now=None) -> {"ok","memories","evidences","pendings","events","error_type"}` | **派生数据全量重建**：单事务清空四张派生表 → `for row in feedbacks ORDER BY id ASC: apply_feedback(row, as_of=row["created_at"])` → 末尾 `_materialize_stale(all, now or 当前时间)`；`now` 仅测试可注入（§5.3.8）；事件 id 重新生成、**不承诺跨 rebuild 稳定**；`feedbacks` 超过 `REBUILD_MAX_FEEDBACKS = 5000` 返回 `rebuild_too_large` 且**不写数据** |
 | 检索 | `retrieve(memory_type=None, subject=None, status="active", limit=10)` | 结构化过滤 + 归一化精确匹配；`limit` 硬上限 10；回传 `evidence_feedback_ids`（≤5）；**不返回 pending 行** |
 | 失效 | `archive_stale(days=60)` | 退化为「`as_of = now()` 对全部记忆批量执行 `_materialize_stale`」的入口；**不再是唯一归档途径**（§5.3.4） |
 | 内部 | `_materialize_stale(memory, as_of)` / `_append_pending(memory, trigger, as_of)` / `_try_promote(memory, trigger, as_of)` | 三者构成状态机全部写入动作，不允许在别处直接改状态字段 |
@@ -357,16 +373,20 @@ memory_context.py                   ← collect_short_term(I/O) + render_short_t
 
 **计算**：纯函数 `evaluate(type, candidates, as_of) -> Conclusion(value_json, supports_ids, contradicts_ids, direction) | None`；`strength` 的 `recency` 也按 `as_of` 计算：`0.5 ** (days(as_of − last_support_created_at) / 30)`，不使用运行时真实时间。
 
-**写入正式证据的时机**：只有「首次达门槛」与「pending 晋升」两种情形会写 `memory_evidence`（回溯补齐全部候选，不只写触发那条）；`active/weakened` 之后的增量支持只做计数与 `strength` 更新，不重复插行。
+**写入正式证据的时机（v6 修正 P0-1）**：**一条被计入的反馈 = 一行 `memory_evidence`**，没有例外——`active/weakened` 下的新增支持同样要插行（幂等靠 `UNIQUE(memory_id, feedback_id)` + §5.1 的 `inserted` 核对），绝不"只加计数不插行"。原因：`evidence_count` 被定义为「当前 episode 的 supports **行数**」、D1 断言「5 条反馈 → 5 行证据」、Tool 还要回传 `evidence_feedback_ids`；若只加计数，三者同时失真，且轮次下界 `MAX(memory_evidence.feedback_id)` 会落后于实际计数，把已计过的旧反馈重新卷进新轮。
+
+**所有计数一律重算，禁止 `+1`**：`evidence_count = COUNT(evidence WHERE episode=当前 AND relation='supports')`、`contradict_count` 同理；插入失败（`inserted=False`）走核对而不是累加。
 
 **`relation` 判定（首次写入或晋升时确定，之后永不改）**：
 
-| 类型 | `supports` | `contradicts` |
-| --- | --- | --- |
-| `difficulty` | `status ∈ (partial, not_completed)` 且 `reason=任务难度太高` | `status = completed` |
-| `task_performance` | `direction=low` 时非 completed；`direction=high` 时 completed | 反方向 |
-| `time_pattern` | `direction=slow` 时 `ratio ≥1.5`；`direction=fast` 时 `ratio ≤0.4` | 反方向且 ratio 有效 |
-| `task_topic` | 恒 `supports` | 无 |
+| 类型 | `supports` | `contradicts` | **neutral（不写证据）** |
+| --- | --- | --- | --- |
+| `difficulty` | `status ∈ (partial, not_completed)` 且 `reason=任务难度太高` | `status = completed` | `partial/not_completed` 且 `reason ∈ (任务时间太长, 临时有事情, 今天状态不好, 其他)` |
+| `task_performance` | `direction=low` 时非 completed；`direction=high` 时 completed | 反方向 | 无（方向由 rate ≤0.5 / ≥0.8 二分确定，落中间则不晋升，见 §5.5） |
+| `time_pattern` | `direction=slow` 时 `ratio ≥1.5`；`direction=fast` 时 `ratio ≤0.4` | 反方向且 ratio 有效 | `0.4 < ratio < 1.5` |
+| `task_topic` | 恒 `supports` | 无 | 无 |
+
+**neutral 候选（v6 修正 P0-3）**：既不是 `supports` 也不是 `contradicts` 的样本（上表第 4 列）**不写入 `memory_evidence`**、分子分母都不计；晋升时随缓冲区一起删除，计 `info.neutral_dropped`。绝不允许把 neutral 一律当 `contradicts`——那会凭空制造 weakened/resolved。
 
 **`direction` 在本轮创建时固定**（写进 `value_json`），本轮内不改——这正是"证据不可变"能成立的前提；`direction` 需要变时只能通过 `rebuild_all()` 全量重建。
 
@@ -397,6 +417,8 @@ UNIQUE(memory_id, feedback_id)
 4. **未达门槛期间，可见结论字段一个都不动**：`content`、`value_json`、`strength`、`evidence_count`、`contradict_count`、`status`、`episode`、`episode_start_feedback_id`、`last_supported_at`、`updated_at` 全部保持旧轮的值。`updated_at` 语义写死为**「结论最后变化时间」**，不是「行最后被触碰的时间」；
 5. **超 30 天窗口的 pending 样本**：晋升时以当时的 `as_of` 重校验 `as_of − 30d ≤ created_at ≤ as_of`，超窗行直接删除（计 `info.pending_expired`），**永远不写入正式证据**；
 6. pending 行不参与检索、不参与 Tool 返回、不参与 `strength`。
+7. **幂等（v6 修正 P1-2）**：写 pending 之前**先查 `memory_evidence`** 是否已有 `(memory_id, feedback_id)`；已有 → 直接跳过并计 `info.already_evidenced`（这条反馈已在某一轮被计入过），不再写缓冲区。否则"重试一条旧反馈"会先落缓冲区、晋升时撞唯一索引，把正常重试变成 `data_inconsistency`。
+8. **neutral 样本**（§5.2 第 4 列，如 `reason=临时有事情` 的未完成、`0.4<ratio<1.5` 的用时样本）：同样进缓冲区（保留原始事实），但晋升时**不写证据**、不计分子分母，随缓冲区一起删除并计 `info.neutral_dropped`。
 
 #### 5.3.3 晋升（promotion）
 
@@ -406,9 +428,9 @@ UNIQUE(memory_id, feedback_id)
 
 1. 取 `episode = pending_episode` 的 pending 行，按 `as_of` 重校验窗口，丢弃超窗行；
 2. 用**完整有效候选集**（pending 行 + 触发反馈，按 `feedback_id` 去重）计算新 `direction`；
-3. 按新 direction 逐条判定最终 `relation`（映射表见 §5.2）；
-4. **一次性 INSERT 正式 `memory_evidence`**（带最终 relation 与 episode），`inserted=False` 走 P1-2 核对；**绝不先写占位再 UPDATE**；
-5. 删除本轮对应 pending 行（晋升后缓冲区清空）；
+3. 按新 direction 逐条判定最终 `relation`（映射表见 §5.2）；判定为 **neutral** 的候选直接丢弃（计 `info.neutral_dropped`，不写证据）；
+4. **一次性 INSERT 正式 `memory_evidence`**（带最终 relation 与 episode，`created_at` = 该反馈的 `created_at`），`inserted=False` 走 P1-2 核对；**绝不先写占位再 UPDATE**；
+5. 删除本轮对应 pending 行（含 neutral 与超窗行，晋升后缓冲区清空）；
 6. 更新记忆：`episode = pending_episode`、`episode_start_feedback_id = MIN(新轮 supports 的 feedback_id)`、`episode_started_at = as_of`、计数与 `value_json` / `content` / `strength` 按新轮重算、`status = active`、清空 `pending_*`、`last_supported_at = as_of`、`updated_at = as_of`；
 7. 写事件 `reopened` / `reopened_from_archived`，`detail_json` 含 `as_of` 与 `evidence_ids`。
 
@@ -420,10 +442,10 @@ v4「只有显式 `archive_stale()` 才归档」不可重放：归档时刻没�
 is_stale(memory, as_of) = (as_of − last_supported_at) > STALE_DAYS(60)
 ```
 
-- **处理任何一条反馈之前**，先以该反馈的 `created_at` 作为 `as_of` 执行 `_materialize_stale(memory, as_of)`：若已 stale → 置 `archived`、固定 `pending_episode = episode + 1`、`pending_start_feedback_id = MAX(memory_evidence.feedback_id)`、写 `archived` 事件（`detail_json.reason = "stale_as_of"`，带 `as_of`）；
+- **处理任何一条反馈之前**，先以该反馈的 `created_at` 作为 `as_of` 执行 `_materialize_stale(memory, as_of)`：若已 stale → 置 `archived`；`pending_*` **只在不曾存在时**才固定（`pending_episode = episode+1`、`pending_start_feedback_id = MAX(memory_evidence.feedback_id)`），从 `resolved` 过来的已有值原样保留；写 `archived` 事件（`detail_json.reason = "stale_as_of"`，带 `as_of`）；
 - `archive_stale(days=60)` 退化为「`as_of = now()` 对全部记忆跑同一个 `_materialize_stale`」的批量入口，**不再是唯一归档途径**；
-- 重建因此不需要任何"回放后补算"：回放到 B 时，`_materialize_stale(mem, B.created_at)` 会在同一时点产生同一个 `archived` 与同一条 pending 边界，B/C 自然进入新 episode；
-- 回放结束后对全部记忆再跑一次 `_materialize_stale(all, now)`，让"当前时间下已 stale"的记忆在库里也体现为 `archived`（同一函数，同一结果）；
+- 重建因此**不需要为归档补算事件**：回放到 B 时，`_materialize_stale(mem, B.created_at)` 会在同一时点产生同一个 `archived` 与同一条 pending 边界，B/C 自然进入新 episode；
+- 回放结束后再对全部记忆跑一次 `_materialize_stale(all, now)`，只负责把「当前时间下已 stale」的记忆在库里体现为 `archived`（这一步用运行时时钟，与历史无关，见 §5.3.8 的复现边界）；
 - stale 判定只依赖 `last_supported_at` 与 `as_of`，不新增字段，也不依赖历史上调用过几次 `archive_stale()`。
 
 #### 5.3.5 状态迁移表
@@ -433,7 +455,8 @@ is_stale(memory, as_of) = (as_of − last_supported_at) > STALE_DAYS(60)
 | 无记忆 | 达 `REQUIRED` 且方向可定 | `active` / `episode=1` | 建行 + 一次性写正式证据（回溯补齐全部），写 `created` |
 | `active` | 新 `supports` | `active` | 计数+1、`last_supported_at=as_of`、`strength` 重算、写 `strengthened` |
 | `active` | 新 `contradicts`（未达推翻） | `weakened` | `contradict_count+1`、`strength` 重算、写 `weakened` |
-| `weakened` | `contradicts ≥ 3` 且全部晚于最后一次 `supports` | `resolved` | 内容改写、固定 `pending_*`、写 `resolved` |
+| `weakened` | `contradicts ≥ 3` 且全部晚于最后一次 `supports` | `resolved` | 内容改写、固定 `pending_*`（`pending_episode = episode+1`、`pending_start_feedback_id = MAX(全部轮 evidence.feedback_id)`、`pending_started_at = as_of`；若已存在则沿用不重置）、写 `resolved` |
+| `resolved` | `_materialize_stale`（as_of 超 60 天） | `archived` | 写 `archived`（`reason=stale_as_of`）；**保留既有 `pending_*` 与缓冲区，不重置**（v6 修正 P1-4） |
 | `weakened` | 新 `supports` 使 `strength ≥ 0.5` | `active` | 写 `strengthened`（不换轮） |
 | `active` / `weakened` | `_materialize_stale`（as_of 超 60 天） | `archived` | 固定 `pending_*`、写 `archived`（`reason=stale_as_of`） |
 | `resolved` / `archived` | 新候选反馈 | 不变 | **只写 `memory_pending_evidence`**（`episode=pending_episode`）；其余字段不动 |
@@ -447,15 +470,30 @@ is_stale(memory, as_of) = (as_of − last_supported_at) > STALE_DAYS(60)
 def apply_feedback(trigger, as_of=None):
     as_of = as_of or trigger["created_at"]          # 在线与重建同一口径
     for mtype in (difficulty, task_performance, time_pattern, task_topic):
-        mem = get_memory(mtype, subject_key(trigger))
+        key = subject_key_for(mtype, trigger)        # 见下：time_pattern 不是任务名
+        if key is None:
+            continue                                 # 例：time_pattern 无有效 plan_id/difficulty
+        mem = get_memory(mtype, key)
         if mem:
             _materialize_stale(mem, as_of)           # 先做归档判定
         if mem and mem["status"] in ("resolved", "archived"):
+            if evidence_exists(mem, trigger):        # 幂等：已在某轮计入过
+                info.already_evidenced += 1
+                continue
             _append_pending(mem, trigger, as_of)     # 只写缓冲区
             _try_promote(mem, trigger, as_of)        # 达门槛才转正
         else:
             _apply_current_episode(mem, trigger, as_of)   # §5.2 候选规则 + 正式证据
+
+def subject_key_for(mtype, trigger):
+    if mtype == "time_pattern":
+        plan = get_plan_by_id(trigger["plan_id"]) if trigger["plan_id"] else None
+        d = plan["difficulty"] if plan else None
+        return d if d in ("easy", "medium", "hard") and plan["estimated_minutes"] > 0 else None
+    return normalize_subject(trigger["task"])[0]
 ```
+
+（v6 修正 P1-5：`time_pattern` 的 key 是 `plans.difficulty`，必须先按 `plan_id` 查计划；`plan_id` 为空、计划缺失或 `difficulty` 非法时**整类跳过**——照 v5 伪代码写会让 `time_pattern` 永不命中。）
 
 - 同一条反馈对同一条记忆**只走一条路径**：`_append_pending` 与 `_apply_current_episode` 互斥；`memory_pending_evidence` 与 `memory_evidence` 各有一把唯一索引兜底，**重复计数在物理层不可能**；
 - `_try_promote` 成功后本轮 pending 行已删除，因此触发反馈不会被普通路径再计一次；
@@ -467,14 +505,15 @@ def apply_feedback(trigger, as_of=None):
 
 #### 5.3.8 重建一致性的承诺边界
 
-- **能复现**：episode 边界、pending 归属与晋升时刻、正式证据的 `relation`/`episode`、`status` 迁移序列、事件类型序列；
-- **不能复现**：事件行 id、`recorded_at` 这类机械时间戳（重建后重新生成）；
+- **能复现**：episode 边界、pending 归属与晋升时刻、正式证据的 `relation`/`episode`、`status` 迁移序列、事件类型与 `memory_id` 序列；
+- **不能复现（重新生成）**：事件行 id、`recorded_at` 这类机械时间戳；
+- **受运行时时钟影响的一处**：回放末尾的 `_materialize_stale(all, now)` 可能新增 `archived` 与对应事件的 `as_of`。因此 `rebuild_all(now=None)` 允许注入固定 `now`：测试里两侧都用同一 `now` 时"逐表相等"成立（B1）；生产语义是"当前时间下应有的状态"（v6 修正 P1-3）；
 - **不再承诺**：用户历史上手动调用过几次 `archive_stale()`——归档已改为按 `as_of` 派生，调用次数不影响结果。
 
 ### 5.4 证据不足的表达
 
 - 单条反馈 → 不生成（`memory_ids: []`）。
-- `REQUIRED ≤ supports < STABLE` → 生成，`strength` 封顶 0.6，内容带「初步观察：」。
+- 计入门槛达 `REQUIRED`（**单位按 §5.5 的表**：`difficulty` 数 supports，`task_performance`/`time_pattern` 数 samples）且 `supports < STABLE` → 生成，`strength` 封顶 0.6，内容带「初步观察：」。
 - 检索为空 → Tool 返回 `count=0` + `reason="insufficient_evidence"`。
 
 ### 5.5 强度分数（启发式证据强度分数）
@@ -484,7 +523,12 @@ def apply_feedback(trigger, as_of=None):
 | 常量 | difficulty | task_performance | time_pattern | task_topic |
 | --- | --- | --- | --- | --- |
 | `REQUIRED`（生成门槛） | 2 | 3 | 4 | 3 |
+| **计入单位（v6 修正 P1-1）** | `supports`（难度失败条数） | **有效样本总数 samples** | **有效样本总数 samples** | 出现次数（= samples） |
 | `STABLE`（= 2×REQUIRED） | 4 | 6 | 8 | 6 |
+
+**计入单位的理由（这是 v5 的真 bug）**：`task_performance` 的结论条件本身是「≥3 条反馈 **且** completion_rate ≤0.5 / ≥0.8」。若 `REQUIRED` 也去数 `supports`，low 方向下 3 条样本最多只有 2 条 supports，记忆**永远不会生成**（§8.2 的 S3「1/3 完成率」用例直接矛盾）。因此该类型的门槛数**样本**，`supports` 只用于算强度；`time_pattern` 同理由门槛数样本；`difficulty` 的门槛确实是"难度失败条数"，所以仍数 `supports`；`task_topic` 无方向，出现即支持。
+
+**方向不可定**：`task_performance` 的 `rate` 落在 `(0.5, 0.8)` 之间、或 `time_pattern` 的中位 `ratio` 落在 `(0.4, 1.5)` 之间 → 即使样本够也不晋升（保持 pending，计 `info.direction_undetermined`）。
 
 ```
 supports    = 当前 episode 的 supports 计数
@@ -536,7 +580,8 @@ reason: FeedbackReason | None = None
 
 | 位置 | 现状 | 处理后 |
 | --- | --- | --- |
-| `test_feedback_plan_link.py:574` | `reason: "时间不够"`（不在五值内，当前能成功） | 改为 `"任务时间太长"`；该用例是"计划存在 → 关联成功"的正例，必须继续成功 |
+| `test_feedback_plan_link.py:575` | POST 的 `reason: "时间不够"`（不在五值内，当前能成功） | 改为 `"任务时间太长"`；该用例是"计划存在 → 关联成功"的正例，必须继续成功 |
+| `test_feedback_plan_link.py:142` | **fixture 直连 SQL** 写入 `("旧反馈B", …, "partial", "时间不够", …)`，绕过接口校验 → 合法的历史脏数据 | **不修改**（它是 H/K 组要覆盖的真实脏值来源）；用它断言服务层 fail-closed：不计分子分母、`info.invalid_enum` 递增、不生成记忆 |
 | `test_feedback_plan_link.py:626` | `partial` 无 reason、`plan_id` 非法 | 断言 `invalid_plan_id`；因 plan_id 校验在 reason_required 之前，行为不变，加注释说明依赖顺序 |
 | 其余 partial 用例 | 有的带合法 reason | 逐个核对，缺 reason 且期望成功的补合法值 |
 
@@ -601,23 +646,23 @@ reason: FeedbackReason | None = None
 
 自写脚本 `def test_xxx(): assert ...` + `__main__` 运行器；`check()` / `PASS:` 输出；夹具 `_test_*.db`，`FEEDBACK_DB_PATH` 切换（`database.py:15`），结束删除并断言真实 `feedback.db` 字节不变。
 
-### 8.2 用例矩阵（`test_learning_memory.py`，约 78–88 例）
+### 8.2 用例矩阵（`test_learning_memory.py`，约 124 例）
 
 | 组 | 编号 | 断言要点 |
 | --- | --- | --- |
-| 迁移 | M1–M6 | V7 三表/索引存在；V5、V6 老库升级后三表为空；重复 `init_db()` 幂等；`user_version > SCHEMA_VERSION` 抛 `RuntimeError`；`episode` 默认 1 |
+| 迁移 | M1–M6 | V7 **四张表**/索引存在；V5、V6 老库升级后**四张表**为空；重复 `init_db()` 幂等；`user_version > SCHEMA_VERSION` 抛 `RuntimeError`；`episode` 默认 1 |
 | 枚举契约 | V1–V8 | 非法 `status`/`reason` → **422 + `detail` + 无 `error_type`** 且行数不变；`partial` 无 reason → 400 `reason_required`；`completed` 无 reason 仍成功；服务层遇脏值不生成 |
 | 归一化 | N1–N6 | 中英/全半角/空白/后缀/空串/超长；不同写法同 key |
-| 存储与回溯 | S1–S9 | 2 条难度失败 → 1 记忆 + **2 条 evidence**；单条 → 0；完成率 1/3 → 0.33；`plan_id IS NULL` 不进 `time_pattern`；`estimated=0` 排除；`difficulty` 非法排除；**两个不同 task 同 difficulty 共同进入 `time_pattern`**（P0-A）；`value_json` 可解析 |
+| 存储与回溯 | S1–S10 | 2 条难度失败 → 1 记忆 + **2 条 evidence**；单条 → 0；**`task_performance` 3 条样本（1 completed）→ 生成 `low`（samples=3 达门槛、supports=2、rate=0.33）**，门槛数样本而非 supports（P1-1）；**5 条反馈 → 5 行 evidence**（一条被计入的反馈一行，P0-1）；`plan_id IS NULL` 不进 `time_pattern`；`estimated=0` 排除；`difficulty` 非法排除；**两个不同 task 同 difficulty 共同进入 `time_pattern`**；`value_json` 可解析 |
 | 脏历史 | H1–H3 | 合法触发 + 同窗口非法历史行 → 非法行**不计分子分母**；全非法 → 不生成；`info.invalid_enum` 计数正确（P1-D） |
 | 检索 | R1–R8 | 类型/主题/状态过滤；`limit` 越界拒绝；只回 `active`；不相关主题不命中；`evidence_feedback_ids` 正确；空结果 `insufficient_evidence` |
 | 去重与不可变 | D1–D7 | 同 subject 5 次 → 1 行 / `evidence_count=5` / evidence 5 行；重复 `feedback_id` 不重复计；**重复调用后既有 evidence 的 `relation`/`episode` 字节不变**；人为构造不一致 → `data_inconsistency` 且不覆盖；**`insert_evidence()` 冲突返回 `inserted=false` 时被当作失败处理而非成功**（P1-2） |
-| pending 缓冲区 | K1–K8 | `resolved`/`archived` 后新反馈**只写 `memory_pending_evidence`**（该表无 relation 列）；`UNIQUE(memory_id, feedback_id)` 防重复；pending 期间 `content`/`value_json`/`strength`/`status`/`episode`/`episode_start_feedback_id`/`last_supported_at`/`updated_at` **逐列不变**；晋升后正式 evidence 一次写齐、pending 行清空；超 30 天窗口的 pending 行被删除且**永不进正式证据**；pending 行不出现在 `retrieve` 与 Tool 返回；同一反馈不可能同时存在于 pending 与 evidence；一次晋升只写一条事件 |
+| pending 缓冲区 | K1–K9 | `resolved`/`archived` 后新反馈**只写 `memory_pending_evidence`**（该表无 relation 列）；`UNIQUE(memory_id, feedback_id)` 防重复；pending 期间 `content`/`value_json`/`strength`/`status`/`episode`/`episode_start_feedback_id`/`last_supported_at`/`updated_at` **逐列不变**；晋升后正式 evidence 一次写齐、pending 行清空；超 30 天窗口的 pending 行被删除且**永不进正式证据**；pending 行不出现在 `retrieve` 与 Tool 返回；**重试一条已在 `memory_evidence` 的旧反馈 → 服务层直接跳过（`info.already_evidenced`），不写缓冲区、不报 `data_inconsistency`**（P1-2）；neutral 样本晋升时被丢弃且不计分子分母；一次晋升只写一条事件 |
 | 轮次 | U1–U18 | 反证 → `weakened`；+新支持强度 ≥0.5 → `active`；≥3 反证 → `resolved` 且固定 `pending_*`；`resolved` 后新轮达门槛 → `episode=2` + 计数从 0 + **旧证据仍是 `episode=1` 且未被搬动**；**`task_performance` 新轮 2 条 `completed`（REQUIRED=3）→ pending 2 行、正式 evidence 0 行、`status` 仍 `resolved`**；**数量够但方向不可定（完成率 0.67）→ 不晋升、不写事件、缓冲区保留**；第三条促成方向 → 一次性晋升；`archived` 后单条反馈 **不复活**；`archived` 后达门槛 → `episode+1` + 不新建行；`strength` 随证据升/随时间降/随反证降；`weakened` 期间新支持不换轮 |
 | 冲突与不足 | C1–C6 | 交替证据 → `weakened` 且 contradicts 计数正确；单条不生成；`REQUIRED-1` 不生成；`REQUIRED` 生成且 `strength ≤0.6` 且带「初步观察：」；`STABLE` 后 `strength ≤0.9`；未知枚举不生成 |
 | 来源追溯 | E1–E5 | `active` 记忆 ≥1 证据；证据 `feedback_id` 真实存在（JOIN）；`plan_id` 与反馈一致；`created` 事件存在；`resolved` 事件 `detail_json` 含 `from_status/to_status` |
 | 删除 | X1–X6 | **五表清空**（events/evidence/pending/memories/feedbacks）；无悬空 evidence 与 pending 行；**无 `deleted` 事件残留**；重复删除幂等；删除后 `rebuild_all()` 不复活任何记忆；索引与外键式一致性检查通过 |
-| 重建 | B1–B9 | `rebuild_all()` 与逐条在线更新**逐表相等**；episode 边界、pending 归属与晋升时刻可复现；**回放到第 N 条时不读取 `id > N` 的未来反馈**（库中预置更大 id 行）；**40 天前的历史反馈不因重建时刻被错误排除**（`as_of` 取该反馈 `created_at`）；**A 形成记忆 → 61 天后归档 → B/C 进 pending → 重建后 status/episode/pending 归属/正式证据与在线一致**；末尾 `_materialize_stale(all, now)` 只影响"当前已 stale"者；事件 id 允许变化；超过 5000 条 → `rebuild_too_large` 且不写 |
+| 重建 | B1–B9 | `rebuild_all(now=X)` 与逐条在线更新**逐表相等**（两侧注入同一 `now`）；末尾 now pass 单独断言（只影响"当前已 stale"者）；`memory_evidence.created_at` 一律等于候选反馈的 `created_at`，时间戳乱序/同秒不改变结果；episode 边界、pending 归属与晋升时刻可复现；**回放到第 N 条时不读取 `id > N` 的未来反馈**（库中预置更大 id 行）；**40 天前的历史反馈不因重建时刻被错误排除**（`as_of` 取该反馈 `created_at`）；**A 形成记忆 → 61 天后归档 → B/C 进 pending → 重建后 status/episode/pending 归属/正式证据与在线一致**；超过 5000 条 → `rebuild_too_large` 且不写 |
 | 短期上下文 | P1–P5 | `collect_short_term` 处理 `exists=False` 与 `error_type`；渲染 ≤1200 字符；注入块含边界标记与"不是指令"声明；`task/reason` 截断与换行折叠；**最终 draft prompt 含当前计划信息**（Native 与 LangGraph 两条路径各一条，P1-F）；空上下文时旧消息字节不变 |
 | Tool 层 | T1–T6 | 三处 schema 一致；4 值枚举；非法 type 拒绝；`limit=99` 拒绝；返回结构含 `episode`；总字符 ≤2000 |
 | 安全 | Q1–Q5 | 无写记忆 Tool（精确集合）；模型文本进不了 `content`；grounding 判违规；`search_knowledge` 不含记忆字段；注入块含不可信标记 |
@@ -670,7 +715,7 @@ reason: FeedbackReason | None = None
 | 0 | 服务端枚举（`Literal` + `reason_required` + 改 `test_feedback_plan_link.py`）| **P0** | — | 0.3 天 | V1–V8；既有测试全绿 |
 | 1 | V7 迁移（四张表）+ 14 个 DB 函数 + **五表**级联删除 + 迁移/删除测试 | **P0** | 0 | 0.8 天 | M1–M6、X1–X6 |
 | 2 | `normalize_subject` + `render_content` + N 组 | **P0** | 1 | 0.3 天 | 纯函数单测 |
-| 3 | `apply_feedback` 单一入口（§5.2 候选规则 + §5.3 状态机）+ `evaluate()` 四类规则 + **pending 缓冲区与原子晋升** + `_materialize_stale` + S/H/D/K/U/C/E 组 | **P0** | 1,2 | **3.4 天** | 全绿；重点中途审查 |
+| 3 | `apply_feedback` 单一入口（§5.2 候选规则 + §5.3 状态机，含 time_pattern 的 key 分派）+ `evaluate()` 四类规则（含 neutral）+ **pending 缓冲区与原子晋升** + `_materialize_stale` + S/H/D/K/U/C/E 组 | **P0** | 1,2 | **3.5 天** | 全绿；重点中途审查 |
 | 4 | `retrieve()` + `rebuild_all()`（as-of 回放）+ R/B 组 + 标注集 | **P0** | 3 | **1.0 天** | P@3/R@3 达标；重建与在线逐表相等 |
 | 5 | `memory_context` + 两条路径注入（Native + LangGraph）+ P 组 | P1 | 3 | 0.6 天 | draft prompt 含计划；空上下文零字节变化 |
 | 6 | Tool 接入三处 + T/Q 组 | P1 | 4 | 0.5 天 | schema/dispatcher 测试全绿 |
@@ -678,7 +723,7 @@ reason: FeedbackReason | None = None
 | 8 | `agent_system` v2 + grounding 扩展 | P2 | 6 | 0.3 天 | 违规用例被判出 |
 | 9 | `docs/STAGE2-LEARNING-MEMORY.md` | P2 | 全部 | 0.3 天 | 含真实测试输出 |
 
-合计约 **7.7 人日**（v2 5.6 → v3 6.5 → v4 6.8 → v5 7.7：任务 1 +0.1（四张表）、任务 3 +0.6（pending 缓冲区与原子晋升）、任务 4 +0.3（as-of 回放与重建一致性用例））。
+合计约 **7.9 人日**（v2 5.6 → v3 6.5 → v4 6.8 → v5 7.7 → v6 7.9：任务 1 +0.1（四张表）、任务 3 +0.7（pending 缓冲区、原子晋升、neutral 判定与 key 分派）、任务 4 +0.3（as-of 回放与重建一致性用例）；分项相加 0.3+0.8+0.3+3.5+1.0+0.6+0.5+0.3+0.3+0.3 = 7.9）。
 
 **交付节奏**：P0（任务 0–4）一个 PR；P1/P2 另一个 PR。任务 3 风险最高，建议单独 push 一次供中途审查。
 
