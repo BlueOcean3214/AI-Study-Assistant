@@ -446,6 +446,14 @@ if (
 
 const subtasks = Array.isArray(plan.subtasks) ? plan.subtasks : [];
 const totalSubtasks = subtasks.length;
+
+// 关联的计划 ID：兼容旧 sessionStorage（没有 plan_id 时不传，退回旧行为）
+const parsedPlanId = Number(plan.plan_id);
+const planId =
+    Number.isInteger(parsedPlanId) && parsedPlanId > 0
+        ? parsedPlanId
+        : null;
+
 const currentPlanKey = JSON.stringify({
     task: plan.task,
     subtasks: subtasks
@@ -501,6 +509,11 @@ const feedback = {
     total_questions: totalQuestions
 };
 
+// 只在拿到有效 plan_id 时才加字段：没有 ID 的请求体与旧版完全一致
+if (planId !== null) {
+    feedback.plan_id = planId;
+}
+
         try {
 
             const response = await fetch("/feedback", {
@@ -522,7 +535,13 @@ const feedback = {
 
             } else {
 
-                alert("保存失败");
+                // 服务端给的是可读原因（例如计划不存在 / 任务不一致），不要吞掉
+                const message =
+                    data && typeof data.message === "string" && data.message
+                        ? data.message
+                        : "保存失败";
+
+                alert(message);
 
             }
 
