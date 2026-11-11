@@ -1585,6 +1585,109 @@ def test_time_pattern_promotion_filters_invalid_pending_with_other_plan():
           str(memory_service.decode_value(promoted[5])))
 
 
+def test_consecutive_neutral_feedback_counts_once_per_feedback():
+    """连续 neutral 不推进证据高水位，neutral_dropped 也只能按反馈计一次（v16 §3.5）。"""
+
+    fresh()
+    task = "重复中性练习"
+    insert_feedback_row(task, "not_completed", "任务难度太高", created_at="2026-01-02T10:00:00Z")
+    insert_feedback_row(task, "not_completed", "任务难度太高", created_at="2026-01-03T10:00:00Z")
+    created = memory_service.apply_pending_updates(now="2026-01-04T00:00:00Z")
+
+    check("建行批次没有 neutral", created["info"]["neutral_dropped"] == 0,
+          str(created["info"]))
+    before_row = memory_of("difficulty", task)
+    before_counts = scoped_counts("difficulty", task)
+    before_value = memory_service.decode_value(before_row[5])
+    before_content = before_row[4]
+    before_events = events_of("difficulty", task)
+
+    per_batch = []
+
+    for index, stamp in enumerate((
+        "2026-01-05T10:00:00Z",
+        "2026-01-06T10:00:00Z",
+        "2026-01-07T10:00:00Z",
+        "2026-01-08T10:00:00Z",
+    )):
+        insert_feedback_row(task, "not_completed", "临时有事情", created_at=stamp)
+        result = memory_service.apply_pending_updates(now=f"2026-01-0{6 + index}T00:00:00Z")
+        per_batch.append(result["info"]["neutral_dropped"])
+
+    check("每批只计本条 neutral（不随窗口重扫累加）", per_batch == [1, 1, 1, 1], str(per_batch))
+    check("四条 neutral 累计恰为 4", sum(per_batch) == 4, str(per_batch))
+
+    after_row = memory_of("difficulty", task)
+    after_counts = scoped_counts("difficulty", task)
+    after_value = memory_service.decode_value(after_row[5])
+
+    check("neutral 不写正式证据", after_counts["evidence"] == before_counts["evidence"],
+          f"{before_counts} -> {after_counts}")
+    check("neutral 不产生事件", events_of("difficulty", task) == before_events,
+          str(events_of("difficulty", task)))
+    check("evidence_count 不变", after_row[7] == before_row[7], f"{before_row[7]} -> {after_row[7]}")
+    check("状态仍为 active", after_row[14] == "active", str(after_row[14]))
+    check("结论未变（failed_count/direction）",
+          after_value.get("failed_count") == before_value.get("failed_count")
+          and after_value.get("direction") == before_value.get("direction"),
+          f"{before_value} -> {after_value}")
+    check("content 未被 neutral 改写", after_row[4] == before_content,
+          f"{before_content!r} -> {after_row[4]!r}")
+    check("neutral 期间不写 pending", after_counts["pending"] == 0, str(after_counts))
+
+    online = memory_service.semantic_projection()
+    rebuilt = memory_service.rebuild_all(now="2026-01-09T00:00:00Z")
+
+    check("rebuild 成功", rebuilt["ok"] is True, str(rebuilt))
+    check("在线与 rebuild 投影一致", memory_service.semantic_projection() == online, "投影不一致")
+
+
+def test_neutral_pending_is_counted_once_at_promotion():
+    """resolved 缓冲里的 neutral 在未晋升前不计数，晋升消费时一次性计入。"""
+
+    fresh()
+    task = "缓冲中性练习"
+    build_difficulty_memory(task)
+
+    for stamp in ("2026-01-05T10:00:00Z", "2026-01-06T10:00:00Z", "2026-01-07T10:00:00Z"):
+        insert_feedback_row(task, "completed", None, created_at=stamp)
+
+    memory_service.apply_pending_updates(now="2026-01-08T00:00:00Z")
+    check("已进入 resolved", memory_of("difficulty", task)[14] == "resolved",
+          str(memory_of("difficulty", task)[14]))
+
+    # 两条 neutral 进缓冲区：本批没有正式证据 → 不晋升，也不能提前计数
+    pending_batches = []
+
+    for index, stamp in enumerate(("2026-01-09T10:00:00Z", "2026-01-10T10:00:00Z")):
+        insert_feedback_row(task, "not_completed", "临时有事情", created_at=stamp)
+        result = memory_service.apply_pending_updates(now=f"2026-01-1{index + 1}T00:00:00Z")
+        pending_batches.append(result["info"]["neutral_dropped"])
+
+    check("未晋升批次不重复计数 neutral", pending_batches == [0, 0], str(pending_batches))
+    check("neutral 留在缓冲区", scoped_counts("difficulty", task)["pending"] == 2,
+          str(scoped_counts("difficulty", task)))
+
+    # 再来两条 supports 达 REQUIRED=2 → 晋升，缓冲里的 neutral 一次性丢弃并计数
+    insert_feedback_row(task, "not_completed", "任务难度太高", created_at="2026-01-11T10:00:00Z")
+    weak = memory_service.apply_pending_updates(now="2026-01-12T00:00:00Z")
+    check("未达门槛时不晋升", memory_of("difficulty", task)[14] == "resolved",
+          str(memory_of("difficulty", task)[14]))
+    check("未达门槛时仍不计数", weak["info"]["neutral_dropped"] == 0, str(weak["info"]))
+
+    insert_feedback_row(task, "not_completed", "任务难度太高", created_at="2026-01-12T10:00:00Z")
+    promoted = memory_service.apply_pending_updates(now="2026-01-13T00:00:00Z")
+    row = memory_of("difficulty", task)
+
+    check("达门槛后晋升", row[14] == "active" and row[9] == 2, f"status={row[14]} episode={row[9]}")
+    check("晋升时丢弃的 neutral 恰计 2", promoted["info"]["neutral_dropped"] == 2,
+          str(promoted["info"]))
+    check("晋升后缓冲区清空", scoped_counts("difficulty", task)["pending"] == 0,
+          str(scoped_counts("difficulty", task)))
+    check("晋升后只写两条 supports 证据", scoped_counts("difficulty", task)["evidence"] == 7,
+          str(scoped_counts("difficulty", task)))
+
+
 # ==========================
 # 运行入口
 # ==========================
@@ -1634,6 +1737,8 @@ def main():
         test_retrieve_invalid_limit_returns_error_dict,
         test_second_episode_keeps_neutral_and_first_formal_sample,
         test_time_pattern_promotion_filters_invalid_pending_with_other_plan,
+        test_consecutive_neutral_feedback_counts_once_per_feedback,
+        test_neutral_pending_is_counted_once_at_promotion,
     ]
 
     passed = 0
