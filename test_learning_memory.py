@@ -168,6 +168,12 @@ def test_v7_columns_and_indexes():
     check("M2 唯一索引 idx_pending_memory_feedback",
           "idx_pending_memory_feedback" in index_names("memory_pending_evidence"))
 
+    pending_indexes = index_names("memory_pending_evidence")
+    check("M2 pending 按 feedback 反查索引 idx_pending_feedback",
+          "idx_pending_feedback" in pending_indexes, f"indexes={pending_indexes}")
+    check("M2 pending 按 episode 过滤索引 idx_pending_memory_episode",
+          "idx_pending_memory_episode" in pending_indexes, f"indexes={pending_indexes}")
+
 
 def test_empty_database_cursor_is_zero():
     use(DB)
@@ -387,17 +393,83 @@ def test_event_and_pending_crud():
     rows = database.list_pending(memory["id"])
     check("D9 list_pending 返回一行", len(rows) == 1 and rows[0]["feedback_id"] == 21,
           f"rows={rows}")
+    check("D9 count_pending 与行数一致", database.count_pending(memory["id"]) == 1)
 
     database.insert_pending(memory["id"], 22, None, 1, "2026-10-01T10:00:00", "2026-10-01T10:00:01")
-    deleted = database.delete_expired_pending("2026-10-15T00:00:00")
+    deleted = database.delete_expired_pending(memory["id"], "2026-10-15T00:00:00")
     check("D10 过期 pending 被删除", deleted == 1, f"deleted={deleted}")
 
     remaining = database.list_pending(memory["id"])
-    remaining_ids = [row["id"] for row in remaining]
     check("D10 未过期的保留", len(remaining) == 1, f"remaining={remaining}")
 
-    removed = database.delete_pending(remaining_ids)
-    check("D9 delete_pending 按主键删除", removed == 1 and not database.list_pending(memory["id"]))
+    removed = database.delete_pending(memory["id"], feedback_ids=[21])
+    check("D9 delete_pending 按 feedback_ids 删除",
+          removed == 1 and not database.list_pending(memory["id"]), f"removed={removed}")
+
+
+def test_pending_queries_are_scoped():
+    """P1-2：pending 四个接口都要按 memory_id / episode 精确收窄，不跨记忆误删。"""
+
+    use(DB)
+    database.init_db()
+
+    memory_a = database.insert_memory(make_memory(subject_key="作用域A"), "2026-11-01T10:00:00")
+    memory_b = database.insert_memory(make_memory(subject_key="作用域B"), "2026-11-01T10:00:00")
+    id_a = memory_a["row_id"]
+    id_b = memory_b["row_id"]
+
+    for feedback_id, episode, created_at in (
+        (31, 1, "2026-11-04T10:00:00"),
+        (32, 1, "2026-11-05T10:00:00"),
+        (33, 2, "2026-11-06T10:00:00"),
+    ):
+        database.insert_pending(id_a, feedback_id, None, episode, created_at, created_at)
+
+    for feedback_id, episode, created_at in (
+        (34, 1, "2026-11-04T10:00:00"),
+        (35, 2, "2026-11-07T10:00:00"),
+    ):
+        database.insert_pending(id_b, feedback_id, None, episode, created_at, created_at)
+
+    def feedback_ids(memory_id, episode=None):
+        return [row["feedback_id"] for row in database.list_pending(memory_id, episode)]
+
+    check("P1 记忆 A 全部 pending 按 feedback_id 升序",
+          feedback_ids(id_a) == [31, 32, 33], f"rows={feedback_ids(id_a)}")
+    check("P2 记忆 A 按 episode=1 过滤",
+          feedback_ids(id_a, 1) == [31, 32], f"rows={feedback_ids(id_a, 1)}")
+    check("P2 记忆 A 按 episode=2 过滤",
+          feedback_ids(id_a, 2) == [33], f"rows={feedback_ids(id_a, 2)}")
+    check("P2 episode 无匹配时返回空", feedback_ids(id_a, 9) == [], f"rows={feedback_ids(id_a, 9)}")
+    check("P2 不存在的 memory_id 返回空", feedback_ids(9999) == [], f"rows={feedback_ids(9999)}")
+
+    check("P3 count_pending 全量", database.count_pending(id_a) == 3)
+    check("P3 count_pending 按 episode", database.count_pending(id_a, 1) == 2)
+    check("P3 count_pending 不影响其他记忆", database.count_pending(id_b) == 2)
+
+    removed = database.delete_pending(id_a, episode=1)
+    check("P4 delete_pending 按 episode 只删本记忆 2 行",
+          removed == 2 and feedback_ids(id_a) == [33], f"removed={removed}, rows={feedback_ids(id_a)}")
+    check("P4 删除 A 的 pending 不影响 B", feedback_ids(id_b) == [34, 35], f"rows={feedback_ids(id_b)}")
+
+    check("P5 delete_pending 指定不存在的 feedback_id 返回 0",
+          database.delete_pending(id_a, feedback_ids=[99]) == 0)
+    check("P5 feedback_ids 为空列表时不删除任何行",
+          database.delete_pending(id_a, feedback_ids=[]) == 0 and database.count_pending(id_a) == 1)
+
+    database.insert_pending(id_a, 36, None, 2, "2026-10-01T10:00:00", "2026-10-01T10:00:01")
+    database.insert_pending(id_b, 37, None, 2, "2026-10-01T10:00:00", "2026-10-01T10:00:01")
+
+    expired = database.delete_expired_pending(id_a, "2026-10-15T00:00:00")
+    check("P6 delete_expired_pending 只清理本记忆的过期行",
+          expired == 1 and feedback_ids(id_a) == [33], f"expired={expired}, rows={feedback_ids(id_a)}")
+    check("P6 其他记忆的同期过期行不受影响",
+          feedback_ids(id_b) == [34, 35, 37], f"rows={feedback_ids(id_b)}")
+
+    removed = database.delete_pending(id_a)
+    check("P7 delete_pending 不给条件时只清空本记忆",
+          removed == 1 and feedback_ids(id_a) == [] and feedback_ids(id_b) == [34, 35, 37],
+          f"removed={removed}, rows_a={feedback_ids(id_a)}, rows_b={feedback_ids(id_b)}")
 
 
 # ==========================
@@ -459,16 +531,40 @@ def test_delete_all_memories_keeps_feedback_and_cursor():
     database.write_cursor(1, "2026-11-10T00:00:00")
     memory = database.insert_memory(make_memory(subject_key="保留测试"), "2026-11-01T10:00:00")
     database.insert_evidence(memory["row_id"], 1, None, 1, "supports", "2026-11-01T10:00:00")
+    database.insert_memory_event(memory["row_id"], "created", "{}", "2026-11-01T10:00:00")
+    database.insert_pending(memory["row_id"], 1, None, 1, "2026-11-01T10:00:00",
+                            "2026-11-01T10:00:00")
+
+    with connect() as conn:
+        seq_before = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'feedbacks'"
+        ).fetchone()[0]
 
     database.delete_all_memories()
 
+    derived_tables = (
+        "learning_memories",
+        "memory_evidence",
+        "memory_events",
+        "memory_pending_evidence",
+    )
     with connect() as conn:
-        feedbacks = conn.execute("SELECT COUNT(*) FROM feedbacks").fetchone()[0]
-        evidence = conn.execute("SELECT COUNT(*) FROM memory_evidence").fetchone()[0]
+        counts = {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in ("feedbacks",) + derived_tables
+        }
+        seq_after = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'feedbacks'"
+        ).fetchone()[0]
 
-    check("D13 delete_all_memories 只清记忆三表",
-          feedbacks == 1 and evidence == 0, f"feedbacks={feedbacks}, evidence={evidence}")
-    check("D13 不动游标", database.read_cursor() == 1)
+    check("D13 delete_all_memories 四张派生表全部清空",
+          all(counts[table] == 0 for table in derived_tables),
+          f"counts={counts}")
+    check("D13 不删除原始 feedbacks", counts["feedbacks"] == 1, f"counts={counts}")
+    check("D13 不动游标", database.read_cursor() == 1,
+          f"cursor={database.read_cursor()}")
+    check("D13 不重置 sqlite_sequence", seq_after == seq_before,
+          f"seq_before={seq_before}, seq_after={seq_after}")
 
 
 # ==========================
@@ -509,12 +605,33 @@ def test_normalize_subject_collapses_variants():
     check("N7 同一主题的不同写法落到同一 key", keys == {"条件概率"}, f"keys={keys}")
 
 
+def test_normalize_subject_is_ascii_only_lowercase():
+    """P2：只对 A-Z 小写，不得用 str.lower() 改写非 ASCII 字母。"""
+
+    key, _ = memory_service.normalize_subject("Ärger")
+    check("N8 非 ASCII 大写字母原样保留", key == "Ärger", f"key={key}")
+
+    other, _ = memory_service.normalize_subject("ärger")
+    check("N8 非 ASCII 大小写视为不同主题", other != key, f"keys={key} / {other}")
+
+    key, _ = memory_service.normalize_subject("ÄRGER")
+    check("N8 混合大小写只折叠 ASCII 部分", key == "Ärger", f"key={key}")
+
+    key, _ = memory_service.normalize_subject("ΣΟΦΙΑ")
+    check("N8 希腊字母不做大小写折叠", key == "ΣΟΦΙΑ", f"key={key}")
+
+    key, _ = memory_service.normalize_subject("Conditional PROBABILITY")
+    check("N8 ASCII 大小写仍然不敏感",
+          key == "conditional probability", f"key={key}")
+
+
 # ==========================
 # R 组：内容渲染
 # ==========================
 
 
 def test_render_content_templates():
+    prefix = memory_service.TENTATIVE_PREFIX
     content = memory_service.render_content(
         "difficulty",
         {"failed_count": 2, "reason": "任务难度太高", "window_days": 30},
@@ -524,42 +641,73 @@ def test_render_content_templates():
     check("R1 difficulty 模板", content == "「条件概率练习」近期 2 次因难度太高未完成（30 天内）",
           content)
 
+    # R2：task_performance 的稳定门槛看 samples，不看 supports。
+    tp_value = {"samples": 4, "completed": 1, "completion_rate": 0.25, "direction": "low"}
+    content = memory_service.render_content(
+        "task_performance", tp_value, "条件概率", supports=6
+    )
+    check("R2 task_performance samples=4/supports=6 仍加前缀（按 samples 判）",
+          content == prefix + "「条件概率」近期 4 次任务完成率 25%", content)
+
     content = memory_service.render_content(
         "task_performance",
-        {"samples": 4, "completed": 1, "completion_rate": 0.25, "direction": "low"},
+        {"samples": 6, "completed": 2, "completion_rate": 0.3333, "direction": "low"},
         "条件概率",
-        supports=6,
+        supports=3,
     )
-    check("R2 task_performance 用百分比", content == "「条件概率」近期 4 次任务完成率 25%", content)
+    check("R2 task_performance samples=6/supports=3 不加前缀（supports 不参与）",
+          content == "「条件概率」近期 6 次任务完成率 33%", content)
 
+    # R3：time_pattern 同样看 samples。
     content = memory_service.render_content(
         "time_pattern",
         {"difficulty": "hard", "samples": 5, "median_ratio": 1.6},
         "困难",
         supports=8,
     )
-    check("R3 time_pattern 用难度中文与倍数",
-          content == "困难 任务近期 5 次实际用时约为预估的 1.6 倍", content)
+    check("R3 time_pattern samples=5/supports=8 仍加前缀（按 samples 判）",
+          content == prefix + "困难 任务近期 5 次实际用时约为预估的 1.6 倍", content)
 
+    content = memory_service.render_content(
+        "time_pattern",
+        {"difficulty": "hard", "samples": 8, "median_ratio": 1.6},
+        "困难",
+        supports=3,
+    )
+    check("R3 time_pattern samples=8/supports=3 不加前缀",
+          content == "困难 任务近期 8 次实际用时约为预估的 1.6 倍", content)
+
+    # R4：task_topic 的稳定门槛看 appearances。
     content = memory_service.render_content(
         "task_topic",
         {"appearances": 3, "last_status": "partial"},
         "条件概率",
-        supports=6,
+        supports=9,
     )
-    check("R4 task_topic 模板", content == "「条件概率」近期反馈中 3 次出现", content)
+    check("R4 task_topic appearances=3 即使 supports 很高也加前缀",
+          content == prefix + "「条件概率」近期反馈中 3 次出现", content)
 
-    tentative = memory_service.render_content(
-        "difficulty", {"failed_count": 2, "window_days": 30}, "条件概率", supports=2
+    content = memory_service.render_content(
+        "task_topic",
+        {"appearances": 6, "last_status": "partial"},
+        "条件概率",
+        supports=0,
     )
-    check("R5 未达稳定门槛加「初步观察：」",
-          tentative.startswith(memory_service.TENTATIVE_PREFIX), tentative)
+    check("R4 task_topic appearances=6 即使 supports=0 也不加前缀",
+          content == "「条件概率」近期反馈中 6 次出现", content)
+
+    # R5/R6：difficulty 是唯一看 supports 的类型。
+    tentative = memory_service.render_content(
+        "difficulty", {"failed_count": 2, "window_days": 30}, "条件概率", supports=3
+    )
+    check("R5 difficulty supports=3 加「初步观察：」",
+          tentative.startswith(prefix), tentative)
 
     stable = memory_service.render_content(
         "difficulty", {"failed_count": 4, "window_days": 30}, "条件概率", supports=4
     )
-    check("R6 达到稳定门槛不加前缀",
-          not stable.startswith(memory_service.TENTATIVE_PREFIX), stable)
+    check("R6 difficulty supports=4 不加前缀",
+          not stable.startswith(prefix), stable)
 
     for label, args in (
         ("R7 未知类型", ("preference", {"x": 1}, "x", 1)),
@@ -609,10 +757,12 @@ def _run_all():
         test_memory_crud,
         test_evidence_crud,
         test_event_and_pending_crud,
+        test_pending_queries_are_scoped,
         test_delete_feedback_cascades_and_keeps_high_water,
         test_delete_all_memories_keeps_feedback_and_cursor,
         test_normalize_subject_basics,
         test_normalize_subject_collapses_variants,
+        test_normalize_subject_is_ascii_only_lowercase,
         test_render_content_templates,
         test_value_json_roundtrip_is_deterministic,
     ]

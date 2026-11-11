@@ -297,6 +297,10 @@ def _migration_v7_learning_memory(conn):
         "CREATE INDEX IF NOT EXISTS idx_pending_memory_episode "
         "ON memory_pending_evidence(memory_id, episode)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_feedback "
+        "ON memory_pending_evidence(feedback_id)"
+    )
 
     conn.execute(
         """
@@ -948,10 +952,16 @@ def insert_memory_event(memory_id, event_type, detail_json, created_at):
 
 
 def delete_all_memories():
-    """清空记忆三表（rebuild 用）；不动游标。"""
+    """清空四张派生表（rebuild 用）；不动游标，也不动原始 feedbacks。
+
+    重建的输入是 feedbacks 全量重放，所以凡是「由 feedbacks 派生」的表都必须
+    一起清空：漏掉 pending 会让旧缓冲区在 rebuild 后把已重放过的证据再算一遍。
+    四张表在同一个事务里删，避免中途失败留下半清空状态。
+    """
 
     with sqlite3.connect(DATABASE_PATH) as conn:
         conn.execute("DELETE FROM memory_events")
+        conn.execute("DELETE FROM memory_pending_evidence")
         conn.execute("DELETE FROM memory_evidence")
         conn.execute("DELETE FROM learning_memories")
 
@@ -997,19 +1007,25 @@ def insert_pending(memory_id, feedback_id, plan_id, episode, created_at, recorde
         return {"inserted": inserted, "row_id": cursor.lastrowid if inserted else None}
 
 
-def list_pending(memory_id=None):
-    """按 feedback_id 升序返回缓冲区行（全局或单条记忆）。"""
+def list_pending(memory_id, episode=None):
+    """按 feedback_id 升序返回某条记忆的缓冲区行，可按 episode 过滤。
+
+    memory_id 必填：缓冲区只服务于「某条记忆下次更新时重算」，脱离记忆的全局
+    列表没有明确语义，也容易在 rebuild/调试时被误当成「全部记忆的待判定证据」。
+    """
+
+    _require_int(memory_id, "memory_id", minimum=1)
 
     sql = (
         "SELECT id, memory_id, feedback_id, plan_id, episode, created_at, recorded_at "
-        "FROM memory_pending_evidence"
+        "FROM memory_pending_evidence WHERE memory_id = ?"
     )
-    params = []
+    params = [memory_id]
 
-    if memory_id is not None:
-        _require_int(memory_id, "memory_id", minimum=1)
-        sql += " WHERE memory_id = ?"
-        params.append(memory_id)
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
 
     sql += " ORDER BY feedback_id ASC"
 
@@ -1019,30 +1035,74 @@ def list_pending(memory_id=None):
     return [_pending_row_to_dict(row) for row in rows]
 
 
-def delete_pending(pending_ids):
-    """按缓冲区主键删除；返回实际删除行数。"""
+def count_pending(memory_id, episode=None):
+    """返回某条记忆的缓冲区行数（可按 episode 过滤）。"""
 
-    if not pending_ids:
-        return 0
+    _require_int(memory_id, "memory_id", minimum=1)
 
-    ids = [_require_int(value, "pending_id", minimum=1) for value in pending_ids]
-    placeholders = ", ".join("?" for _ in ids)
+    sql = "SELECT COUNT(*) FROM memory_pending_evidence WHERE memory_id = ?"
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
 
     with sqlite3.connect(DATABASE_PATH) as conn:
-        cursor = conn.execute(
-            f"DELETE FROM memory_pending_evidence WHERE id IN ({placeholders})", ids
-        )
+        return int(conn.execute(sql, params).fetchone()[0])
+
+
+def _require_pending_feedback_ids(feedback_ids):
+    """校验删除用的 feedback_id 列表，返回去重后的列表。"""
+
+    if isinstance(feedback_ids, (str, bytes)) or not hasattr(feedback_ids, "__iter__"):
+        raise ValueError("feedback_ids 必须是整数序列")
+
+    values = [_require_int(value, "feedback_id", minimum=1) for value in feedback_ids]
+
+    return list(dict.fromkeys(values))
+
+
+def delete_pending(memory_id, episode=None, feedback_ids=None):
+    """删除某条记忆的缓冲区行；返回实际删除行数。
+
+    episode 与 feedback_ids 都是可选收窄条件，同时给出时取交集。任何情况下都
+    以 memory_id 为硬边界，绝不会跨记忆删除；换到的行数只反映本条记忆的删除量。
+    """
+
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    sql = "DELETE FROM memory_pending_evidence WHERE memory_id = ?"
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
+
+    if feedback_ids is not None:
+        ids = _require_pending_feedback_ids(feedback_ids)
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        sql += f" AND feedback_id IN ({placeholders})"
+        params.extend(ids)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(sql, params)
         return cursor.rowcount
 
 
-def delete_expired_pending(cutoff_iso):
-    """删除 created_at 早于 cutoff 的缓冲区行（窗口过期）；返回删除行数。"""
+def delete_expired_pending(memory_id, cutoff_created_at):
+    """删除某条记忆中 created_at 早于 cutoff 的缓冲区行；返回删除行数。"""
 
-    _require_text(cutoff_iso, "cutoff_iso")
+    _require_int(memory_id, "memory_id", minimum=1)
+    _require_text(cutoff_created_at, "cutoff_created_at")
 
     with sqlite3.connect(DATABASE_PATH) as conn:
         cursor = conn.execute(
-            "DELETE FROM memory_pending_evidence WHERE created_at < ?", (cutoff_iso,)
+            "DELETE FROM memory_pending_evidence WHERE memory_id = ? AND created_at < ?",
+            (memory_id, cutoff_created_at),
         )
         return cursor.rowcount
 

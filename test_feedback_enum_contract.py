@@ -178,6 +178,23 @@ def test_invalid_reason_is_rejected():
     )
 
 
+def test_completed_with_invalid_reason_is_rejected():
+    """status=completed 可以不带 reason，但带了一个非枚举值仍应被 422 拒绝。
+
+    completed 只是放宽「必须给 reason」，不放宽 reason 本身的取值域；否则
+    「完成任务但标记原因为任务太难」这种自相矛盾的记录会写进库。
+    """
+
+    assert_rejected_422(
+        lambda: post(base_payload(status="completed", reason="时间不够")),
+        "V9 completed + 非枚举 reason 时间不够",
+    )
+    assert_rejected_422(
+        lambda: post(base_payload(status="completed", reason="任务太难")),
+        "V9 completed + 非枚举 reason 任务太难",
+    )
+
+
 def test_reason_required_for_partial():
     before = feedback_count()
     response = post(base_payload(status="partial", reason=None))
@@ -238,6 +255,7 @@ def _run_all():
     tests = [
         test_invalid_status_is_rejected,
         test_invalid_reason_is_rejected,
+        test_completed_with_invalid_reason_is_rejected,
         test_reason_required_for_partial,
         test_reason_required_for_not_completed,
         test_completed_without_reason_is_accepted,

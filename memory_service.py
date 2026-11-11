@@ -80,6 +80,17 @@ def _clean_text(value):
     return " ".join(text.split())
 
 
+def _ascii_lower(text):
+    """只把 A-Z 转小写，其他字符原样保留（v16 归一化规则）。
+
+    不能用 str.lower()：它按 Unicode 大小写映射改写非 ASCII 字母（如 `Ä`、`Σ`），
+    会让「Ärger」和「ärger」被当成同一主题，也会把拉丁/希腊/西里尔字母的原始
+    写法悄悄改掉。主题 key 只承诺 ASCII 大小写不敏感。
+    """
+
+    return "".join(chr(ord(char) + 32) if "A" <= char <= "Z" else char for char in text)
+
+
 def normalize_subject(task):
     """任务名 -> (subject_key, subject_label)；空任务返回 (None, None)。
 
@@ -109,7 +120,7 @@ def normalize_subject(task):
     if not key:
         key = label
 
-    key = key.lower()[:SUBJECT_KEY_MAX_CHARS].strip()
+    key = _ascii_lower(key)[:SUBJECT_KEY_MAX_CHARS].strip()
     label = label[:SUBJECT_LABEL_MAX_CHARS]
 
     if not key:
@@ -147,12 +158,28 @@ def _pick(value, name):
     return value[name]
 
 
+def _stable_unit(memory_type, fields, supports):
+    """稳定门槛的计入单位（v16 §5.5）：同一记忆只有一套门槛口径。
+
+    difficulty 数 supports，task_performance / time_pattern 数有效样本 samples，
+    task_topic 数出现次数。单位直接从模板已校验的字段里取，避免「门槛用 A、
+    文案用 B」两套口径打架。
+    """
+
+    if memory_type == "difficulty":
+        return supports
+    if memory_type in ("task_performance", "time_pattern"):
+        return fields["samples"]
+    return fields["appearances"]
+
+
 def render_content(memory_type, value, subject_label, supports=0):
     """由结构化取值渲染记忆文本（纯函数，不含任何模型调用）。
 
     value 必须是 dict（value_json 的原样解析结果）；字段缺失或类型不符直接
     抛 ValueError，避免把脏数据渲染成一句看似正常的结论。
-    supports 是当前轮已计入的支持条数，仅用于决定是否加「初步观察：」前缀。
+    supports 是当前轮已计入的支持条数，只有 difficulty 用它判稳定门槛；
+    其余类型按 v16 §5.5 的计入单位（samples / appearances）判。
     """
 
     if memory_type not in TEMPLATES:
@@ -198,7 +225,7 @@ def render_content(memory_type, value, subject_label, supports=0):
 
     content = TEMPLATES[memory_type].format(**fields)
 
-    if supports < STABLE[memory_type]:
+    if _stable_unit(memory_type, fields, supports) < STABLE[memory_type]:
         content = TENTATIVE_PREFIX + content
 
     return content
