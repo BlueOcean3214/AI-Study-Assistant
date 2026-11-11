@@ -177,7 +177,8 @@ def test_v5_to_v6_migration_keeps_data():
     finally:
         conn.close()
 
-    assert version == 6, f"user_version 应为 6，实际 {version}"
+    # 第二阶段起 schema 已到 V7：这里只断言「升级到程序当前支持的版本」
+    assert version == database.SCHEMA_VERSION, f"user_version 应为 {database.SCHEMA_VERSION}，实际 {version}"
     assert column_names(MIGRATE_DB, "feedbacks").count("plan_id") == 1
     assert "idx_feedbacks_plan_id" in index_names(MIGRATE_DB, "feedbacks")
 
@@ -192,7 +193,7 @@ def test_v5_to_v6_migration_keeps_data():
         conn.close()
     assert plan_count == 1, "旧计划不应丢失"
 
-    print("PASS: V5 -> V6 迁移保留旧数据，plan_id 为 NULL，索引已建立")
+    print("PASS: V5 老库升级到当前版本，旧数据保留，plan_id 为 NULL，索引已建立")
 
 
 def test_v6_migration_is_idempotent():
@@ -211,7 +212,7 @@ def test_v6_migration_is_idempotent():
     print("PASS: 重复 init_db 3 次，列/索引/数据均不变")
 
 
-def test_fresh_database_is_v6():
+def test_fresh_database_is_current_version():
     remove_file(UNIT_DB)
 
     with fixture_database(UNIT_DB):
@@ -223,11 +224,11 @@ def test_fresh_database_is_v6():
     finally:
         conn.close()
 
-    assert version == 6
+    assert version == database.SCHEMA_VERSION
     assert "plan_id" in column_names(UNIT_DB, "feedbacks")
     assert "idx_feedbacks_plan_id" in index_names(UNIT_DB, "feedbacks")
 
-    print("PASS: 全新库初始化为 v6，含 plan_id 与索引")
+    print(f"PASS: 全新库初始化为 v{database.SCHEMA_VERSION}，含 plan_id 与索引")
 
 
 def test_newer_database_is_rejected():
@@ -235,7 +236,7 @@ def test_newer_database_is_rejected():
 
     conn = connect(MIGRATE_DB)
     try:
-        conn.execute("PRAGMA user_version = 7")
+        conn.execute(f"PRAGMA user_version = {database.SCHEMA_VERSION + 1}")
         conn.commit()
     finally:
         conn.close()
@@ -248,7 +249,7 @@ def test_newer_database_is_rejected():
         else:
             raise AssertionError("FAILED: 高版本库应拒绝启动")
 
-    print("PASS: user_version=7 的库仍被拒绝（降级保护有效）")
+    print("PASS: 高于 SCHEMA_VERSION 的库仍被拒绝（降级保护有效）")
 
 
 # ==========================
@@ -262,7 +263,7 @@ def _feedback(task="关联测试任务", plan_id=None):
         "estimated_minutes": 40,
         "actual_minutes": 30,
         "status": "completed",
-        "reason": "无",
+        "reason": "其他",
         "completed_subtasks": 1,
         "total_subtasks": 2,
         "completed_questions": 2,
@@ -499,7 +500,7 @@ def test_http_valid_plan_link():
         "estimated_minutes": 40,
         "actual_minutes": 35,
         "status": "completed",
-        "reason": "无",
+        "reason": "其他",
         "completed_subtasks": 2,
         "total_subtasks": 2,
         "completed_questions": 4,
@@ -572,7 +573,8 @@ def test_http_missing_plan_id_is_compatible():
         "estimated_minutes": 30,
         "actual_minutes": 20,
         "status": "partial",
-        "reason": "时间不够",
+        # 第二阶段 Task 0 起 reason 是服务端枚举：这里必须给五值之一
+        "reason": "任务时间太长",
     }
     response = requests.post(f"{base_url}/feedback", json=payload, timeout=10)
 
@@ -624,6 +626,7 @@ def test_http_multiple_feedback_for_same_plan():
                 "estimated_minutes": 40,
                 "actual_minutes": 20,
                 "status": "partial",
+                "reason": "任务时间太长",
                 "plan_id": plan_id,
             },
             timeout=10,
