@@ -525,14 +525,58 @@ def _relation_for(memory_type, direction, row, plan_difficulty=None):
     return None
 
 
-def _valid_candidates(memory_type, rows, plan_difficulties=None):
-    """过滤掉枚举非法、以及 time_pattern 里比例不可算的行。
+def _plan_difficulty_for_row(row, subject_key, conn, cache=None):
+    """time_pattern 候选的 plan 有效性校验（§5.2），返回合法 difficulty 或 None。
 
-    返回 (有效行, 非法行数)。非法行既不计分子也不计分母，计 info.invalid_enum。
+    四件事必须同时成立，缺一即视为无效候选（不参与 direction/samples/median/
+    REQUIRED/STABLE，也不写正式证据）：plan 行存在、difficulty ∈ easy/medium/hard、
+    difficulty 等于当前记忆的 subject_key、plans.estimated_minutes > 0。
+    任何时候都重新回表核对，不信任反馈自带的 estimated_minutes。
+    """
+
+    plan_id = row.get("plan_id")
+
+    if plan_id is None:
+        return None
+
+    if cache is not None and plan_id in cache:
+        plan = cache[plan_id]
+    else:
+        plan = database.get_plan_by_id(plan_id, conn=conn)
+
+        if cache is not None:
+            cache[plan_id] = plan
+
+    if plan is None:
+        return None
+
+    difficulty = plan.get("difficulty")
+
+    if difficulty not in DIFFICULTY_LABELS:
+        return None
+
+    if difficulty != subject_key:
+        return None
+
+    estimated = plan.get("estimated_minutes")
+
+    if isinstance(estimated, bool) or not isinstance(estimated, int) or estimated <= 0:
+        return None
+
+    return difficulty
+
+
+def _valid_candidates(memory_type, rows, plan_difficulties=None):
+    """过滤掉枚举非法、以及 time_pattern 里 plan 无效或比例不可算的行。
+
+    返回 (有效行, 非法枚举行数, 无效计划行数)。两类非法行既不计分子也不计分母，
+    分别计 info.invalid_enum 与 info.invalid_plan。time_pattern 的每一行都必须在
+    plan_difficulties 里（调用方已按 §5.2 校验过 plan 存在、难度匹配、预估 > 0）。
     """
 
     valid = []
     invalid = 0
+    invalid_plan = 0
 
     for row in rows:
         if not _is_valid_reason(row.get("status"), row.get("reason")):
@@ -541,13 +585,16 @@ def _valid_candidates(memory_type, rows, plan_difficulties=None):
 
         if memory_type == "time_pattern":
             difficulty = None if plan_difficulties is None else plan_difficulties.get(row.get("id"))
+            if difficulty is None:
+                invalid_plan += 1
+                continue
             if _ratio_for(row, difficulty) is None:
                 invalid += 1
                 continue
 
         valid.append(row)
 
-    return (valid, invalid)
+    return (valid, invalid, invalid_plan)
 
 
 def evaluate(memory_type, candidates, as_of, plan_difficulties=None):
@@ -565,7 +612,7 @@ def evaluate(memory_type, candidates, as_of, plan_difficulties=None):
     if memory_type not in MEMORY_TYPES:
         raise ValueError(f"未知记忆类型：{memory_type}")
 
-    rows, invalid = _valid_candidates(memory_type, candidates, plan_difficulties)
+    rows, invalid, invalid_plan = _valid_candidates(memory_type, candidates, plan_difficulties)
     required = REQUIRED[memory_type]
 
     if memory_type == "difficulty":
@@ -578,6 +625,7 @@ def evaluate(memory_type, candidates, as_of, plan_difficulties=None):
             "unit": unit,
             "sufficient": unit >= required,
             "invalid": invalid,
+            "invalid_plan": invalid_plan,
             "direction": "failure",
             "value": {
                 "failed_count": unit,
@@ -606,6 +654,7 @@ def evaluate(memory_type, candidates, as_of, plan_difficulties=None):
             "unit": samples,
             "sufficient": samples >= required,
             "invalid": invalid,
+            "invalid_plan": invalid_plan,
             "direction": direction,
             "value": {
                 "completion_rate": round(rate, 6),
@@ -648,6 +697,7 @@ def evaluate(memory_type, candidates, as_of, plan_difficulties=None):
             "unit": samples,
             "sufficient": samples >= required,
             "invalid": invalid,
+            "invalid_plan": invalid_plan,
             "direction": direction,
             "value": {
                 "difficulty": difficulty_value,
@@ -664,6 +714,7 @@ def evaluate(memory_type, candidates, as_of, plan_difficulties=None):
         "unit": unit,
         "sufficient": unit >= required,
         "invalid": invalid,
+        "invalid_plan": invalid_plan,
         "direction": "appearance",
         "value": {"appearances": unit},
         "relations": relations,
@@ -702,6 +753,7 @@ def _new_info():
     return {
         "already_evidenced": 0,
         "invalid_enum": 0,
+        "invalid_plan": 0,
         "neutral_dropped": 0,
         "direction_undetermined": 0,
         "insufficient_evidence": 0,
@@ -1110,20 +1162,31 @@ def _commit_conclusion(memory, conn, info, status=None, extra_fields=None):
     return database.get_memory(memory["id"], conn=conn)
 
 
-def _plan_difficulties_for(rows, conn):
-    """给带 plan_id 的反馈补齐 plans.difficulty（time_pattern 的关系判定要用）。"""
+def _plan_difficulties_for(rows, conn, subject_key=None):
+    """给带 plan_id 的反馈补齐 plans.difficulty（time_pattern 的关系判定要用）。
+
+    subject_key 非 None 时按 §5.2 做完整有效性校验（plan 存在、难度合法且等于
+    subject_key、estimated_minutes > 0），无效行不进返回字典——调用方的
+    evaluate 会把它们计成 invalid_plan，既不参与统计也不写正式证据。
+    """
 
     cache = {}
     result = {}
 
     for row in rows:
-        if "difficulty" in row:
+        if subject_key is None and "difficulty" in row:
             result[row["id"]] = row.get("difficulty")
             continue
 
         plan_id = row.get("plan_id")
 
         if plan_id is None:
+            continue
+
+        if subject_key is not None:
+            difficulty = _plan_difficulty_for_row(row, subject_key, conn, cache)
+            if difficulty is not None:
+                result[row["id"]] = difficulty
             continue
 
         if plan_id not in cache:
@@ -1135,27 +1198,79 @@ def _plan_difficulties_for(rows, conn):
     return result
 
 
-def _episode_value(memory, as_of, conn, direction, episode=None):
-    """用当前轮已落库的证据反推 value（计数/比率全部重算，禁止 +1）。"""
+def _episode_candidates(memory, as_of, end_feedback_id, conn):
+    """从原始反馈重算当前轮的有效候选（含 neutral），供更新后的结论重算。
 
+    v16 §5.2：窗口 [as_of-30d, as_of]、id <= end_feedback_id、id > 轮次下界。
+    轮次下界：第 1 轮没有下界（首轮覆盖窗口内全部候选），之后取
+    episode_start_feedback_id（该轮第一条正式证据）。neutral 没有正式证据行，
+    只能从原始 feedbacks 重算，否则后续更新时 samples/median 会凭空变小
+    （PR #4 P1-3）。
+    """
+
+    memory_type = memory["memory_type"]
+    lower_bound = None if memory["episode"] == 1 else memory.get("episode_start_feedback_id")
+    as_of_dt = _parse_ts(as_of)
+    start = (as_of_dt - timedelta(days=MEMORY_WINDOW_DAYS + 1)).isoformat()
+    end = (as_of_dt + timedelta(days=1)).isoformat()
+
+    if end_feedback_id is None:
+        end_feedback_id = database.max_feedback_id(conn=conn)
+
+    rows = database.list_feedbacks_between(start, end, max_id=end_feedback_id, conn=conn)
+    selected = []
+
+    for row in rows:
+        if not _in_window(row["created_at"], as_of):
+            continue
+        if lower_bound is not None and row["id"] <= lower_bound:
+            continue
+
+        if memory_type == "time_pattern":
+            if _plan_difficulty_for_row(row, memory["subject_key"], conn) is None:
+                continue
+            if _ratio_for(row) is None:
+                continue
+        elif normalize_subject(row.get("task"))[0] != memory["subject_key"]:
+            continue
+
+        selected.append(row)
+
+    return selected
+
+
+def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id=None):
+    """用当前轮的原始候选重算 value（计数/比率全部重算，禁止 +1）。
+
+    v16 §5.2/§5.5：time_pattern 的 samples 是有效样本总数，neutral 也算，但
+    neutral 不写正式证据。所以不能拿 memory_evidence 行数当 samples——那会让
+    历史 neutral 样本在第二次更新时消失（PR #4 P1-3）。这里一律回原始
+    feedbacks 按轮次边界重算，rebuild 走同一函数于是天然可复现。
+    """
+
+    memory_type = memory["memory_type"]
     episode = memory["episode"] if episode is None else episode
-    evidence_rows = database.list_evidence(memory["id"], episode=episode, conn=conn)
-    feedback_ids = [row["feedback_id"] for row in evidence_rows]
-    feedbacks = database.list_feedbacks_by_ids(feedback_ids, conn=conn)
-    plan_difficulties = _plan_difficulties_for(feedbacks, conn)
-    conclusion = evaluate(memory["memory_type"], feedbacks, as_of, plan_difficulties)
+    probe = dict(memory)
+    probe["episode"] = episode
 
-    if conclusion is None:
-        # 证据已落库却算不出结论：说明库里数据与本轮口径不一致
-        raise MemoryError(
-            ERROR_DATA_INCONSISTENCY,
-            f"记忆 {memory['id']} 第 {episode} 轮证据无法算出结论，需 rebuild_all 重建",
-        )
+    rows = _episode_candidates(probe, as_of, end_feedback_id, conn)
+    plan_difficulties = None
 
+    if memory_type == "time_pattern":
+        plan_difficulties = _plan_difficulties_for(rows, conn, memory["subject_key"])
+
+    conclusion = evaluate(memory_type, rows, as_of, plan_difficulties)
     value = dict(conclusion["value"])
 
-    if value.get("difficulty") is None and memory["memory_type"] == "time_pattern":
-        value["difficulty"] = memory["subject_key"]
+    if memory_type == "time_pattern":
+        if value.get("difficulty") is None:
+            value["difficulty"] = memory["subject_key"]
+        if value.get("samples") in (0, None):
+            # 当前轮的 plan 全部失效（被删/改难度/预估非法）：没有有效样本可
+            # 支撑新结论，保留上一次结论而不是把内容改写成「0 次」。
+            stored = decode_value(memory["value_json"])
+            value["samples"] = stored.get("samples", 0)
+            value["median_ratio"] = stored.get("median_ratio")
 
     value["direction"] = direction
 
@@ -1238,13 +1353,15 @@ def _finalize(memory, as_of, conn, info, value, evidence_ids, wrote_supports, wr
 
 
 def _materialize_stale(memory, as_of, conn, info, threshold_days=None):
-    """stale 是派生状态（§5.3.4）：以 as_of 判定，成立即归档。
+    """stale 是派生状态（§5.3.4/§5.3.5）：以 as_of 判定，成立即归档。
 
-    只在 active/weakened 下生效；固定 pending_* 只在未曾存在时才写，
-    并关轮清理旧轮残留 pending。
+    候选是 active/weakened/resolved：v16 §5.3.5 明确 resolved --(>60 天无支撑)-->
+    archived。archived 本身不在候选里，重复调用因此天然幂等（不写第二条事件）。
+    固定 pending_* 只在未曾存在时才写；resolved 已有的新轮边界必须原样保留，
+    只关轮清理旧轮 pending，新轮缓冲区一行都不能删（PR #4 P1-1）。
     """
 
-    if memory is None or memory["status"] not in ("active", "weakened"):
+    if memory is None or memory["status"] not in ("active", "weakened", "resolved"):
         return False
 
     if not _is_stale(memory, as_of, threshold_days):
@@ -1315,6 +1432,7 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
         relations = conclusion["relations"]
         supports_rows = [row for row in rows if relations.get(row["id"]) == "supports"]
         contradicts_rows = [row for row in rows if relations.get(row["id"]) == "contradicts"]
+        formal_rows = supports_rows + contradicts_rows
         last_supported_at = None
 
         for row in supports_rows:
@@ -1342,7 +1460,9 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
                 "evidence_count": len(supports_rows),
                 "contradict_count": len(contradicts_rows),
                 "episode": 1,
-                "episode_start_feedback_id": min(row["id"] for row in rows),
+                # §3.2：当前轮第一条「正式证据」的 feedback id；neutral 没有证据行
+                # （PR #4 P2-1），所以必须从 supports/contradicts 里取最小 id。
+                "episode_start_feedback_id": min(row["id"] for row in formal_rows),
                 "episode_started_at": as_of,
                 "status": "active",
                 "last_supported_at": last_supported_at or as_of,
@@ -1406,9 +1526,17 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
         info["neutral_dropped"] += neutral
 
     if not evidence_ids:
+        if neutral:
+            # neutral 不写正式证据，但 time_pattern 的 samples/median 与 STABLE 的
+            # 计入单位都包含 neutral（§5.2/§5.5）。只来 neutral 时样本口径已经变了，
+            # 必须重算结论，否则 samples 会永远停在旧值（PR #4 P1-3）；结论变了但
+            # 状态没变，按 §5.3.7 不写事件。
+            value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
+            _prepare_conclusion(memory, as_of, conn, info, value)
+            _commit_conclusion(memory, conn, info)
         return None
 
-    value = _episode_value(memory, as_of, conn, direction)
+    value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
     _finalize(memory, as_of, conn, info, value, evidence_ids, wrote_supports, wrote_contradicts)
 
     return memory["id"]
@@ -1430,7 +1558,11 @@ def _drain_pending(memory, trigger, as_of, conn, info):
 
     stored = decode_value(memory["value_json"])
     direction = stored.get("direction")
-    plan_difficulties = _plan_difficulties_for(valid, conn)
+    plan_difficulties = {}
+
+    if memory["memory_type"] == "time_pattern":
+        plan_difficulties = _plan_difficulties_for(valid, conn, memory["subject_key"])
+
     evidence_ids = []
     consumed_ids = []
     neutral = 0
@@ -1438,6 +1570,12 @@ def _drain_pending(memory, trigger, as_of, conn, info):
     wrote_contradicts = False
 
     for row in valid:
+        if memory["memory_type"] == "time_pattern" and row["id"] not in plan_difficulties:
+            # plan 已删除/难度失效/预估非法：这条 pending 不能计入，但也不能删
+            # 掉——它没被消费，等 plan 合法或 rebuild 时再处理（PR #4 P1-2）。
+            info["invalid_plan"] += 1
+            continue
+
         relation = _relation_for(
             memory["memory_type"], direction, row, plan_difficulties.get(row["id"])
         )
@@ -1472,9 +1610,16 @@ def _drain_pending(memory, trigger, as_of, conn, info):
         info["neutral_dropped"] += neutral
 
     if not evidence_ids:
+        if neutral:
+            # 与 _apply_current_episode 一致：neutral 已从缓冲区消费，但它是
+            # samples/median 的一部分（§5.2/§5.5），样本口径变了就要重算结论，
+            # 只是不写事件（§5.3.7：本批没写证据就不写 pending_drained）。
+            value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
+            _prepare_conclusion(memory, as_of, conn, info, value)
+            _commit_conclusion(memory, conn, info)
         return 0
 
-    value = _episode_value(memory, as_of, conn, direction)
+    value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
     _finalize(
         memory,
         as_of,
@@ -1517,7 +1662,9 @@ def _try_promote(memory, trigger, as_of, conn, info):
         info["insufficient_evidence"] += 1
         return False
 
-    plan_difficulties = _plan_difficulties_for(rows, conn)
+    plan_difficulties = _plan_difficulties_for(
+        rows, conn, memory["subject_key"] if memory["memory_type"] == "time_pattern" else None
+    )
     conclusion = evaluate(memory["memory_type"], rows, as_of, plan_difficulties)
 
     if conclusion["invalid"]:
@@ -1549,6 +1696,18 @@ def _try_promote(memory, trigger, as_of, conn, info):
 
     counts = _episode_counts(memory["id"], episode, conn)
     last_supported_at = counts["last_supported_at"] or as_of
+    evidence_rows = database.list_evidence(memory["id"], episode=episode, conn=conn)
+    episode_start_feedback_id = min(row["feedback_id"] for row in evidence_rows)
+
+    # 晋升值与后续在线更新必须同源：都用 _episode_value 从原始反馈重算，
+    # 否则下一轮更新时 samples/median 会跳变（PR #4 P1-3）。
+    probe = dict(memory)
+    probe["episode"] = episode
+    probe["episode_start_feedback_id"] = episode_start_feedback_id
+    value = _episode_value(
+        probe, as_of, conn, value["direction"], episode=episode, end_feedback_id=trigger["id"]
+    )
+
     payload = _conclusion_payload(
         memory["memory_type"],
         value,
@@ -1558,8 +1717,6 @@ def _try_promote(memory, trigger, as_of, conn, info):
         as_of,
         last_supported_at,
     )
-    evidence_rows = database.list_evidence(memory["id"], episode=episode, conn=conn)
-    episode_start_feedback_id = min(row["feedback_id"] for row in evidence_rows)
 
     database.update_memory_state(
         memory["id"],
@@ -1723,20 +1880,19 @@ def rebuild_all(now=None):
     info = _new_info()
 
     try:
-        total = database.count_feedbacks()
-
-        if total > REBUILD_MAX_FEEDBACKS:
-            return {
-                "ok": False,
-                "memories": 0,
-                "evidences": 0,
-                "pendings": 0,
-                "events": 0,
-                "error_type": ERROR_REBUILD_TOO_LARGE,
-                "message": f"feedbacks 共 {total} 条，超过上限 {REBUILD_MAX_FEEDBACKS}",
-            }
-
         with database.transaction() as conn:
+            # 条数检查必须和清表/回放同事务（PR #4 P2-3）：放在事务外的话，
+            # 检查与 BEGIN IMMEDIATE 之间还能插进新反馈，5000 条上限就失效了。
+            total = database.count_feedbacks(conn=conn)
+
+            if total > REBUILD_MAX_FEEDBACKS:
+                # 用异常退出事务：transaction() 会 ROLLBACK，超限路径一定不改
+                # 任何派生数据或游标。error_type 由下面的 except 分支统一返回。
+                raise MemoryError(
+                    ERROR_REBUILD_TOO_LARGE,
+                    f"feedbacks 共 {total} 条，超过上限 {REBUILD_MAX_FEEDBACKS}",
+                )
+
             database.delete_all_memories(conn=conn)
             rows = database.list_feedbacks_after(0, None, conn=conn)
 
@@ -1809,7 +1965,17 @@ def retrieve(memory_type=None, subject=None, status="active", limit=10):
             "message": f"未知记忆状态：{status}",
         }
 
-    limit = _require_number(limit, "limit", minimum=1)
+    try:
+        limit = _require_number(limit, "limit", minimum=1)
+    except ValueError as error:
+        # §4.2：参数非法返回稳定 error_type，不向调用方抛裸 ValueError（PR #4 P2-2）
+        return {
+            "ok": False,
+            "count": 0,
+            "memories": [],
+            "error_type": ERROR_INVALID_ARGUMENT,
+            "message": str(error),
+        }
 
     if limit > RETRIEVE_MAX_LIMIT:
         limit = RETRIEVE_MAX_LIMIT

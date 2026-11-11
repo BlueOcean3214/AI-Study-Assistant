@@ -426,25 +426,43 @@ def test_apply_pending_updates_processes_in_id_order():
 
 
 def test_id_gap_skipped_is_diagnostic_only():
-    """已提交但失败的 INSERT 会留下永久空洞：照常处理、只记诊断。"""
+    """真实已提交的 id 空洞：照常处理后续反馈，只记诊断，不阻塞游标。"""
 
     fresh()
     insert_feedback_row("空洞练习", "not_completed", "任务难度太高", created_at="2026-01-02T10:00:00Z")
     insert_feedback_row("空洞练习", "not_completed", "任务难度太高", created_at="2026-01-03T10:00:00Z")
+    memory_service.apply_pending_updates(now="2026-01-03T00:00:00Z")
+    check("空洞前游标 = 2", cursor_row()[0] == 2, str(cursor_row()))
 
-    # 真实制造一个空洞：约束失败但 sqlite_sequence 已前进（唯一索引冲突）
+    # 真实制造永久空洞：插入 id=3 并提交，再删除并提交。sqlite_sequence 不回退，
+    # 所以下一条反馈拿到 id=4，而 3 永远不会出现（不是手工指定 id）。
+    hole_id = insert_feedback_row("空洞占位", "completed", None, created_at="2026-01-03T12:00:00Z")
     conn = connect()
     try:
-        conn.execute("INSERT INTO memory_apply_cursor (id, last_applied_feedback_id, updated_at) "
-                     "VALUES (2, 0, '2026-01-01T00:00:00Z')") if False else None
+        conn.execute("DELETE FROM feedbacks WHERE id = ?", (hole_id,))
         conn.commit()
     finally:
         conn.close()
 
-    result = memory_service.apply_pending_updates(now="2026-01-04T00:00:00Z")
-    check("空洞：全部反馈都被处理", result["processed"] == 2, str(result["processed"]))
-    check("空洞：id_gap_skipped 默认 0", result["info"]["id_gap_skipped"] == 0,
-          str(result["info"]["id_gap_skipped"]))
+    following = insert_feedback_row("空洞练习", "not_completed", "任务难度太高",
+                                    created_at="2026-01-04T10:00:00Z")
+    check("删除后新反馈 id 跳号", following == hole_id + 1, f"{hole_id} -> {following}")
+
+    result = memory_service.apply_pending_updates(now="2026-01-05T00:00:00Z")
+    info = result["info"]
+    check("空洞后仍然处理新反馈", result["processed"] == 1, str(result["processed"]))
+    check("id_gap_skipped 记录真实跳过数量", info["id_gap_skipped"] == 1,
+          str(info["id_gap_skipped"]))
+    check("id_gap_detail 记录 after/before/gap",
+          info["id_gap_detail"] == [{"after": 2, "before": following, "gap": 1}],
+          str(info["id_gap_detail"]))
+    check("游标推进到最大 id（gap 不阻塞）", cursor_row()[0] == following, str(cursor_row()))
+
+    row = memory_of("difficulty", "空洞练习")
+    check("空洞后仍计入第三条 supports", row[7] == 3, str(row[7]))
+    check("空洞不产生重复证据",
+          scoped_counts("difficulty", "空洞练习")["evidence"] == 3,
+          str(scoped_counts("difficulty", "空洞练习")))
 
 
 def test_failed_feedback_insert_leaves_no_permanent_gap_wrong_id():
@@ -1046,6 +1064,349 @@ def test_concurrent_apply_processes_each_feedback_once():
 
 
 # ==========================
+# 四、PR #4 复审：resolved stale、plan 有效性、neutral 样本、参数契约
+# ==========================
+
+
+def plan_update(plan_id, **fields):
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    values = list(fields.values()) + [plan_id]
+    conn = connect()
+    try:
+        conn.execute(f"UPDATE plans SET {assignments} WHERE id = ?", values)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def plan_delete(plan_id):
+    conn = connect()
+    try:
+        conn.execute("DELETE FROM plans WHERE id = ?", (plan_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def plan_restore(plan_id, task, difficulty="medium", estimated=30, plan_date="2026-01-02"):
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO plans
+            (id, plan_date, task, estimated_minutes, difficulty, question_count,
+             reason, completion_criteria, subtasks_json, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 1, '测试', '完成', '[]', 'active', ?)
+            """,
+            (plan_id, plan_date, task, estimated, difficulty, plan_date + "T08:00:00Z"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def events_detail(memory_id, path=None):
+    conn = connect(path)
+    try:
+        return conn.execute(
+            "SELECT event_type, detail_json FROM memory_events WHERE memory_id = ? ORDER BY id",
+            (memory_id,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def build_resolved_difficulty(task="过期练习"):
+    """2 条 difficulty supports 建行，再 3 条 completed 走到 resolved。"""
+
+    for stamp in ("2026-01-02T10:00:00Z", "2026-01-03T10:00:00Z"):
+        insert_feedback_row(task, "not_completed", "任务难度太高", created_at=stamp)
+    memory_service.apply_pending_updates(now="2026-01-03T12:00:00Z")
+
+    for stamp in ("2026-01-04T10:00:00Z", "2026-01-05T10:00:00Z", "2026-01-06T10:00:00Z"):
+        insert_feedback_row(task, "completed", None, created_at=stamp)
+
+    memory_service.apply_pending_updates(now="2026-01-07T00:00:00Z")
+
+
+def build_time_pattern(task, difficulty="medium", supports=4, contradicts=0):
+    """按 time_pattern 口径造样本：ratio 2.0 → slow supports，ratio 0.3 → contradicts。"""
+
+    plan_id = insert_plan_row("2026-01-02", task, difficulty=difficulty, estimated=30)
+    day = 2
+
+    for _ in range(supports):
+        insert_feedback_row(task, "completed", None,
+                            created_at=f"2026-01-{day:02d}T10:00:00Z",
+                            minutes=30, actual=60, plan_id=plan_id)
+        day += 1
+
+    for _ in range(contradicts):
+        insert_feedback_row(task, "completed", None,
+                            created_at=f"2026-01-{day:02d}T10:00:00Z",
+                            minutes=30, actual=9, plan_id=plan_id)
+        day += 1
+
+    memory_service.apply_pending_updates(now=f"2026-01-{day:02d}T23:00:00Z")
+
+    return plan_id
+
+
+def test_resolved_memory_archives_when_stale():
+    """§5.3.5：resolved 超过 60 天无支撑 → archived，保留新轮 pending 与边界。"""
+
+    fresh()
+    build_resolved_difficulty("过期练习")
+    resolved = memory_of("difficulty", "过期练习")
+    check("先进入 resolved", resolved[14] == "resolved", str(resolved[14]))
+
+    boundary = (resolved[12], resolved[13])
+    check("resolved 已固定新轮边界", boundary[0] == 2 and boundary[1] == 5, str(boundary))
+
+    insert_feedback_row("过期练习", "not_completed", "任务难度太高", created_at="2026-01-08T10:00:00Z")
+    memory_service.apply_pending_updates(now="2026-01-09T00:00:00Z")
+    waiting = memory_of("difficulty", "过期练习")
+
+    check("resolved 下新候选只写 pending",
+          scoped_counts("difficulty", "过期练习")["pending"] == 1,
+          str(scoped_counts("difficulty", "过期练习")))
+    check("写 pending 不改边界", (waiting[12], waiting[13]) == boundary,
+          str((waiting[12], waiting[13])))
+
+    result = memory_service.archive_stale(now="2026-04-01T00:00:00Z")
+    archived = memory_of("difficulty", "过期练习")
+
+    check("批量入口归档成功", result["ok"] is True and result["archived"] >= 1, str(result))
+    check("resolved 超 60 天转 archived", archived[14] == "archived", str(archived[14]))
+    check("归档不重算 pending 边界", (archived[12], archived[13]) == boundary,
+          str((archived[12], archived[13])))
+    check("新轮 pending 一行不删",
+          scoped_counts("difficulty", "过期练习")["pending"] == 1,
+          str(scoped_counts("difficulty", "过期练习")))
+
+    events = events_detail(archived[0])
+    archived_events = [detail for kind, detail in events if kind == "archived"]
+    check("只写一条 archived 事件", len(archived_events) == 1, str(events))
+
+    detail = json.loads(archived_events[0])
+    check("archived 事件 reason = stale_as_of", detail.get("reason") == "stale_as_of", str(detail))
+    check("archived 事件 from/to 正确",
+          detail.get("from_status") == "resolved" and detail.get("to_status") == "archived",
+          str(detail))
+
+    again = memory_service.archive_stale(now="2026-05-01T00:00:00Z")
+    repeated = [detail for kind, detail in events_detail(archived[0]) if kind == "archived"]
+
+    check("重复归档不再写事件", again["archived"] == 0 and len(repeated) == 1, str(again))
+    check("重复归档状态不变", memory_of("difficulty", "过期练习")[14] == "archived")
+
+
+def test_time_pattern_ignores_candidates_after_plan_deleted():
+    """plan 被删除后：历史与新反馈都不再计入 samples、不写新证据（§5.2）。"""
+
+    fresh()
+    plan_id = build_time_pattern("计划失效")
+    before = json.loads(memory_of("time_pattern", "medium")[5])
+
+    check("4 个有效样本建 time_pattern", before["samples"] == 4, str(before))
+
+    plan_delete(plan_id)
+
+    for stamp in ("2026-01-07T10:00:00Z", "2026-01-08T10:00:00Z"):
+        insert_feedback_row("计划失效", "completed", None, created_at=stamp,
+                            minutes=30, actual=60, plan_id=plan_id)
+
+    result = memory_service.apply_pending_updates(now="2026-01-09T00:00:00Z")
+    after = json.loads(memory_of("time_pattern", "medium")[5])
+
+    check("plan 删除后 samples 不增长", after["samples"] == 4, str(after))
+    check("plan 删除后不写新证据",
+          scoped_counts("time_pattern", "medium")["evidence"] == 4,
+          str(scoped_counts("time_pattern", "medium")))
+    # plan 已删除的行被 SQL JOIN 直接挡在候选之外，根本到不了 evaluate，
+    # 所以 invalid_plan 不增长；关键是它们没被计入统计、也没进缓冲区。
+    check("plan 删除后不产生 pending",
+          scoped_counts("time_pattern", "medium")["pending"] == 0,
+          str(scoped_counts("time_pattern", "medium")))
+    check("plan 删除后记忆状态不变", memory_of("time_pattern", "medium")[14] == "active")
+
+
+def test_time_pattern_ignores_candidates_when_plan_estimate_invalid():
+    """plans.estimated_minutes <= 0 的反馈不能充当 time_pattern 样本。"""
+
+    fresh()
+    plan_id = build_time_pattern("预估失效")
+    plan_update(plan_id, estimated_minutes=0)
+
+    insert_feedback_row("预估失效", "completed", None, created_at="2026-01-07T10:00:00Z",
+                        minutes=30, actual=60, plan_id=plan_id)
+    memory_service.apply_pending_updates(now="2026-01-08T00:00:00Z")
+
+    after = json.loads(memory_of("time_pattern", "medium")[5])
+
+    check("预估为 0 时 samples 不增长", after["samples"] == 4, str(after))
+    check("预估为 0 时不写证据",
+          scoped_counts("time_pattern", "medium")["evidence"] == 4,
+          str(scoped_counts("time_pattern", "medium")))
+
+
+def test_time_pattern_ignores_candidates_when_difficulty_mismatched():
+    """plan 难度改成另一个合法值后，不再属于当前 time_pattern 记忆。"""
+
+    fresh()
+    plan_id = build_time_pattern("难度漂移")
+    plan_update(plan_id, difficulty="hard")
+
+    insert_feedback_row("难度漂移", "completed", None, created_at="2026-01-07T10:00:00Z",
+                        minutes=30, actual=60, plan_id=plan_id)
+    memory_service.apply_pending_updates(now="2026-01-08T00:00:00Z")
+
+    after = json.loads(memory_of("time_pattern", "medium")[5])
+
+    check("难度不匹配时 samples 不增长", after["samples"] == 4, str(after))
+    check("难度不匹配时不写 medium 证据",
+          scoped_counts("time_pattern", "medium")["evidence"] == 4,
+          str(scoped_counts("time_pattern", "medium")))
+    # 难点在于"不能串进 medium"：同一条反馈按 plan 的当前难度归到 hard，
+    # 会另建一条 time_pattern/hard 记忆，这属于设计预期，不是串记忆。
+    check("medium 记忆仍是原 episode", memory_of("time_pattern", "medium")[9] == 1,
+          str(memory_of("time_pattern", "medium")[9]))
+
+
+def test_time_pattern_pending_promotion_requires_valid_plan():
+    """pending 晋升候选同样校验 plan：删掉 plan 后不能错误晋升（§5.3.3）。"""
+
+    fresh()
+    plan_id = build_time_pattern("节奏练习", supports=4, contradicts=3)
+    resolved = memory_of("time_pattern", "medium")
+
+    check("time_pattern 走到 resolved", resolved[14] == "resolved", str(resolved[14]))
+
+    day = 10
+    for _ in range(3):
+        insert_feedback_row("节奏练习", "completed", None,
+                            created_at=f"2026-01-{day:02d}T10:00:00Z",
+                            minutes=30, actual=60, plan_id=plan_id)
+        day += 1
+
+    memory_service.apply_pending_updates(now="2026-01-13T00:00:00Z")
+    waiting = memory_of("time_pattern", "medium")
+
+    check("3 条待定样本不足不晋升", waiting[14] == "resolved", str(waiting[14]))
+    check("3 条写入 pending", scoped_counts("time_pattern", "medium")["pending"] == 3,
+          str(scoped_counts("time_pattern", "medium")))
+
+    plan_delete(plan_id)
+    insert_feedback_row("节奏练习", "completed", None, created_at="2026-01-13T10:00:00Z",
+                        minutes=30, actual=60, plan_id=plan_id)
+    blocked = memory_service.apply_pending_updates(now="2026-01-14T00:00:00Z")
+    still = memory_of("time_pattern", "medium")
+
+    check("plan 失效时门槛不动", still[14] == "resolved", str(still[14]))
+    check("plan 失效时不写新轮证据",
+          scoped_counts("time_pattern", "medium")["evidence"] == 7,
+          str(scoped_counts("time_pattern", "medium")))
+    # trigger 自己的 plan 失效时，time_pattern 整类被跳过（subject_key_for 返回
+    # None），这条反馈连缓冲区都不进；已有 3 行 pending 必须原样保留。
+    check("无效 plan 的 pending 不删",
+          scoped_counts("time_pattern", "medium")["pending"] == 3,
+          str(scoped_counts("time_pattern", "medium")))
+
+    plan_restore(plan_id, "节奏练习", difficulty="medium", estimated=30)
+    insert_feedback_row("节奏练习", "completed", None, created_at="2026-01-15T10:00:00Z",
+                        minutes=30, actual=60, plan_id=plan_id)
+    memory_service.apply_pending_updates(now="2026-01-16T00:00:00Z")
+    promoted = memory_of("time_pattern", "medium")
+
+    check("plan 恢复后 4 条样本可晋升", promoted[14] == "active", str(promoted[14]))
+    check("晋升到第 2 轮", promoted[9] == 2, str(promoted[9]))
+    # 新轮证据 = 3 行 pending + 本轮 trigger，共 4 行；旧轮 7 行保留
+    check("晋升后新轮证据 4 行、总数 11 行",
+          scoped_counts("time_pattern", "medium")["evidence"] == 11,
+          str(scoped_counts("time_pattern", "medium")))
+    check("晋升后 pending 清空",
+          scoped_counts("time_pattern", "medium")["pending"] == 0,
+          str(scoped_counts("time_pattern", "medium")))
+
+
+def test_time_pattern_neutral_samples_survive_updates():
+    """neutral 不写证据但要计入 samples：更新后不能凭空消失（PR #4 P1-3）。"""
+
+    fresh()
+    plan_id = build_time_pattern("中性样本")
+    created = json.loads(memory_of("time_pattern", "medium")[5])
+
+    check("初始 samples = 4", created["samples"] == 4, str(created))
+    check("初始 median = 2.0", created["median_ratio"] == 2.0, str(created))
+
+    # ratio 1.0 落在 0.4~1.5：在 slow 方向下是 neutral，不写证据但要计入 samples
+    insert_feedback_row("中性样本", "completed", None, created_at="2026-01-07T10:00:00Z",
+                        minutes=30, actual=30, plan_id=plan_id)
+    memory_service.apply_pending_updates(now="2026-01-08T00:00:00Z")
+    neutral = json.loads(memory_of("time_pattern", "medium")[5])
+
+    check("neutral 计入 samples", neutral["samples"] == 5, str(neutral))
+    check("neutral 不写正式证据",
+          scoped_counts("time_pattern", "medium")["evidence"] == 4,
+          str(scoped_counts("time_pattern", "medium")))
+
+    # 追加一条 contradicts（ratio 0.3）：neutral 仍留在 samples 里
+    insert_feedback_row("中性样本", "completed", None, created_at="2026-01-09T10:00:00Z",
+                        minutes=30, actual=9, plan_id=plan_id)
+    memory_service.apply_pending_updates(now="2026-01-10T00:00:00Z")
+    updated = json.loads(memory_of("time_pattern", "medium")[5])
+
+    check("更新后 neutral 仍在 samples 内", updated["samples"] == 6, str(updated))
+    check("contradicts 写证据、neutral 不写",
+          scoped_counts("time_pattern", "medium")["evidence"] == 5,
+          str(scoped_counts("time_pattern", "medium")))
+
+    online = memory_service.semantic_projection()
+    rebuilt = memory_service.rebuild_all(now="2026-01-10T23:00:00Z")
+    offline = memory_service.semantic_projection()
+
+    check("含 neutral 的 rebuild 成功", rebuilt["ok"] is True, str(rebuilt))
+    check("含 neutral 的在线/rebuild 投影完全相等",
+          online["memories"] == offline["memories"]
+          and online["evidence"] == offline["evidence"]
+          and online["pendings"] == offline["pendings"]
+          and online["events"] == offline["events"]
+          and online["cursor"] == offline["cursor"])
+
+
+def test_episode_start_feedback_id_uses_formal_evidence_only():
+    """§3.2：episode_start_feedback_id 取当前轮第一条正式证据，不含 neutral。"""
+
+    fresh()
+    insert_feedback_row("边界练习", "not_completed", "任务时间太长", created_at="2026-01-02T10:00:00Z")
+    insert_feedback_row("边界练习", "not_completed", "任务难度太高", created_at="2026-01-03T10:00:00Z")
+    insert_feedback_row("边界练习", "not_completed", "任务难度太高", created_at="2026-01-04T10:00:00Z")
+
+    memory_service.apply_pending_updates(now="2026-01-05T00:00:00Z")
+    row = memory_of("difficulty", "边界练习")
+
+    check("neutral 在前仍能建行", row is not None)
+    check("episode_start_feedback_id 跳过 neutral", row[10] == 2, str(row[10]))
+    check("neutral 不计入 evidence_count", row[7] == 2, str(row[7]))
+
+
+def test_retrieve_invalid_limit_returns_error_dict():
+    """§4.2：limit 非法返回稳定 invalid_argument，不抛裸 ValueError（PR #4 P2-2）。"""
+
+    fresh()
+    build_rich_dataset()
+    memory_service.apply_pending_updates(now="2026-01-10T00:00:00Z")
+
+    for limit in (0, -1, 2.5, True, "abc"):
+        result = memory_service.retrieve(limit=limit)
+
+        check(f"limit={limit!r} 返回错误字典",
+              result["ok"] is False and result["error_type"] == "invalid_argument",
+              str(result))
+        check(f"limit={limit!r} 不返回记忆", result["memories"] == [], str(result))
+
+
+# ==========================
 # 运行入口
 # ==========================
 
@@ -1084,6 +1445,14 @@ def main():
         test_retrieve_filters_and_limits,
         test_apply_feedback_is_not_a_public_entry,
         test_concurrent_apply_processes_each_feedback_once,
+        test_resolved_memory_archives_when_stale,
+        test_time_pattern_ignores_candidates_after_plan_deleted,
+        test_time_pattern_ignores_candidates_when_plan_estimate_invalid,
+        test_time_pattern_ignores_candidates_when_difficulty_mismatched,
+        test_time_pattern_pending_promotion_requires_valid_plan,
+        test_time_pattern_neutral_samples_survive_updates,
+        test_episode_start_feedback_id_uses_formal_evidence_only,
+        test_retrieve_invalid_limit_returns_error_dict,
     ]
 
     passed = 0

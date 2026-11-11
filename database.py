@@ -534,7 +534,8 @@ def list_feedbacks_with_plan(start_iso, end_iso, max_id, difficulties=None, conn
     """取关联到 plan 的反馈，并把 plans.difficulty 一起带出来。
 
     time_pattern 的难度只能来自有效 plan_id 关联的 plans 行（v16 §5.2）：plan_id
-    为 NULL 的历史反馈、或 plans 里不存在的行，一律不进候选，不做任何推断。
+    为 NULL 的历史反馈、plans 里不存在的行、difficulty 非法的行、以及
+    `estimated_minutes <= 0` 的计划，一律不进候选，不做任何推断。
     返回的 dict 在 feedback 字段之外多一个 "difficulty" 键。
     """
 
@@ -546,7 +547,8 @@ def list_feedbacks_with_plan(start_iso, end_iso, max_id, difficulties=None, conn
         f"SELECT {', '.join('f.' + name.strip() for name in FEEDBACK_COLUMNS.split(','))}, "
         "p.difficulty FROM feedbacks AS f "
         "JOIN plans AS p ON p.id = f.plan_id "
-        "WHERE f.created_at >= ? AND f.created_at <= ? AND f.id <= ?"
+        "WHERE f.created_at >= ? AND f.created_at <= ? AND f.id <= ? "
+        "AND p.estimated_minutes > 0"
     )
     params = [start_iso, end_iso, max_id]
 
@@ -1194,7 +1196,10 @@ def delete_all_memories(conn=None):
 
 
 def list_stale_candidate_ids(conn=None):
-    """列出还需要做 stale 判定的记忆 id（active/weakened），按 id 升序。
+    """列出还需要做 stale 判定的记忆 id（active/weakened/resolved），按 id 升序。
+
+    resolved 也在内：v16 §5.3.5 规定 resolved 在 `as_of - last_supported_at > 60d`
+    后同样转 archived（stale 优先于其他判定）。archived 不再入选，天然幂等。
 
     只返回 id：批量归档会改变 status，按 offset 翻页会漏行，因此调用方拿 id
     再逐条读最新行（`get_memory`），保证每条只按当前状态判一次。
@@ -1202,7 +1207,8 @@ def list_stale_candidate_ids(conn=None):
 
     with _db(conn) as db_conn:
         rows = db_conn.execute(
-            "SELECT id FROM learning_memories WHERE status IN ('active', 'weakened') ORDER BY id"
+            "SELECT id FROM learning_memories "
+            "WHERE status IN ('active', 'weakened', 'resolved') ORDER BY id"
         ).fetchall()
 
     return [row[0] for row in rows]
