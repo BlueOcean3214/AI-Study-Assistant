@@ -1138,6 +1138,31 @@ def max_evidence_feedback_id(memory_id, episode=None, conn=None):
     return int(row[0] or 0)
 
 
+def max_evidence_feedback_id_before_episode(memory_id, episode, conn=None):
+    """该记忆在第 episode 轮之前所有证据里的最大 feedback id；没有则返回 0。
+
+    重算某一轮的候选时，轮次边界必须取「上一轮结束时的高水位」，而不是本轮
+    的 `episode_start_feedback_id`：后者是本轮第一条正式证据，拿它当下界会把
+    这一条本身（以及 id 更小的 neutral）直接排除掉（PR #4 第三轮 P1）。
+    episode <= 1 没有更早的轮次，返回 0。
+    """
+
+    _require_int(memory_id, "memory_id", minimum=1)
+    _require_int(episode, "episode", minimum=1)
+
+    if episode <= 1:
+        return 0
+
+    with _db(conn) as db_conn:
+        row = db_conn.execute(
+            "SELECT COALESCE(MAX(feedback_id), 0) FROM memory_evidence "
+            "WHERE memory_id = ? AND episode < ?",
+            (memory_id, episode),
+        ).fetchone()
+
+    return int(row[0] or 0)
+
+
 def count_evidence(memory_id, episode=None, relation=None, conn=None):
     _require_int(memory_id, "memory_id", minimum=1)
 

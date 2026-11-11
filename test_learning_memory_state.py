@@ -188,6 +188,32 @@ def memory_of(memory_type, task, path=None):
     return memory_by_key(memory_type, subject_key(task), path)
 
 
+def key_counts(memory_type, subject_key, path=None):
+    """按业务键直接取行数（time_pattern 的 key 是难度，不是任务名）。"""
+
+    row = memory_by_key(memory_type, subject_key, path)
+    conn = connect(path)
+    try:
+        if row is None:
+            return {"evidence": 0, "pending": 0, "events": 0}
+
+        memory_id = row[0]
+        return {
+            "evidence": conn.execute(
+                "SELECT COUNT(*) FROM memory_evidence WHERE memory_id = ?", (memory_id,)
+            ).fetchone()[0],
+            "pending": conn.execute(
+                "SELECT COUNT(*) FROM memory_pending_evidence WHERE memory_id = ?",
+                (memory_id,),
+            ).fetchone()[0],
+            "events": conn.execute(
+                "SELECT COUNT(*) FROM memory_events WHERE memory_id = ?", (memory_id,)
+            ).fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+
 def scoped_counts(memory_type, task, path=None):
     """某条记忆自己的证据 / pending / 事件行数（全局计数会被其它类型干扰）。"""
 
@@ -1406,6 +1432,140 @@ def test_retrieve_invalid_limit_returns_error_dict():
         check(f"limit={limit!r} 不返回记忆", result["memories"] == [], str(result))
 
 
+def test_second_episode_keeps_neutral_and_first_formal_sample():
+    """§3.2/§5.3.1：episode_start_feedback_id 只用于展示，不能当候选过滤下界。"""
+
+    fresh()
+    plan_id = build_time_pattern("重算样本", supports=4, contradicts=3)
+    first_round = memory_by_key("time_pattern", "medium")
+    check("第一轮已 resolved", first_round[14] == "resolved", str(first_round[14]))
+    check("第一轮证据 7 行",
+          key_counts("time_pattern", "medium")["evidence"] == 7,
+          str(key_counts("time_pattern", "medium")))
+
+    # 新一轮：第 1 条 neutral（ratio 1.0），随后 3 条 supports（ratio 1.6/1.7/1.8）
+    neutral_id = insert_feedback_row("重算样本", "completed", None,
+                                     created_at="2026-01-10T10:00:00Z",
+                                     minutes=30, actual=30, plan_id=plan_id)
+    formal_ids = []
+    for day, actual in ((11, 48), (12, 51), (13, 54)):
+        formal_ids.append(insert_feedback_row("重算样本", "completed", None,
+                                             created_at=f"2026-01-{day:02d}T10:00:00Z",
+                                             minutes=30, actual=actual, plan_id=plan_id))
+
+    memory_service.apply_pending_updates(now="2026-01-14T00:00:00Z")
+    promoted = memory_by_key("time_pattern", "medium")
+    value = memory_service.decode_value(promoted[5])
+
+    check("晋升到第二轮",
+          promoted[9] == 2 and promoted[14] == "active",
+          f"episode={promoted[9]} status={promoted[14]}")
+    check("episode_start_feedback_id 取首条正式证据而非 neutral",
+          promoted[10] == formal_ids[0],
+          f"start={promoted[10]} neutral={neutral_id} formal={formal_ids}")
+    check("samples 计入 neutral 与首条正式证据", value["samples"] == 4, str(value))
+    check("median 覆盖四条有效候选", value["median_ratio"] == 1.65, str(value))
+    check("新轮只写 3 条正式证据（neutral 不写）",
+          key_counts("time_pattern", "medium")["evidence"] == 10,
+          str(key_counts("time_pattern", "medium")))
+
+    # 追加 1 条 supports（ratio 3.0）：samples 5、median 按 5 条重算、证据只加 1 条
+    insert_feedback_row("重算样本", "completed", None,
+                        created_at="2026-01-15T10:00:00Z",
+                        minutes=30, actual=90, plan_id=plan_id)
+    memory_service.apply_pending_updates(now="2026-01-16T00:00:00Z")
+    updated = memory_by_key("time_pattern", "medium")
+    updated_value = memory_service.decode_value(updated[5])
+
+    check("active 更新后 samples 为 5", updated_value["samples"] == 5, str(updated_value))
+    check("median 按五条有效候选重算", updated_value["median_ratio"] == 1.7,
+          str(updated_value))
+    check("证据只增加一条正式 evidence",
+          key_counts("time_pattern", "medium")["evidence"] == 11,
+          str(key_counts("time_pattern", "medium")))
+    check("episode_start_feedback_id 不因更新而改变",
+          updated[10] == formal_ids[0], f"start={updated[10]}")
+
+    online = memory_service.semantic_projection()
+    rebuilt = memory_service.rebuild_all(now="2026-01-16T00:00:00Z")
+    offline = memory_service.semantic_projection()
+
+    check("rebuild 成功", rebuilt["ok"] is True, str(rebuilt))
+    check("rebuild 后语义投影完全相等", online == offline, "在线与重建结果不一致")
+    rebuilt_memory = memory_by_key("time_pattern", "medium")
+    rebuilt_value = memory_service.decode_value(rebuilt_memory[5])
+    check("rebuild 后 samples 仍为 5", rebuilt_value["samples"] == 5, str(rebuilt_value))
+    check("rebuild 后 median 仍为 1.7", rebuilt_value["median_ratio"] == 1.7,
+          str(rebuilt_value))
+
+
+def test_time_pattern_promotion_filters_invalid_pending_with_other_plan():
+    """PR #4 P2-2：trigger 用另一条有效 plan，也要进 _try_promote 并跳过失效 pending。"""
+
+    fresh()
+    base_plan = build_time_pattern("混合计划", supports=4, contradicts=3)
+    resolved = memory_by_key("time_pattern", "medium")
+    check("先进入 resolved", resolved[14] == "resolved", str(resolved[14]))
+
+    # 3 条 pending 候选挂在独立 plan 上
+    stale_plan = insert_plan_row("2026-01-03", "混合计划", difficulty="medium", estimated=30)
+    for day in (10, 11, 12):
+        insert_feedback_row("混合计划", "completed", None,
+                            created_at=f"2026-01-{day:02d}T10:00:00Z",
+                            minutes=30, actual=60, plan_id=stale_plan)
+
+    memory_service.apply_pending_updates(now="2026-01-13T00:00:00Z")
+    check("resolved 下只写 pending",
+          key_counts("time_pattern", "medium")["pending"] == 3,
+          str(key_counts("time_pattern", "medium")))
+
+    # 让旧 pending 的 plan 失效（行还在，estimated_minutes=0）
+    plan_update(stale_plan, estimated_minutes=0)
+
+    # trigger 用另一条同难度有效 plan
+    trigger_plan = insert_plan_row("2026-01-04", "混合计划", difficulty="medium", estimated=30)
+    insert_feedback_row("混合计划", "completed", None,
+                        created_at="2026-01-14T10:00:00Z",
+                        minutes=30, actual=60, plan_id=trigger_plan)
+
+    blocked = memory_service.apply_pending_updates(now="2026-01-15T00:00:00Z")
+    still = memory_by_key("time_pattern", "medium")
+
+    check("trigger 有效时仍能进入候选流程", blocked["ok"] is True, str(blocked))
+    check("无效 pending 不参与门槛 → 不晋升",
+          still[14] == "resolved" and still[9] == 1, f"status={still[14]} episode={still[9]}")
+    # trigger 本身也按 §5.3.3 入缓冲区：3 条旧 pending + 1 条 trigger = 4
+    check("无效 pending 不被误删",
+          key_counts("time_pattern", "medium")["pending"] == 4,
+          str(key_counts("time_pattern", "medium")))
+    check("无效 pending 不写证据",
+          key_counts("time_pattern", "medium")["evidence"] == 7,
+          str(key_counts("time_pattern", "medium")))
+    check("无效 plan 计入 info.invalid_plan", blocked["info"]["invalid_plan"] >= 3,
+          str(blocked["info"]))
+
+    # plan 恢复后，3 条 pending + 1 条 trigger 达门槛 → 正常晋升
+    plan_update(stale_plan, estimated_minutes=30)
+    insert_feedback_row("混合计划", "completed", None,
+                        created_at="2026-01-16T10:00:00Z",
+                        minutes=30, actual=60, plan_id=trigger_plan)
+    recovered = memory_service.apply_pending_updates(now="2026-01-17T00:00:00Z")
+    promoted = memory_by_key("time_pattern", "medium")
+
+    check("plan 恢复后晋升成功",
+          recovered["ok"] is True and promoted[14] == "active" and promoted[9] == 2,
+          f"status={promoted[14]} episode={promoted[9]}")
+    check("晋升补齐五条正式证据",
+          key_counts("time_pattern", "medium")["evidence"] == 12,
+          str(key_counts("time_pattern", "medium")))
+    check("晋升后 pending 清空",
+          key_counts("time_pattern", "medium")["pending"] == 0,
+          str(key_counts("time_pattern", "medium")))
+    check("晋升后 samples 为 5",
+          memory_service.decode_value(promoted[5])["samples"] == 5,
+          str(memory_service.decode_value(promoted[5])))
+
+
 # ==========================
 # 运行入口
 # ==========================
@@ -1453,6 +1613,8 @@ def main():
         test_time_pattern_neutral_samples_survive_updates,
         test_episode_start_feedback_id_uses_formal_evidence_only,
         test_retrieve_invalid_limit_returns_error_dict,
+        test_second_episode_keeps_neutral_and_first_formal_sample,
+        test_time_pattern_promotion_filters_invalid_pending_with_other_plan,
     ]
 
     passed = 0

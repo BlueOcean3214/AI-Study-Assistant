@@ -1198,18 +1198,29 @@ def _plan_difficulties_for(rows, conn, subject_key=None):
     return result
 
 
-def _episode_candidates(memory, as_of, end_feedback_id, conn):
+def _episode_candidates(memory, as_of, end_feedback_id, conn, info=None):
     """从原始反馈重算当前轮的有效候选（含 neutral），供更新后的结论重算。
 
-    v16 §5.2：窗口 [as_of-30d, as_of]、id <= end_feedback_id、id > 轮次下界。
-    轮次下界：第 1 轮没有下界（首轮覆盖窗口内全部候选），之后取
-    episode_start_feedback_id（该轮第一条正式证据）。neutral 没有正式证据行，
-    只能从原始 feedbacks 重算，否则后续更新时 samples/median 会凭空变小
-    （PR #4 P1-3）。
+    v16 §5.2：窗口 [as_of-30d, as_of]、id <= end_feedback_id、id > 上一轮高水位。
+    轮次下界取「episode < 当前轮的最大 evidence feedback_id」，不是本轮的
+    `episode_start_feedback_id`——后者是当前轮第一条正式证据，用它当下界会把
+    这一条本身和 id 更小的 neutral 一起排除，第二轮起 samples 会凭空变小
+    （PR #4 第三轮 P1）。`episode_start_feedback_id` 只用于展示与诊断。
+    第 1 轮没有更早的轮次，因此没有下界（首轮覆盖窗口内全部候选）。
+    neutral 没有正式证据行，只能从原始 feedbacks 重算。
     """
 
     memory_type = memory["memory_type"]
-    lower_bound = None if memory["episode"] == 1 else memory.get("episode_start_feedback_id")
+    episode = memory["episode"]
+    lower_bound = None
+
+    if episode > 1:
+        previous = database.max_evidence_feedback_id_before_episode(
+            memory["id"], episode, conn=conn
+        )
+        # 没有更早轮的证据（不该发生）时退化成无下界，避免把本轮全部候选筛空
+        lower_bound = previous if previous > 0 else None
+
     as_of_dt = _parse_ts(as_of)
     start = (as_of_dt - timedelta(days=MEMORY_WINDOW_DAYS + 1)).isoformat()
     end = (as_of_dt + timedelta(days=1)).isoformat()
@@ -1228,6 +1239,10 @@ def _episode_candidates(memory, as_of, end_feedback_id, conn):
 
         if memory_type == "time_pattern":
             if _plan_difficulty_for_row(row, memory["subject_key"], conn) is None:
+                # plan 被删/难度非法或不匹配/预估 <= 0：这条不是本轮有效样本，
+                # 诊断计数要如实记下，不能静默丢掉（PR #4 第三轮 P2-1）。
+                if info is not None:
+                    info["invalid_plan"] += 1
                 continue
             if _ratio_for(row) is None:
                 continue
@@ -1239,7 +1254,7 @@ def _episode_candidates(memory, as_of, end_feedback_id, conn):
     return selected
 
 
-def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id=None):
+def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id=None, info=None):
     """用当前轮的原始候选重算 value（计数/比率全部重算，禁止 +1）。
 
     v16 §5.2/§5.5：time_pattern 的 samples 是有效样本总数，neutral 也算，但
@@ -1253,7 +1268,7 @@ def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id
     probe = dict(memory)
     probe["episode"] = episode
 
-    rows = _episode_candidates(probe, as_of, end_feedback_id, conn)
+    rows = _episode_candidates(probe, as_of, end_feedback_id, conn, info)
     plan_difficulties = None
 
     if memory_type == "time_pattern":
@@ -1419,6 +1434,9 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
         if conclusion["invalid"]:
             info["invalid_enum"] += conclusion["invalid"]
 
+        if conclusion["invalid_plan"]:
+            info["invalid_plan"] += conclusion["invalid_plan"]
+
         if not conclusion["sufficient"]:
             info["insufficient_evidence"] += 1
             return None
@@ -1531,12 +1549,16 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
             # 计入单位都包含 neutral（§5.2/§5.5）。只来 neutral 时样本口径已经变了，
             # 必须重算结论，否则 samples 会永远停在旧值（PR #4 P1-3）；结论变了但
             # 状态没变，按 §5.3.7 不写事件。
-            value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
+            value = _episode_value(
+                memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+            )
             _prepare_conclusion(memory, as_of, conn, info, value)
             _commit_conclusion(memory, conn, info)
         return None
 
-    value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
+    value = _episode_value(
+        memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+    )
     _finalize(memory, as_of, conn, info, value, evidence_ids, wrote_supports, wrote_contradicts)
 
     return memory["id"]
@@ -1573,7 +1595,8 @@ def _drain_pending(memory, trigger, as_of, conn, info):
         if memory["memory_type"] == "time_pattern" and row["id"] not in plan_difficulties:
             # plan 已删除/难度失效/预估非法：这条 pending 不能计入，但也不能删
             # 掉——它没被消费，等 plan 合法或 rebuild 时再处理（PR #4 P1-2）。
-            info["invalid_plan"] += 1
+            # 诊断计数不在这里加：_episode_candidates() 扫原始反馈时统一记一次，
+            # 这里再加会和它重复计同一行（PR #4 第三轮 P2-1）。
             continue
 
         relation = _relation_for(
@@ -1614,12 +1637,16 @@ def _drain_pending(memory, trigger, as_of, conn, info):
             # 与 _apply_current_episode 一致：neutral 已从缓冲区消费，但它是
             # samples/median 的一部分（§5.2/§5.5），样本口径变了就要重算结论，
             # 只是不写事件（§5.3.7：本批没写证据就不写 pending_drained）。
-            value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
+            value = _episode_value(
+                memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+            )
             _prepare_conclusion(memory, as_of, conn, info, value)
             _commit_conclusion(memory, conn, info)
         return 0
 
-    value = _episode_value(memory, as_of, conn, direction, end_feedback_id=trigger["id"])
+    value = _episode_value(
+        memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+    )
     _finalize(
         memory,
         as_of,
@@ -1669,6 +1696,9 @@ def _try_promote(memory, trigger, as_of, conn, info):
 
     if conclusion["invalid"]:
         info["invalid_enum"] += conclusion["invalid"]
+
+    if conclusion["invalid_plan"]:
+        info["invalid_plan"] += conclusion["invalid_plan"]
 
     if not conclusion["sufficient"]:
         info["insufficient_evidence"] += 1
