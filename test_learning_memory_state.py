@@ -1443,15 +1443,15 @@ def test_second_episode_keeps_neutral_and_first_formal_sample():
           key_counts("time_pattern", "medium")["evidence"] == 7,
           str(key_counts("time_pattern", "medium")))
 
-    # 新一轮：第 1 条 neutral（ratio 1.0），随后 3 条 supports（ratio 1.6/1.7/1.8）
+    # 新一轮：第 1 条 neutral（ratio 1.0），随后 3 条 supports（ratio 2.0/2.0/2.0）
     neutral_id = insert_feedback_row("重算样本", "completed", None,
                                      created_at="2026-01-10T10:00:00Z",
                                      minutes=30, actual=30, plan_id=plan_id)
     formal_ids = []
-    for day, actual in ((11, 48), (12, 51), (13, 54)):
+    for day in (11, 12, 13):
         formal_ids.append(insert_feedback_row("重算样本", "completed", None,
                                              created_at=f"2026-01-{day:02d}T10:00:00Z",
-                                             minutes=30, actual=actual, plan_id=plan_id))
+                                             minutes=30, actual=60, plan_id=plan_id))
 
     memory_service.apply_pending_updates(now="2026-01-14T00:00:00Z")
     promoted = memory_by_key("time_pattern", "medium")
@@ -1464,21 +1464,21 @@ def test_second_episode_keeps_neutral_and_first_formal_sample():
           promoted[10] == formal_ids[0],
           f"start={promoted[10]} neutral={neutral_id} formal={formal_ids}")
     check("samples 计入 neutral 与首条正式证据", value["samples"] == 4, str(value))
-    check("median 覆盖四条有效候选", value["median_ratio"] == 1.65, str(value))
+    check("median 覆盖四条有效候选", value["median_ratio"] == 2.0, str(value))
     check("新轮只写 3 条正式证据（neutral 不写）",
           key_counts("time_pattern", "medium")["evidence"] == 10,
           str(key_counts("time_pattern", "medium")))
 
-    # 追加 1 条 supports（ratio 3.0）：samples 5、median 按 5 条重算、证据只加 1 条
+    # 追加 1 条 supports（ratio 1.5）：samples 5、证据只加 1 条
     insert_feedback_row("重算样本", "completed", None,
                         created_at="2026-01-15T10:00:00Z",
-                        minutes=30, actual=90, plan_id=plan_id)
+                        minutes=30, actual=45, plan_id=plan_id)
     memory_service.apply_pending_updates(now="2026-01-16T00:00:00Z")
     updated = memory_by_key("time_pattern", "medium")
     updated_value = memory_service.decode_value(updated[5])
 
     check("active 更新后 samples 为 5", updated_value["samples"] == 5, str(updated_value))
-    check("median 按五条有效候选重算", updated_value["median_ratio"] == 1.7,
+    check("五条有效候选的 median 为 2.0", updated_value["median_ratio"] == 2.0,
           str(updated_value))
     check("证据只增加一条正式 evidence",
           key_counts("time_pattern", "medium")["evidence"] == 11,
@@ -1486,16 +1486,35 @@ def test_second_episode_keeps_neutral_and_first_formal_sample():
     check("episode_start_feedback_id 不因更新而改变",
           updated[10] == formal_ids[0], f"start={updated[10]}")
 
+    # 再追加 1 条 neutral（ratio 0.5）：samples 6、median 由 2.0 变 1.75、证据不增
+    insert_feedback_row("重算样本", "completed", None,
+                        created_at="2026-01-16T10:00:00Z",
+                        minutes=30, actual=15, plan_id=plan_id)
+    memory_service.apply_pending_updates(now="2026-01-17T00:00:00Z")
+    after_neutral = memory_by_key("time_pattern", "medium")
+    after_neutral_value = memory_service.decode_value(after_neutral[5])
+
+    check("再追加 neutral 后 samples 为 6",
+          after_neutral_value["samples"] == 6, str(after_neutral_value))
+    check("median 按六条有效候选重算为 1.75",
+          after_neutral_value["median_ratio"] == 1.75, str(after_neutral_value))
+    check("neutral 不增加正式 evidence",
+          key_counts("time_pattern", "medium")["evidence"] == 11,
+          str(key_counts("time_pattern", "medium")))
+
     online = memory_service.semantic_projection()
-    rebuilt = memory_service.rebuild_all(now="2026-01-16T00:00:00Z")
+    rebuilt = memory_service.rebuild_all(now="2026-01-17T00:00:00Z")
     offline = memory_service.semantic_projection()
 
     check("rebuild 成功", rebuilt["ok"] is True, str(rebuilt))
     check("rebuild 后语义投影完全相等", online == offline, "在线与重建结果不一致")
     rebuilt_memory = memory_by_key("time_pattern", "medium")
     rebuilt_value = memory_service.decode_value(rebuilt_memory[5])
-    check("rebuild 后 samples 仍为 5", rebuilt_value["samples"] == 5, str(rebuilt_value))
-    check("rebuild 后 median 仍为 1.7", rebuilt_value["median_ratio"] == 1.7,
+    check("rebuild 后 samples 仍为 6", rebuilt_value["samples"] == 6, str(rebuilt_value))
+    check("rebuild 后 median 仍为 1.75", rebuilt_value["median_ratio"] == 1.75,
+          str(rebuilt_value))
+    check("rebuild 后首条正式证据仍参与统计",
+          rebuilt_value["samples"] == after_neutral_value["samples"],
           str(rebuilt_value))
 
 
