@@ -1,4 +1,4 @@
-# 第二阶段：学习记忆管理 —— 方案设计（v14）
+# 第二阶段：学习记忆管理 —— 方案设计（v15）
 
 - 基线：`main` @ `fb22365`（第一阶段已合并）
 - 代码阅读范围：`database.py`、`main.py`、`feedback_service.py`、`agent_tools.py`、`agent_loop.py`、`agent_schema.py`、`agent_dispatcher.py`、`agent_plan_draft.py`、`context_builder.py`、`langgraph_plan_workflow.py`、`rag_service.py`、`plan_service.py`、`prompt_registry.py`、`static/feedback.html`，以及 `test_agent_tools.py` / `test_agent_loop.py` / `test_database_migrations.py` / `test_feedback_plan_link.py`
@@ -7,7 +7,21 @@
 
 ## 0. 修订记录
 
-### v13 → v14（本轮，外部复审 P1×6 + P2×6）
+### v14 → v15（本轮，外部复审 P1×3 + P2×5）
+
+| # | 审查意见 | 处理 |
+| --- | --- | --- |
+| P1-1 | `apply_pending_updates(now=None)` 直接 `write_cursor(row["id"], now)`，会把 `None` 写进 `updated_at TEXT NOT NULL`；正常 `/feedback` 链路不传 `now`，首次处理即回滚 | §5.3.3.2 开头生成一次 `effective_now = now or utcnow()`，循环内 `write_cursor(row["id"], effective_now)`，收尾 stale pass 用同一变量；§4.3 写死 `updated_at` 必须是非空字符串、由调用方给；新增 K23 |
+| P1-2 | §8.2 的 K15 仍是 v13 测试（SQL 直插 `id=11`、再补 `id=10`、断言 `cursor_blocked`），与方案 A 的「禁止手工补录 id」冲突 | K15 整段重写为方案 A 测试（真实自动分配、升序处理、前后与中间空洞不阻塞、失败回滚游标不动），HTTP 并发交给 K19；「禁止手工补录」改成独立契约断言，不再用违规操作模拟并发 |
+| P1-3 | 「回滚的 INSERT 永久消耗 id」不成立：SQLite 文档说明回滚事务分配的 ROWID 可被重新使用 | §5.3.3.2 原理段按官方行为改写（区分「完整事务回滚」与「已提交的失败 INSERT」）；K20 改为可复现的约束失败构造，并**先断言行未插入、`sqlite_sequence` 已推进**再断言越过空洞 |
+| P2-1 | `rebuild_all()` 收尾 `write_cursor(MAX(feedbacks.id))` 会把 DELETE 后保留的高水位降回 0 | §5.3.6/§4.2/§8.2 统一改为 `write_cursor(max(read_cursor(), COALESCE(MAX(feedbacks.id), 0)))`，空表与非空表都**不回退**；B16 补「删除 → rebuild → 新增」场景 |
+| P2-2 | 迁移初值只取 `MAX(id)`，升级前已清空但序列仍有高水位的老库会被初始化成 0 | §3.1/§3.4/§9 统一为 `MAX(COALESCE(seq,0), COALESCE(MAX(id),0))`；新增 M10（V6 空表 + 非零 `sqlite_sequence`） |
+| P2-3 | `id_gap_skipped` 只算 cursor 到首行之间的空号，中间空洞漏统计 | 定义写死为「本批跳过的全部自动 id 数」，循环内累计首行前 + 相邻已处理行之间的 gap，并给 `id_gap_detail`；K15 断言 `[cursor+1, cursor+3]` 时 gap=1 |
+| P2-4 | 分组相加是 151（+6 回归 = 157），不是 153/159 | 逐项重算：v14 表格确实少算 2 例；本轮新增 M10、K23 后为 **153 唯一 + 6 回归 = 159**，§0/§8.2/PR body 三处一致 |
+| P2-5 | PR body 与回帖的 head SHA 与 GitHub metadata 不一致 | PR body 改为真实 head；回帖里那个 SHA 是手抄错误值，以 PR metadata 为准 |
+| 连带 | 用例数、工期、文件清单、风险表需同步 | 用例 159（153 + 6）；任务 1 1.0 → **1.1 天**（迁移高水位 + M10），合计 **10.6 人日**；§11 两行改写 |
+
+### v13 → v14（上一轮，外部复审 P1×6 + P2×6）
 
 | # | 审查意见 | 处理 |
 | --- | --- | --- |
@@ -354,9 +368,13 @@ CREATE TABLE IF NOT EXISTS memory_apply_cursor (
 );
 
 -- 迁移末尾必须真的插入这一行（只建表不会产生行），见 §3.4
--- 老库：历史反馈视为旧数据，cursor 落在迁移前的最大 feedback id 上，首次新反馈不会回放历史
+-- 初值取「高水位」：老库可能已被旧版 delete_all_feedback() 清空，但 sqlite_sequence 仍留着旧高水位；
+-- 只取 MAX(id) 会让 cursor 落到 0，把已删除的历史 id 全部误报成 gap（v15 修正 P2-2）。
 INSERT INTO memory_apply_cursor (id, last_applied_feedback_id, updated_at)
-SELECT 1, COALESCE((SELECT MAX(id) FROM feedbacks), 0), :migration_as_of
+SELECT 1,
+       MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'feedbacks'), 0),
+           COALESCE((SELECT MAX(id) FROM feedbacks), 0)),
+       :migration_as_of
 WHERE NOT EXISTS (SELECT 1 FROM memory_apply_cursor WHERE id = 1);
 
 CREATE TABLE IF NOT EXISTS memory_events (
@@ -395,17 +413,18 @@ CREATE INDEX IF NOT EXISTS idx_events_memory ON memory_events(memory_id, created
 
 ### 3.4 历史数据兼容与删除语义
 
-- **旧库升级（v14 修正 P1-2）**：V7 只 `CREATE TABLE IF NOT EXISTS`；老库升级后新表为空，历史反馈**不回填**（无可靠依据，回填即伪造）。**迁移末尾插入 cursor 单行**，初值 = 迁移时刻的 `COALESCE(MAX(feedbacks.id), 0)`：
+- **旧库升级（v14 修正 P1-2，v15 改高水位 P2-2）**：V7 只 `CREATE TABLE IF NOT EXISTS`；老库升级后新表为空，历史反馈**不回填**（无可靠依据，回填即伪造）。**迁移末尾插入 cursor 单行**，初值 = 迁移时刻的**高水位** `MAX(COALESCE(sqlite_sequence.seq, 0), COALESCE(MAX(feedbacks.id), 0))`：
   - 全新空库 → `0`，第一条反馈被正常处理；
   - V5/V6 老库（已有历史反馈）→ 落在历史最大值上，因此**第一次 `/feedback` 只会处理它自己那条**，不会把历史当待处理回放；
-  - M1–M9 分别断言空库初始化、老库初始化、恰好一行、首次新反馈只处理新行。
+  - **升级前已被清空、但 `sqlite_sequence` 有非零高水位**的 V6 库 → `cursor = 旧高水位`（不是 0），新反馈 id 必然大于它，既不阻塞、也不会把已删除的 id 记成 `id_gap_skipped`（M10 断言）。
+  - M1–M10 分别断言空库初始化、老库初始化、恰好一行、首次新反馈只处理新行、清空后的高水位初值。
   - 允许历史全量回放的**唯一入口是显式 `rebuild_all()`**（它本来就把游标推到 `MAX(id)`）。
 - **`DELETE /feedback`（【契约变更】级联清空，v14 修正 P1-3）**：`database.delete_all_feedback()` 内部**同一事务**按子表→父表删除：`memory_events → memory_evidence → memory_pending_evidence → learning_memories → feedbacks`，`commit` 前不落任何一条；异常 `rollback`。
   - 语义：**清空就是清空**——不保留归档记忆、不保留事件、不保留 pending 缓冲区、**不写 `deleted` 事件**（P0-D3：写了也会被同事务删掉，保留又违背清空语义）。
   - **cursor 不重置为 0**：`feedbacks.id` 是 `AUTOINCREMENT`，`DELETE FROM feedbacks` 不会清零 `sqlite_sequence` 高水位，清空后下一条反馈会得到「旧高水位 + 1」。若把 cursor 归零，随后第一条新反馈就会被当成缺口，游标永久卡死。因此清空前读高水位：
     ```sql
-    SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'feedbacks'),
-                    (SELECT COALESCE(MAX(id), 0) FROM feedbacks)) AS hwm;
+    SELECT MAX(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'feedbacks'), 0),
+               COALESCE((SELECT MAX(id) FROM feedbacks), 0)) AS hwm;
     -- 同一事务内 DELETE ...；写入 cursor(hwm)
     INSERT INTO memory_apply_cursor (id, last_applied_feedback_id, updated_at)
     VALUES (1, :hwm, :as_of)
@@ -475,7 +494,7 @@ memory_context.py                   ← collect_short_term(I/O) + render_short_t
 
 ### 4.3 `database.py` 新增函数（只做 SQL）
 
-`list_memories(...)`、`get_memory_by_key(...)`、`insert_memory(...)`、`update_memory_state(...)`、`insert_evidence(...)`（**INSERT OR IGNORE，返回 `{"inserted","row_id"}`，绝不 UPDATE 已有行**）、`get_evidence(memory_id, feedback_id)`（核对用）、`list_evidence(memory_id, episode=None, relation=None, limit=None)`、`max_evidence_feedback_id(memory_id, episode=None)`、`count_evidence(...)`、`insert_memory_event(...)`、`delete_all_memories()`；pending 缓冲区五件套：`insert_pending(...)`（返回 `{"inserted","row_id"}`）、`list_pending(memory_id, episode=None)`、`delete_pending(memory_id, episode=None, feedback_ids=None)`、`delete_expired_pending(memory_id, cutoff_created_at)`（返回删除条数，供 `info.pending_expired`）、`count_pending(memory_id, episode=None)`；游标两个：`read_cursor()`、`write_cursor(feedback_id, updated_at)`（v13 加入，v14 明确**游标只在 `database.py` 读写**，不放进 `memory_context`）。合计 **17 个函数**，全部参数化，返回 `dict`。
+`list_memories(...)`、`get_memory_by_key(...)`、`insert_memory(...)`、`update_memory_state(...)`、`insert_evidence(...)`（**INSERT OR IGNORE，返回 `{"inserted","row_id"}`，绝不 UPDATE 已有行**）、`get_evidence(memory_id, feedback_id)`（核对用）、`list_evidence(memory_id, episode=None, relation=None, limit=None)`、`max_evidence_feedback_id(memory_id, episode=None)`、`count_evidence(...)`、`insert_memory_event(...)`、`delete_all_memories()`；pending 缓冲区五件套：`insert_pending(...)`（返回 `{"inserted","row_id"}`）、`list_pending(memory_id, episode=None)`、`delete_pending(memory_id, episode=None, feedback_ids=None)`、`delete_expired_pending(memory_id, cutoff_created_at)`（返回删除条数，供 `info.pending_expired`）、`count_pending(memory_id, episode=None)`；游标两个：`read_cursor()`、`write_cursor(feedback_id, updated_at)`（v13 加入，v14 明确**游标只在 `database.py` 读写**，不放进 `memory_context`；v15 写死 `updated_at` 必须是非空字符串，调用方传 `effective_now`，本层不做 None 兜底）。合计 **17 个函数**，全部参数化，返回 `dict`。
 
 ---
 
@@ -674,15 +693,20 @@ UNIQUE(memory_id, feedback_id)
 
 **重建一致性**：`rebuild_all()` 走同一个 `apply_feedback`，`_drain_pending` 自然在每次触发时被调用，因此"在线与重建结果一致"仍由 §5.3.8 的语义投影保证（K12、K18 专测）。
 
-#### 5.3.3.2 处理游标：在线按 `feedback_id` 升序推进（v14 重写，P1-1 的阻断项）
+#### 5.3.3.2 处理游标：在线按 `feedback_id` 升序推进（v14 重写、v15 修订 P1-1/P1-3/P2-3）
 
 **为什么需要游标**：v12 用「SQLite 单写者 + `BEGIN IMMEDIATE`」论证在线按 ID 升序，这是错的。写事务锁只保证**同一时刻只有一个写者**，不保证**获得锁的顺序 = feedback id 的顺序**：两个请求都已提交原始反馈（id=10、id=11），随后各自开记忆事务，id=11 完全可能先拿到锁。于是先处理 11、再处理 10，而 `feedback_id <= trigger.id` 的上界让 10 看不到 11，最终在线不晋升、rebuild 晋升——同一批数据两个结论。
 
-**为什么 v13 的"连续性检查"也是错的**：v13 要求 `rows[0].id == cursor + 1`，把 AUTOINCREMENT 的"单调递增"当成"严格连续"。SQLite 的 AUTOINCREMENT 只保证新 id > 历史所有 id，**失败或回滚的 INSERT 会永久消耗一个 id**（`sqlite_sequence` 已推进），留下**永远不会出现的空洞**；把空洞当成"较小 id 还没提交"，会让游标永久卡死。而且只检查 `rows[0]` 时，`[cursor+1, cursor+3]` 会通过首行检查、静默跳过中间行。
+**为什么 v13 的"连续性检查"也是错的**：v13 要求 `rows[0].id == cursor + 1`，把 AUTOINCREMENT 的"单调递增"当成"严格连续"。SQLite 的 AUTOINCREMENT 只保证新 id 大于历史分配过的最大值，**不保证连续**（官方文档 https://www.sqlite.org/autoinc.html ）。空洞的成因必须说准（v15 修正 P1-3）：
+
+- **完整事务回滚不产生永久空洞**：回滚时分配的 ROWID 会被忽略，之后可以重新使用；
+- **已提交事务里的失败 INSERT**（约束失败但编号已分配/`sqlite_sequence` 已推进）才可能留下不会再出现的编号；
+- 所以本设计既不假设"空洞一定存在"，也不假设"一定不存在"——只按**现存行**升序处理，两种情形都不影响正确性；
+- 但只检查 `rows[0]` 时，`[cursor+1, cursor+3]` 会通过首行检查、静默跳过中间行。
 
 ##### 采用方案 A：只处理"实际存在且已提交"的记录，不要求 id 连续
 
-**前置约束（写死）**：本项目**不支持、也禁止手工指定或补录 `feedbacks.id`**——所有反馈只能经 `POST /feedback` 由 SQLite 分配 id；历史补录一律走 `rebuild_all()`（它按 `ORDER BY id` 全量回放并把游标推到 `MAX(id)`）。任何直接 `INSERT INTO feedbacks (id, ...)` 的脚本都属违规操作，K15 会显式断言其后果。
+**前置约束（写死）**：本项目**不支持、也禁止手工指定或补录 `feedbacks.id`**——所有反馈只能经 `POST /feedback` 由 SQLite 分配 id；历史补录一律走 `rebuild_all()`（它按 `ORDER BY id` 全量回放并把游标推到 `MAX(id)`）。任何直接 `INSERT INTO feedbacks (id, ...)` 的脚本都属违规操作——v15 起这条作为**独立契约断言**（不用它构造并发或空洞场景：K15 只用真实自动分配的行，K20 用真实的失败 INSERT）。
 
 **为什么"更小的自动 id 不可能在较大 id 已提交之后出现"**（这是方案 A 成立的唯一依据）：
 
@@ -694,6 +718,8 @@ UNIQUE(memory_id, feedback_id)
 ```python
 def apply_pending_updates(final_feedback_id=None, now=None):
     """在线唯一入口。处理所有 id > cursor 的现存反馈，按 id 升序。"""
+    effective_now = now or utcnow()      # v15 P1-1：本批次唯一时间来源，绝不把 None 写进 updated_at
+    info = {"id_gap_skipped": 0, "id_gap_detail": []}
     with transaction("BEGIN IMMEDIATE"):
         cursor = read_cursor()                       # 迁移时已初始化（§3.4/§5.3.3.2 末）
         rows = SELECT * FROM feedbacks
@@ -701,43 +727,51 @@ def apply_pending_updates(final_feedback_id=None, now=None):
                    AND (:final_feedback_id IS NULL OR id <= :final_feedback_id)
                  ORDER BY id ASC
         if not rows:
-            return {"ok": True, "processed": 0}
+            return {"ok": True, "processed": 0, "info": info}
 
-        # 诊断（不阻塞）：cursor 与首行之间若有空号，只记一笔，不改变处理
-        if rows[0]["id"] > cursor + 1:
-            info["id_gap_skipped"] = rows[0]["id"] - cursor - 1
-
+        prev = cursor
         for row in rows:
+            # 诊断（不阻塞）：累计本批跳过的**全部**自动 id，含首行之前与相邻已处理行之间（v15 P2-3）
+            if row["id"] > prev + 1:
+                gap = row["id"] - prev - 1
+                info["id_gap_skipped"] += gap
+                info["id_gap_detail"].append({"after": prev, "before": row["id"], "gap": gap})
             apply_feedback(row, as_of=row["created_at"])   # §5.3.6 的内部单步函数
-            write_cursor(row["id"], now)                   # 逐条推进，同事务内可见
+            write_cursor(row["id"], effective_now)         # 逐条推进，同事务内可见；时间非空
+            prev = row["id"]
 
-        _materialize_stale(all, now or utcnow())           # 收尾：把"当前已 stale"体现为 archived
+        _materialize_stale(all, effective_now)             # 收尾用同一 effective_now
         return {"ok": True, "processed": len(rows), "info": info}
 ```
 
-**与 v13 的差别**：没有 `cursor_blocked`，没有 `cursor + 1` 等式；`rows` 里的每一行都是真实存在的记录，逐条按升序处理即可。存在空洞时**照常处理并前进**，因为空洞不可能是"还没提交的较小 id"。
+**与 v13 的差别**：没有 `cursor_blocked`，没有 `cursor + 1` 等式；`rows` 里的每一行都是真实存在的记录，逐条按升序处理即可。存在空洞时**照常处理并前进**。
+
+**时间来源（v15 P1-1）**：`effective_now = now or utcnow()` 在**事务之前**只求值一次，批次内所有 `write_cursor(...)` 与收尾 `_materialize_stale(...)` 共用它。因此 ①正常 `/feedback` 不传 `now` 时也不会把 `None` 写进 `memory_apply_cursor.updated_at`（该列 `TEXT NOT NULL`）；②测试注入固定 `now` 时，整批游标时间、归档判定与事件 `as_of` 都落在同一时刻，可复现；③`write_cursor(feedback_id, updated_at)` 的 `updated_at` **必须是非空字符串**，`database.py` 层不做"None 自动补时间"的隐式兜底（两层契约只留一处）。
+
+**`id_gap_skipped` 的定义（v15 P2-3）**：本批次中、从 `cursor` 起按升序推进时**被跳过的自动 id 总数**，包含「`cursor` 与首行之间」和「相邻两条已处理行之间」两类；`id_gap_detail` 记录每段 `{after, before, gap}` 便于排查。它只用于诊断，**不参与任何判定**。
 
 | 场景 | 行为 |
 | --- | --- |
 | 两个 `/feedback` 并发提交 | 谁的记忆事务先拿锁都一样：它处理的是**全部** `id > cursor` 的行，而不是"只处理我这条"。处理完游标前进，另一个进来时 `rows` 为空、no-op。**处理顺序 = id 升序，与锁顺序无关** |
-| AUTOINCREMENT 空洞（失败 INSERT 消耗了 id） | 首行为 `cursor + 3` 时记 `info.id_gap_skipped=2` 并**照常处理**；不阻塞、不等待 |
-| 中间出现空洞 `[cursor+1, cursor+3]` | 两行都处理；空洞不产生错误（K15 第 2 段专测） |
+| AUTOINCREMENT 空洞（已提交的失败 INSERT 消耗了 id） | 首行为 `cursor + 3` 时 `info.id_gap_skipped=2`、`id_gap_detail` 记一段，**照常处理**；不阻塞、不等待 |
+| 中间出现空洞 `[cursor+1, cursor+3]` | 两行都处理；`id_gap_skipped` 累计为 1（K15 第 2 段专测） |
 | 某条反馈处理抛异常 | 整个事务 rollback：游标不动、证据与事件都不落库；下次调用从同一位置重试，已提交的较大 id 不会被"越过"（它们尚未处理，游标未推进） |
 | 旧反馈重试 / 时间更早的反馈 | id 已 `<= cursor`，不在 `rows` 里，天然不重复处理；要重算历史走 `rebuild_all()` |
-| `rebuild_all()` | 内部同一循环 `ORDER BY id`，结束后 `write_cursor(MAX(feedbacks.id))`。**在线 = rebuild 的前缀增量** |
-| 手工指定 id 补录（禁止） | 若有人绕过服务层插入更小 id：该行 `<= cursor`，在线**永远不会**处理它；必须 `rebuild_all()` 才能纳入。K15 第 4 段断言这个后果 |
+| `rebuild_all()` | 内部同一循环 `ORDER BY id`，结束后 `write_cursor(max(read_cursor(), COALESCE(MAX(feedbacks.id), 0)))`——**不回退**：清空后重建仍停在旧高水位（v15 P2-1）。**在线 = rebuild 的前缀增量** |
+| 手工指定 id 补录（禁止） | 若有人绕过服务层插入更小 id：该行 `<= cursor`，在线**永远不会**处理它；必须 `rebuild_all()` 才能纳入。v15 起这是**独立契约断言**，不再用来构造 K15 场景 |
 
 **残留风险的诚实说明**：
 
 - 并发下"后到的请求可能先跑"是允许的：它会把别人的反馈一起处理掉，结果与顺序执行一致（这是方案 A 的核心收益）。
 - 若将来要支持"手工补录更早的历史反馈并让在线增量吸收"，必须换成方案 B（独立处理序号/待处理账本，在写入反馈的同一事务里生成），**不能**沿用游标。本阶段明确不做。
-- 不引入任务队列/后台 worker：游标 + 同步批量已满足单用户 MVP，K15 用真实 `/feedback` 并发验证。
+- 不引入任务队列/后台 worker：游标 + 同步批量已满足单用户 MVP；**HTTP 并发由 K19** 用真实 `/feedback` 验证（K15 只管升序与空洞）。
 - **游标不是"进度百分比"**：它只是"已处理到哪条现存记录"，空洞不占位。
 
-**迁移初始化（回应 P1-2）**：V7 迁移末尾执行 §3.1 的 `INSERT ... SELECT 1, COALESCE(MAX(id),0), :migration_as_of WHERE NOT EXISTS`，因此：
+**迁移初始化（回应 P1-2，v15 P2-2 改为高水位）**：V7 迁移末尾执行 §3.1 的 `INSERT ... SELECT 1, MAX(COALESCE(sqlite_sequence.seq,0), COALESCE(MAX(id),0)), :migration_as_of WHERE NOT EXISTS`，因此：
 
 - 空库 → `cursor = 0`；
 - 已有历史反馈的老库 → `cursor = MAX(历史 id)`，**第一次 `/feedback` 只处理新插入的那条**（与 §3.4"历史不回填"一致）；
+- **升级前已被清空、`sqlite_sequence` 仍有高水位**的老库 → `cursor = 旧高水位`（不是 0），新反馈 id 必大于它，不阻塞也不会把已删 id 记成 gap（M10 断言）；
 - 只 `CREATE TABLE` 不插入是错的（M3 断言恰好一行、M4 断言老库迁移后值是历史最大 id）。
 
 
@@ -816,7 +850,7 @@ def subject_key_for(mtype, trigger):
 - **重复计数由服务层拦截，唯一索引只是兜底**（v6 修正 P1-2）：pending 与 evidence 是两张表，各自的唯一索引只在表内生效，跨表重复必须由"写 pending 前查 evidence"（§5.3.2 第 8 条）挡住；`inserted=False` 再按 §5.2 第 3–4 步核对，不一致才报 `data_inconsistency`；
 - `_try_promote` 成功后本轮 pending 行已删除，因此触发反馈不会被普通路径再计一次；
 - **在线唯一入口是 `apply_pending_updates()`（v13 引入，v14 统一命名 P1-4）**：它按 §5.3.3.2 读游标、把 `id > cursor` 的**全部现存反馈**升序逐条交给 `apply_feedback`，逐条推进游标；`/feedback` 只调用它（`final_feedback_id=None`），不存在"只处理刚插入那条"的旁路。保留名 `update_from_feedback(id)` 是它的**包装**（内部 `final_feedback_id=id`），仍然走同一游标与同一批量循环；`apply_feedback` 是内部单步函数，不得作为入口被调用（K19 断言包装函数也不绕过游标）；
-- `rebuild_all()` 是**同一套逻辑的全量版本**：`for row in feedbacks ORDER BY id → apply_feedback(row, as_of=row["created_at"])` → 末尾 `_materialize_stale(all, now)` → `write_cursor(MAX(id))`。**在线 = rebuild 的前缀增量**，因此 §5.3.8 的投影比较才有意义。
+- `rebuild_all()` 是**同一套逻辑的全量版本**：`for row in feedbacks ORDER BY id → apply_feedback(row, as_of=row["created_at"])` → 末尾 `_materialize_stale(all, now)` → `write_cursor(max(read_cursor(), COALESCE(MAX(id), 0)))`（**不回退**，v15 P2-1）。**在线 = rebuild 的前缀增量**，因此 §5.3.8 的投影比较才有意义。
 
 #### 5.3.7 事件规则（v13 重写，P1-3 的统一口径）
 
@@ -1018,22 +1052,22 @@ reason: FeedbackReason | None = None
 
 | 组 | 编号 | 断言要点 |
 | --- | --- | --- |
-| 迁移 | M1–M9 | V7 **五张表**/索引存在；V5、V6 老库升级后**五张表**为空；`memory_apply_cursor` 恰好 1 行、`last_applied_feedback_id` 默认 0；重复 `init_db()` 幂等；`user_version > SCHEMA_VERSION` 抛 `RuntimeError`；`episode` 默认 1；**M7 空库迁移后 cursor=0、首次 `/feedback` 只处理新插入的那条**；**M8 V5/V6 老库迁移后 cursor=MAX(历史 id)、首次 `/feedback` 不回放历史**（P1-2）；**M9 重复执行迁移不覆盖已有 cursor（`WHERE NOT EXISTS`）、不会插入第二行** |
+| 迁移 | M1–M10 | V7 **五张表**/索引存在；V5、V6 老库升级后**五张表**为空；`memory_apply_cursor` 恰好 1 行、`last_applied_feedback_id` 默认 0；重复 `init_db()` 幂等；`user_version > SCHEMA_VERSION` 抛 `RuntimeError`；`episode` 默认 1；**M7 空库迁移后 cursor=0、首次 `/feedback` 只处理新插入的那条**；**M8 V5/V6 老库迁移后 cursor=MAX(历史 id)、首次 `/feedback` 不回放历史**（P1-2）；**M9 重复执行迁移不覆盖已有 cursor（`WHERE NOT EXISTS`）、不会插入第二行**；**M10 `OLD_DB_CLEARED_HIGH_WATER`（v15 P2-2）**：V6 库、`feedbacks` 为空、`sqlite_sequence` 有非零高水位 → ①升级 V7 后 cursor 等于该高水位（**不是 0**）②首次 `/feedback` 正常处理 ③新反馈 id 与 cursor 之间**不产生 gap 记录**（`id_gap_skipped == 0`） |
 | 枚举契约 | V1–V8 | 非法 `status`/`reason` → **422 + `detail` + 无 `error_type`** 且行数不变；`partial` 无 reason → 400 `reason_required`；`completed` 无 reason 仍成功；服务层遇脏值不生成 |
 | 归一化 | N1–N6 | 中英/全半角/空白/后缀/空串/超长；不同写法同 key |
 | 存储与回溯 | S1–S11 | 2 条难度失败 → 1 记忆 + **2 条 evidence**；单条 → 0；**`task_performance` 3 条样本（1 completed）→ 生成 `low`（samples=3 达门槛、supports=2、rate=0.33）**，门槛数样本而非 supports（P1-1）；**5 条反馈 → 5 行 evidence**（一条被计入的反馈一行，P0-1）；`plan_id IS NULL` 不进 `time_pattern`；`estimated=0` 排除；`difficulty` 非法排除；**两个不同 task 同 difficulty 共同进入 `time_pattern` 同一条记忆**；**无效 `plan_id`/计划缺失/`difficulty` 非法 → `time_pattern` 整类跳过，不创建也不更新该记忆，其他三类照常处理**；`value_json` 可解析 |
 | 脏历史 | H1–H3 | 合法触发 + 同窗口非法历史行 → 非法行**不计分子分母**；全非法 → 不生成；`info.invalid_enum` 计数正确（P1-D） |
 | 检索 | R1–R8 | 类型/主题/状态过滤；`limit` 越界拒绝；只回 `active`；不相关主题不命中；`evidence_feedback_ids` 正确；空结果 `insufficient_evidence` |
 | 去重与不可变 | D1–D9 | 同 subject 5 次 → 1 行 / `evidence_count=5` / evidence 5 行；重复 `feedback_id` 不重复计；**重复调用后既有 evidence 的 `relation`/`episode` 字节不变**；人为构造不一致 → `data_inconsistency` 且不覆盖；**`insert_evidence()` 冲突返回 `inserted=false` 时被当作失败处理而非成功**（P1-2）；**记忆建立后继续输入 3 条新反馈 → 正式 evidence 恰好追加 3 行，且每行 `relation`/`episode` 正确、`evidence_count` 与 `COUNT` 一致**（P0-1）；**再重复调用这 3 条中的任意一条 → evidence 行数与两个计数都不变**（P0-1） |
-| pending 缓冲区 | K1–K22 | `resolved`/`archived` 后新反馈**只写 `memory_pending_evidence`**（该表无 relation 列）；`UNIQUE(memory_id, feedback_id)` 防重复；pending 期间 `content`/`value_json`/`strength`/`status`/`episode`/`episode_start_feedback_id`/`last_supported_at`/`updated_at` **逐列不变**；晋升后正式 evidence 一次写齐、已消费的 pending 行清空；超 30 天窗口的 pending 行被删除且**永不进正式证据**；pending 行不出现在 `retrieve` 与 Tool 返回；**重试一条已在 `memory_evidence` 的旧反馈 → 服务层直接跳过（`info.already_evidenced`），不写缓冲区、不报 `data_inconsistency`**；neutral 样本晋升时被丢弃且不计分子分母；一次晋升只写一条事件；**方向长期不可定（完成率持续 0.6）跨过 30 天后新反馈到来 → 旧 pending 行被删除、`info.pending_expired` 等于删除条数、剩余行不参与方向与门槛计算**；**K11 `PENDING_FUTURE_AS_OF`（v11）**：先放 `created_at=2026-01-10` 的 pending（id 较小），再用 id 更大但 `created_at=2026-01-05` 的反馈触发 → 该 pending ①不参与 direction ②不计门槛、不提前晋升 ③**没有被删除**（`pending_future_skipped=1`、`pending_expired=0`）④后续 `created_at=2026-01-11` 的反馈到来时才进入有效集；**K12 `FUTURE_PENDING_AFTER_PROMOTION`（v12 P1-3，核心）**：①pending 中放 3 条满足 `task_performance` 门槛的有效样本（3 samples、完成率 1/3）+ 1 条 `created_at` 更靠后的未来样本；②当前触发成功晋升为 `active` → 断言未来样本**仍在 pending 表**、其 `episode` 等于新当前轮、3 条有效样本已写成正式证据；③随后处理一条 `created_at` 越过该未来样本的反馈 → `_drain_pending` 把它按**已固定 direction** 转成正式证据、`evidence_count`/`evidence.py` 计数一致、该 pending 行被删除；④同一反馈重复处理 → 不写第二行、不重复计数、无新事件；⑤同一批数据用 `rebuild_all()` 重放 → 语义投影与在线一致（含事件 `detail_json`）；**K13 `PENDING_ID_UPPER_BOUND`（v12 P1-4）**：缓冲区里存在 `feedback_id` 大于当前 trigger 的行（由重建预置或乱序写入构造）→ ①不参与 direction/unit/REQUIRED 计算 ②**不被删除**（`pending_future_id` 计数正确）③后续 id 追上的触发到来时才参与；**K14 `FUTURE_OUT_OF_RANGE`（v12 P2-2，v13 补充）**：新候选 `created_at > as_of + 30d` → 不写 pending、不写证据、`info.future_out_of_range` 计数正确，且该次调用不产生任何状态迁移；**已有 pending 行**越界（`created_at > as_of + FUTURE_SKEW_MAX`）→ 在同一 `_pending_window` 事务内被 **DELETE**、计 `pending_out_of_range_dropped`，与 `future_out_of_range` 是两个计数，`rebuild_all()` 重放后行数与计数一致；**K15 `APPLY_CURSOR_ORDER`（v13 P1-1，阻断项）**：先写入 feedback `id=9` 并处理（游标=9）；随后**直接 SQL 插入** `id=11`（模拟后插入者已提交、`id=10` 尚未提交）→ 调 `apply_pending_updates()` 断言 ①`ok=false`、`error_type="cursor_blocked"`、`blocked_at=10`、`processed=0`、游标仍为 9 ②再插入 `id=10` 后调用 → 一次事务内**先 10 后 11** 处理、游标推进到 11、`processed=2` ③在此数据上跑 `rebuild_all()` → 语义投影与在线完全一致（特别是 pending 晋升结果）④**失败重试**：让 `id=10` 的处理抛异常 → 事务回滚、游标仍为 9、`id=11` 未被处理、证据与事件均未落库；恢复后重跑从 10 开始并最终与 rebuild 一致；**K16 `DRAIN_BEFORE_STALE`（v13 P1-2）**：记忆 `last_supported_at = T0`，`as_of = T0 + 61 天` 已超 stale；缓冲区有一条 `created_at = T0 + 55 天` 的 supports（此前因未来被跳过）→ 新触发 `as_of = T0 + 62 天` 到来：①断言**先 drain** 把它写成正式证据、`last_supported_at` 刷新为 `T0+55 天` ②随后 stale 判定为"未超 60 天"→ **不归档**、`status` 保持原值（若顺序颠倒则会被 `archived`，测试即失败）③`apply_feedback` 的调用顺序用日志/事件顺序断言 ④`rebuild_all()` 复现同一结果；**K17 `PENDING_ORPHAN_ON_CLOSE`（v13 P1-2 配套）**：`weakened → resolved` 时缓冲区里仍有 2 条属于旧轮的 pending（未来行）→ 断言 ①两行被删除、`info.pending_episode_closed=2` ②没有孤儿行（`memory_pending_evidence` 中不存在 `episode < memory.episode` 的行）③新轮候选边界仍为 `pending_start_feedback_id`、后续反馈照常进新轮 ④重建后行数一致；**K18 `DRAIN_BATCH_TRANSITIONS`（v13 P1-3）**：缓冲区一次性含 1 条 supports + 3 条 contradicts（全部满足窗口与 ID 上界、`as_of` 同时到达）→ ①一次性 drain 后 `status=resolved`（不是 `weakened`）②`contradict_count=3`、`supports` 行 1 条 ③事件恰好 2 条：`pending_drained`（`consumed=4`、`evidence_ids` 升序、`neutral_dropped`）+ `resolved`（`from_status="weakened"`）④`pending_*` 已固定、旧轮 pending 被清理 ⑤同批再调用一次 → 0 消费、不写事件、状态不变 ⑥`rebuild_all()` 后事件投影逐字节一致 |
-| pending 缓冲区（v14 补充，P1-1/P1-3/P1-6） | K19–K22 | **K19 `CONCURRENT_FEEDBACK_ORDER`**：两个线程同时 POST `/feedback`（真实 HTTP，不手工插 ID）→ ①两条各被处理一次 ②`last_applied_feedback_id == MAX(feedbacks.id)` ③无阻塞类错误 ④与 `rebuild_all()` 语义投影相等；**K20 `CURSOR_GAP`**：用「插入后 ROLLBACK」消耗一个 AUTOINCREMENT 号制造真实空洞，再正常提交两条 → ①`info.id_gap_skipped` 等于空洞数 ②两行照常处理、游标推进到最大 id ③不阻塞、与无空洞时结果一致；**K21 `CURSOR_AFTER_DELETE`**：建 3 条并处理 → `DELETE /feedback` → 五表全空、cursor 等于清空前 `sqlite_sequence` 高水位（非 0）→ 再提交 1 条 → 被正常处理、未回放历史、序列未被重置；**K22 `DRAIN_STALE_PRIORITY`**：`last_supported_at = T0`、`as_of = T0+62d`、drain 批次 3 条有效 contradicts 无 supports → ①最终 `archived`、**不出现 `resolved`** ②事件恰 2 条且顺序 `pending_drained` → `archived`（`reason=\\"stale_as_of\\"`）③旧轮 pending 关轮清理 ④在线与 `rebuild_all()` 投影一致 |
+| pending 缓冲区 | K1–K23 | `resolved`/`archived` 后新反馈**只写 `memory_pending_evidence`**（该表无 relation 列）；`UNIQUE(memory_id, feedback_id)` 防重复；pending 期间 `content`/`value_json`/`strength`/`status`/`episode`/`episode_start_feedback_id`/`last_supported_at`/`updated_at` **逐列不变**；晋升后正式 evidence 一次写齐、已消费的 pending 行清空；超 30 天窗口的 pending 行被删除且**永不进正式证据**；pending 行不出现在 `retrieve` 与 Tool 返回；**重试一条已在 `memory_evidence` 的旧反馈 → 服务层直接跳过（`info.already_evidenced`），不写缓冲区、不报 `data_inconsistency`**；neutral 样本晋升时被丢弃且不计分子分母；一次晋升只写一条事件；**方向长期不可定（完成率持续 0.6）跨过 30 天后新反馈到来 → 旧 pending 行被删除、`info.pending_expired` 等于删除条数、剩余行不参与方向与门槛计算**；**K11 `PENDING_FUTURE_AS_OF`（v11）**：先放 `created_at=2026-01-10` 的 pending（id 较小），再用 id 更大但 `created_at=2026-01-05` 的反馈触发 → 该 pending ①不参与 direction ②不计门槛、不提前晋升 ③**没有被删除**（`pending_future_skipped=1`、`pending_expired=0`）④后续 `created_at=2026-01-11` 的反馈到来时才进入有效集；**K12 `FUTURE_PENDING_AFTER_PROMOTION`（v12 P1-3，核心）**：①pending 中放 3 条满足 `task_performance` 门槛的有效样本（3 samples、完成率 1/3）+ 1 条 `created_at` 更靠后的未来样本；②当前触发成功晋升为 `active` → 断言未来样本**仍在 pending 表**、其 `episode` 等于新当前轮、3 条有效样本已写成正式证据；③随后处理一条 `created_at` 越过该未来样本的反馈 → `_drain_pending` 把它按**已固定 direction** 转成正式证据、`evidence_count`/`evidence.py` 计数一致、该 pending 行被删除；④同一反馈重复处理 → 不写第二行、不重复计数、无新事件；⑤同一批数据用 `rebuild_all()` 重放 → 语义投影与在线一致（含事件 `detail_json`）；**K13 `PENDING_ID_UPPER_BOUND`（v12 P1-4）**：缓冲区里存在 `feedback_id` 大于当前 trigger 的行（由重建预置或乱序写入构造）→ ①不参与 direction/unit/REQUIRED 计算 ②**不被删除**（`pending_future_id` 计数正确）③后续 id 追上的触发到来时才参与；**K14 `FUTURE_OUT_OF_RANGE`（v12 P2-2，v13 补充）**：新候选 `created_at > as_of + 30d` → 不写 pending、不写证据、`info.future_out_of_range` 计数正确，且该次调用不产生任何状态迁移；**已有 pending 行**越界（`created_at > as_of + FUTURE_SKEW_MAX`）→ 在同一 `_pending_window` 事务内被 **DELETE**、计 `pending_out_of_range_dropped`，与 `future_out_of_range` 是两个计数，`rebuild_all()` 重放后行数与计数一致；**K15 `APPLY_CURSOR_ORDER`（v13 引入，v15 重写为方案 A，P1-2）**：全程不使用任何手工 ID，只走真实 `POST /feedback` → ①依次提交 3 条并各调一次 `apply_pending_updates()`：按 id 升序处理、`processed` 与游标单调推进、每次 `memory_apply_cursor.updated_at` 非空 ②**中间空洞**：先处理第 4 条，再用 K20 的构造在序列中留出空洞、随后提交两条，使 `rows` 呈 `[cursor+1, cursor+3]` → 两行都处理、`id_gap_skipped == 1`、`id_gap_detail` 恰一段 ③**首行前空洞**：清空反馈表并让 `sqlite_sequence` 前进若干后再提交 → `id_gap_skipped` 等于空号数、照常处理 ④**失败回滚**：让第 2 条的处理抛异常 → 整个事务回滚、游标仍停在第一条之前、该批证据与事件均未落库、后续行仍未处理；恢复后重跑从同一点继续 ⑤**契约断言**：文档禁止手工指定 `feedbacks.id`，本测试文件内**不存在任何** `INSERT INTO feedbacks (id, ...)`；真实 HTTP 并发由 K19 覆盖；**K16 `DRAIN_BEFORE_STALE`（v13 P1-2）**：记忆 `last_supported_at = T0`，`as_of = T0 + 61 天` 已超 stale；缓冲区有一条 `created_at = T0 + 55 天` 的 supports（此前因未来被跳过）→ 新触发 `as_of = T0 + 62 天` 到来：①断言**先 drain** 把它写成正式证据、`last_supported_at` 刷新为 `T0+55 天` ②随后 stale 判定为"未超 60 天"→ **不归档**、`status` 保持原值（若顺序颠倒则会被 `archived`，测试即失败）③`apply_feedback` 的调用顺序用日志/事件顺序断言 ④`rebuild_all()` 复现同一结果；**K17 `PENDING_ORPHAN_ON_CLOSE`（v13 P1-2 配套）**：`weakened → resolved` 时缓冲区里仍有 2 条属于旧轮的 pending（未来行）→ 断言 ①两行被删除、`info.pending_episode_closed=2` ②没有孤儿行（`memory_pending_evidence` 中不存在 `episode < memory.episode` 的行）③新轮候选边界仍为 `pending_start_feedback_id`、后续反馈照常进新轮 ④重建后行数一致；**K18 `DRAIN_BATCH_TRANSITIONS`（v13 P1-3）**：缓冲区一次性含 1 条 supports + 3 条 contradicts（全部满足窗口与 ID 上界、`as_of` 同时到达）→ ①一次性 drain 后 `status=resolved`（不是 `weakened`）②`contradict_count=3`、`supports` 行 1 条 ③事件恰好 2 条：`pending_drained`（`consumed=4`、`evidence_ids` 升序、`neutral_dropped`）+ `resolved`（`from_status="weakened"`）④`pending_*` 已固定、旧轮 pending 被清理 ⑤同批再调用一次 → 0 消费、不写事件、状态不变 ⑥`rebuild_all()` 后事件投影逐字节一致 |
+| pending 缓冲区（v14 补充，v15 扩至 K19–K23） | K19–K23 | **K19 `CONCURRENT_FEEDBACK_ORDER`**：两个线程同时 POST `/feedback`（真实 HTTP，不手工插 ID）→ ①两条各被处理一次 ②`last_applied_feedback_id == MAX(feedbacks.id)` ③无阻塞类错误 ④与 `rebuild_all()` 语义投影相等；**K20 `CURSOR_GAP_FROM_FAILED_INSERT`（v15 P1-3 重写）**：用**已提交的失败 INSERT** 制造真实空洞（**不用事务回滚**，因为回滚分配的 ROWID 会被复用）——对 `feedbacks` 的 NOT NULL 列执行 `INSERT OR IGNORE` 触发约束失败：①断言 `feedbacks` 行数不变、该 id 从未出现 ②断言 `sqlite_sequence.seq` 已推进（记录前后值）③随后正常 `POST /feedback` 得到更大的 id ④调 `apply_pending_updates()` → 越过空洞、`id_gap_skipped` 等于空洞数、两行照常处理、与无空洞时结果一致；**若该构造在本机 SQLite 上不产生空洞，测试必须以「无法构造空洞」失败并留下日志**（禁止改成假定空洞存在，也禁止修改 ID 分配规则）；**K21 `CURSOR_AFTER_DELETE`**：建 3 条并处理 → `DELETE /feedback` → 五表全空、cursor 等于清空前 `sqlite_sequence` 高水位（非 0）→ 再提交 1 条 → 被正常处理、未回放历史、序列未被重置；**K22 `DRAIN_STALE_PRIORITY`**：`last_supported_at = T0`、`as_of = T0+62d`、drain 批次 3 条有效 contradicts 无 supports → ①最终 `archived`、**不出现 `resolved`** ②事件恰 2 条且顺序 `pending_drained` → `archived`（`reason=\\"stale_as_of\\"`）③旧轮 pending 关轮清理 ④在线与 `rebuild_all()` 投影一致；**K23 `CURSOR_UPDATED_AT_NOT_NULL`（v15 P1-1）**：①正常链路**不传** `now` 调 `/feedback` → 处理成功、`memory_apply_cursor.updated_at` 非空且是合法时间字符串、无 NOT NULL 异常；②注入固定 `now=X` → 整批游标 `updated_at == X`、收尾 stale pass 用同一 `X`（事件 `as_of` 与归档判定同刻）；③`write_cursor(feedback_id, None)` 被 `database.py` 直接拒绝（不做隐式补时间） |
 | 轮次 | U1–U25 | 反证 → `weakened`；+新支持强度 ≥0.5 → `active`；≥3 反证 → `resolved` 且固定 `pending_*`；`resolved` 后新轮达门槛 → `episode=2` + 计数从 0 + **旧证据仍是 `episode=1` 且未被搬动**；**`task_performance` 新轮 2 条 `completed`（REQUIRED=3）→ pending 2 行、正式 evidence 0 行、`status` 仍 `resolved`**；**数量够但方向不可定（完成率 0.67）→ 不晋升、不写事件、缓冲区保留**；第三条促成方向 → 一次性晋升；`archived` 后单条反馈 **不复活**；`archived` 后达门槛 → `episode+1` + 不新建行；`strength` 随证据升/随时间降/随反证降；`weakened` 期间新支持不换轮；**当前轮追加 3 条支持后 `evidence_count == COUNT(evidence)` 且 `episode` 全为当前轮**；**连续反证但不被支撑超 60 天后新反馈到来 → 先 `archived`、该反证进新轮 pending、`last_supported_at` 未被反证刷新**；**U21 `PROMOTE_BY_UNIT_PERFORMANCE`（v12 P1-1）**：`task_performance` 新轮 3 条有效样本、其中 1 条 `completed` → 完成率 1/3 = 0.33（`low`）、`samples=3 ≥ REQUIRED=3`、`supports=2 < 3` → **必须晋升**，断言 `status=active`、`episode+1`、`evidence_count=2`（supports 行）、`value_json.samples=3`；**U22 `PROMOTE_BY_UNIT_TIME_PATTERN`（v13 修正样本）**：同一 `difficulty=hard` 的 5 条有效样本，`ratio = actual/estimated` 分别为 **2.0 / 1.8 / 1.6 / 1.2 / 0.3**（5 组可比样本来自 6 条反馈：第 6 条 `estimated_minutes = 0`，按 §5.2 第 2 条既不参与比例、也不计入 `samples`；其余 5 条 `estimated` 均为 10 分钟，`actual` 分别为 20/18/16/12/3）→ 排序后中位数 = **1.6 ≥ 1.5 → `slow`**；按 §5.2 映射：`ratio ≥ 1.5` 的 2.0/1.8/1.6 是 **supports=3**、`ratio ≤ 0.4` 的 0.3 是 **contradicts=1**、`0.4 < 1.2 < 1.5` 是 **neutral=1**；`samples=5 ≥ REQUIRED=4`、`supports=3 < 4` → **必须按 samples 晋升**；断言 ①`status=active` ②`memory_evidence` 恰好 4 行（3 supports + 1 contradicts）③`ratio=1.2` 那条**没有** evidence 行、`neutral_dropped=1` ④`value_json.median_ratio=1.6`、`samples=5`；**U23 `PROMOTE_BY_SUPPORTS_DIFFICULTY`**：`difficulty` 2 条"难度太高"失败 + 3 条中性失败（`reason=临时有事情`）→ `supports=2 ≥ REQUIRED=2` 晋升，且 neutral 未计入 supports；**U24 `PERFORMANCE_DENOMINATOR_INCLUDES_CONTRADICTS`（v13 重写：task_performance 没有 neutral 类型）**：5 条样本 = **2 completed + 3 partial（全部 `reason=任务难度太高`）**；`completion_rate = 2/5 = 0.4 ≤ 0.5 → low`、`samples=5 ≥ 3`、`supports`= 非 completed = **3**、`contradicts` = completed = **2**；断言 ①若把 contradicts 排除在分母外会得到 2/2 = 1.0 并翻转成 `high`，故必须断言 `value_json.completion_rate == 0.4` 且 `direction == "low"` ②`memory_evidence` 5 行（3 supports + 2 contradicts）③代码里**不存在** task_performance 的 neutral 分支（`info.neutral_dropped` 不因该类型增加）；**U25 `NEUTRAL_IN_MEDIAN_RATIO`（v13 修正样本）**：`difficulty=hard` 的 4 条样本 `ratio = 2.0 / 1.9 / 1.6 / 1.2` → 排序 [1.2, 1.6, 1.9, 2.0]，中位数 = **(1.6+1.9)/2 = 1.75 ≥ 1.5 → `slow`**；supports = 2.0/1.9/1.6 = 3、neutral = 1.2 = 1、contradicts = 0；`samples=4 ≥ 4` → 晋升；断言 ①`value_json.median_ratio == 1.75`、`samples=4`（**若先剔除 neutral，中位数为 1.9 → 结论同为 slow 但 samples=3 不达门槛，会误判为不晋升**）②`memory_evidence` 3 行 ③neutral 行不进证据、`neutral_dropped=1` |
 | 冲突与不足 | C1–C6 | 交替证据 → `weakened` 且 contradicts 计数正确；单条不生成；`REQUIRED-1` 不生成；`REQUIRED` 生成且 `strength ≤0.6` 且带「初步观察：」；`STABLE` 后 `strength ≤0.9`；未知枚举不生成 |
 | 来源追溯 | E1–E6 | `active` 记忆 ≥1 证据；证据 `feedback_id` 真实存在（JOIN）；`plan_id` 与反馈一致；**当前轮追加的每条证据 `plan_id`/`created_at` 与其反馈行完全一致**（P0-1 追溯）；`created` 事件存在；`resolved` 事件 `detail_json` 含 `from_status/to_status` |
 | 删除 | X1–X8 | **五表清空**（events/evidence/pending/memories/feedbacks）且游标**不重置为 0**（等于清空前高水位，v14 P1-3）；无悬空 evidence 与 pending 行；**无 `deleted` 事件残留**；重复删除幂等；删除后 `rebuild_all()` 不复活任何记忆；索引与外键式一致性检查通过 |
 | 重建 | B1–B16 | `rebuild_all(now=X)` 与逐条在线更新按 §5.3.8 的**语义字段投影相等**比较（两侧注入同一 `now`；**不比较各表自增 id 与 `memory_pending_evidence.recorded_at`**；两张子表的 `memory_id` 先按 `(memory_type, subject_key)` 换成业务键再比；`episode_start_feedback_id`、`pending_*`、四个时间列均在比较集合内）；末尾 now pass 单独断言（只影响"当前已 stale"者）；`memory_evidence.created_at` 一律等于候选反馈的 `created_at`，时间戳乱序/同秒不改变结果；episode 边界、pending 归属与晋升时刻可复现；**回放到第 N 条时不读取 `id > N` 的未来反馈**（库中预置更大 id 行）；**40 天前的历史反馈不因重建时刻被错误排除**（`as_of` 取该反馈 `created_at`）；**A 形成记忆 → 61 天后归档 → B/C 进 pending → 重建后 status/episode/pending 归属/正式证据与在线一致**；**在线追加 3 条支持后重建 → evidence 行数、`relation`、`episode`、`evidence_count` 与在线完全一致**；**同 `now` 连续重建两次 → `memory_events.created_at`、`learning_memories.first_seen_at`、`episode_started_at`、`updated_at` 逐值相等**；超过 5000 条 → `rebuild_too_large` 且不写；**B14 `DETAIL_JSON_PROJECTION`（v12 P1-5）**：构造两套**自增 id 必然不同**的派生库（同一批反馈、不同插入批次），分别在线更新与 `rebuild_all()` 生成事件 → 断言 `detail_json.evidence_ids` **存的是 feedback_id 且升序**、`json.loads` 后按 `sort_keys` 序列化**逐字节相等**、`event_type/created_at` 相等；再断言同一事件的 `detail_json` 在两次重建后完全相同（不允许出现自增 id 或 `now()` 痕迹） |
 | 时间戳乱序明细（不单独占编号，属重建组 B12–B13） | 明细 | **B12 负 age 防护（v11 变量隔离）**：`strength` 同时受 `unit`、`contradicts` 惩罚与 `recency` 影响，因此第二条反馈**必须用 neutral 样本**（例：`status=partial` + `reason=临时有事情`，或 `0.4<ratio<1.5` 的用时样本），保证 ①`unit` 不变 ②`contradicts` 不变 ③`direction` 不变，只留 `as_of` 这一个自变量。步骤：先处理 `created_at=2026-01-10` 的 supports（记为 S1）；再处理 `feedback.id` 更大但 `created_at=2026-01-05` 的 **neutral** 反馈（N2）；断言 ④N2 不写 `memory_evidence`、`evidence_count` 与 `strength` 的 `unit`/`contradicts` 分量不变 ⑤`last_supported_at` 仍为 `2026-01-10`（不回拨） ⑥`age_days == 0` ⑦`recency == 1.0` ⑧`strength` 与"仅 S1、as_of=01-10"时的值**逐值相等**（既不上升也不下降）。**B13 在线/重建一致**：同一批乱序数据，在线逐条 `apply_feedback` vs `rebuild_all()`，按 §5.3.8 语义投影比较 `last_supported_at`、`strength`、`evidence_count`、`episode` 与证据行（不含自增 id / `recorded_at`） |
-| 重建（v14 补充，P1-5/P2-1） | B15–B16 | **B15 `PENDING_DRAINED_DETAIL_JSON`**：同一批数据在线更新一次、`rebuild_all()` 两次（两套不同自增 id 的库）→ 三处 `pending_drained` 的 `detail_json` 逐字节相等，键集合恰为 `as_of/episode/evidence_ids/consumed/neutral_dropped`（同批无迁移时不出现 `from_status`/`to_status`）；**B16 `CURSOR_PROJECTION`**：在线推进到 id=N 后 `rebuild_all(now=X)` → `last_applied_feedback_id == N`、`updated_at` 不参与比较；清空后 `rebuild_all()` 把 cursor 推到 `MAX(feedbacks.id)`（空表为 0） |
+| 重建（v14 补充，P1-5/P2-1） | B15–B16 | **B15 `PENDING_DRAINED_DETAIL_JSON`**：同一批数据在线更新一次、`rebuild_all()` 两次（两套不同自增 id 的库）→ 三处 `pending_drained` 的 `detail_json` 逐字节相等，键集合恰为 `as_of/episode/evidence_ids/consumed/neutral_dropped`（同批无迁移时不出现 `from_status`/`to_status`）；**B16 `CURSOR_PROJECTION`（v15 P2-1 扩写）**：①在线推进到 id=N 后 `rebuild_all(now=X)` → `last_applied_feedback_id == N`、`updated_at` 不参与比较；②**删除 → rebuild → 新增**：建 3 条并处理 → `DELETE /feedback` → cursor 等于清空前高水位 H（非 0）→ `rebuild_all()` → cursor **仍为 H，不回退到 0** → 新增 1 条（id > H）→ 被正常处理、`id_gap_skipped == 0`（已删 id 不被记成新 gap）、不回放已删历史
 | 短期上下文 | P1–P5 | `collect_short_term` 处理 `exists=False` 与 `error_type`；渲染 ≤1200 字符；注入块含边界标记与"不是指令"声明；`task/reason` 截断与换行折叠；**最终 draft prompt 含当前计划信息**（Native 与 LangGraph 两条路径各一条，P1-F）；空上下文时旧消息字节不变 |
 | Tool 层 | T1–T6 | 三处 schema 一致；4 值枚举；非法 type 拒绝；`limit=99` 拒绝；返回结构含 `episode`；总字符 ≤2000 |
 | 安全 | Q1–Q5 | 无写记忆 Tool（精确集合）；模型文本进不了 `content`；grounding 判违规；`search_knowledge` 不含记忆字段；注入块含不可信标记 |
@@ -1060,7 +1094,7 @@ reason: FeedbackReason | None = None
 
 | 文件 | 类型 | 改动 |
 | --- | --- | --- |
-| `database.py` | 改 | `SCHEMA_VERSION` 7；`_migration_v7_learning_memory`；§4.3 的 17 个函数（含 pending 五件套、`get_evidence`、游标 `read_cursor`/`write_cursor`）；`insert_feedback()` 返回 `lastrowid`；`_migration_v7_learning_memory` 末尾**真实 INSERT** 游标行（空库 0、老库 `COALESCE(MAX(id),0)`）；`delete_all_feedback()` **五表**级联，并在同一事务内把游标写成**清空前的高水位**（`COALESCE(sqlite_sequence.seq, MAX(id))`，**不是 0**） |
+| `database.py` | 改 | `SCHEMA_VERSION` 7；`_migration_v7_learning_memory`；§4.3 的 17 个函数（含 pending 五件套、`get_evidence`、游标 `read_cursor`/`write_cursor`）；`insert_feedback()` 返回 `lastrowid`；`_migration_v7_learning_memory` 末尾**真实 INSERT** 游标行（空库 0、老库 `MAX(COALESCE(sqlite_sequence.seq,0), COALESCE(MAX(id),0))`）；`delete_all_feedback()` **五表**级联，并在同一事务内把游标写成**清空前的高水位**（同式 `MAX(seq, MAX(id))`，**不是 0**）；`rebuild_all()` 收尾写回 `max(read_cursor(), MAX(id))`（**不回退**） |
 | `memory_service.py` | **新增** | §4.2 接口 + §5.3 状态机（`apply_pending_updates` 游标循环 / `apply_feedback` / `_drain_pending` / `_pending_window` / `_materialize_stale` / `_append_pending` / `_try_promote`）+ 模板 + 规则/门槛常量（约 650–780 行） |
 | `memory_context.py` | **新增** | `collect_short_term`（I/O）+ `render_short_term`（纯函数）（约 140 行） |
 | `agent_tools.py` | 改 | `get_learning_memory()` + 3 个预算常量 |
@@ -1084,7 +1118,7 @@ reason: FeedbackReason | None = None
 | 序 | 任务 | 优先级 | 依赖 | 预估 | 验收 |
 | --- | --- | --- | --- | --- | --- |
 | 0 | 服务端枚举（`Literal` + `reason_required` + 改 `test_feedback_plan_link.py`）| **P0** | — | 0.3 天 | V1–V8；既有测试全绿 |
-| 1 | V7 迁移（**五张表**，含 `memory_apply_cursor` **初始化插入**）+ **17 个 DB 函数**（含 `read_cursor`/`write_cursor`）+ 五表级联删除与**清空前写回高水位** + 迁移/删除测试 | **P0** | 0 | **1.0 天** | M1–M9、X1–X8 |
+| 1 | V7 迁移（**五张表**，含 `memory_apply_cursor` **初始化插入**）+ **17 个 DB 函数**（含 `read_cursor`/`write_cursor`）+ 五表级联删除与**清空前写回高水位** + 迁移/删除测试 | **P0** | 0 | **1.1 天** | M1–M10、X1–X8 |
 | 2 | `normalize_subject` + `render_content` + N 组 | **P0** | 1 | 0.3 天 | 纯函数单测 |
 | 3 | `apply_feedback` 单一入口（§5.2 候选规则 + §5.3 状态机，含 time_pattern 的 key 分派）+ `evaluate()` 四类规则（含 neutral）+ **pending 缓冲区、过期清理与原子晋升** + `_materialize_stale` + 追加证据写入与核对 + S/H/D/K/U/C/E 组 + **处理游标与升序批量（§5.3.3.2）** + **drain/stale 定序与关轮清理** + **批量状态机与事件上限** + **stale 优先于 resolved** + **与锁顺序无关的升序批量（真实并发、ID 空洞、清空后高水位）** | **P0** | 1,2 | **5.3 天** | 全绿；重点中途审查 |
 | 4 | `retrieve()` + `rebuild_all()`（as-of 回放 + 收尾游标前进）+ 语义投影比较器（含 `memory_apply_cursor`）+ R/B 组 + 标注集 | **P0** | 3 | **1.6 天** | P@3/R@3 达标；重建与在线**语义投影相等**（§5.3.8） |
@@ -1094,7 +1128,7 @@ reason: FeedbackReason | None = None
 | 8 | `agent_system` v2 + grounding 扩展 | P2 | 6 | 0.3 天 | 违规用例被判出 |
 | 9 | `docs/STAGE2-LEARNING-MEMORY.md` | P2 | 全部 | 0.3 天 | 含真实测试输出 |
 
-合计约 **10.5 人日**（v2 5.6 → v3 6.5 → v4 6.8 → v5 7.7 → v6 7.9 → v7 8.0 → v8 8.0 → v10 8.0 → v11 8.2 → v12 8.7 → v13 9.8 → **v14 10.5**：任务 3 4.8→**5.3**（方案 A 游标语义重写、stale 优先于 resolved、真实并发/空洞/清空后高水位用例）、任务 1 0.9→**1.0**（cursor 初始化插入与清空时高水位写回）、任务 4 1.5→**1.6**（B15 事件逐字节、B16 游标投影）；v13：任务 3 4.0→4.8（游标与升序批量、drain 先于 stale、关轮清理、批量状态机与事件上限）、任务 1 0.8→0.9、任务 4 1.3→1.5；分项相加 0.3+**1.0**+0.3+**5.3**+**1.6**+0.6+0.5+0.3+0.3+0.3 = **10.5**）。
+合计约 **10.5 人日**（v2 5.6 → v3 6.5 → v4 6.8 → v5 7.7 → v6 7.9 → v7 8.0 → v8 8.0 → v10 8.0 → v11 8.2 → v12 8.7 → v13 9.8 → v14 10.5 → **v15 10.6**：任务 3 4.8→**5.3**（方案 A 游标语义重写、stale 优先于 resolved、真实并发/空洞/清空后高水位用例）、任务 1 0.9→**1.0**（cursor 初始化插入与清空时高水位写回）、任务 4 1.5→**1.6**（B15 事件逐字节、B16 游标投影）；v13：任务 3 4.0→4.8（游标与升序批量、drain 先于 stale、关轮清理、批量状态机与事件上限）、任务 1 0.8→0.9、任务 4 1.3→1.5；分项相加 0.3+**1.1**+0.3+**5.3**+**1.6**+0.6+0.5+0.3+0.3+0.3 = **10.6**）。
 
 **交付节奏**：P0（任务 0–4）一个 PR；P1/P2 另一个 PR。任务 3 风险最高，建议单独 push 一次供中途审查。
 
@@ -1113,9 +1147,9 @@ reason: FeedbackReason | None = None
 | pending 缓冲区无界增长 | 方向长期不可定（如完成率长期 0.6）时过期候选一直留在表里 | 每次 `_try_promote` **第 0 步**删除超 30 天窗口的行并计 `info.pending_expired`，与晋升同事务；上界 = 窗口内候选数；K10 专测 |
 | 增量证据只存计数 | `feedback3/4/5` 无法追溯、`MAX(feedback_id)` 不推进、重复调用识别失败 | §5.2 八条规则写死"一条被计入的反馈 = 一行证据"、计数一律 `COUNT` 重算、`inserted=False` 必读回核对；D8/D9/U19/B10 专测 |
 | 方向未定与证据不可变冲突 | 新轮 direction 尚不可算时，`relation` 无法确定；沿用旧方向会判错，先猜再改又违反不可变 | **原始候选缓冲区 `memory_pending_evidence`**（无 relation 列）+ 方向确定后一次性转正（§5.3.2/§5.3.3）；K 组专测 |
-| 在线处理顺序被并发打乱（v13/v14） | 后插入的较大 id 先拿到记忆事务，会算出与 `rebuild_all()` 相反的结论（例：在线 `resolved`、重建 `active`） | **方案 A**：`memory_apply_cursor` 持久化「已处理到哪条现存记录」，每次处理**全部** `id > cursor` 的行并按 id 升序推进，因此锁顺序不影响处理顺序；**不要求 id 连续**（失败 INSERT 会留永久空洞，按连续检查必然卡死，v14 修正）；禁止手工补录 id，补录走 `rebuild_all()`；K15/K19/K20 专测 |
+| 在线处理顺序被并发打乱（v13/v14） | 后插入的较大 id 先拿到记忆事务，会算出与 `rebuild_all()` 相反的结论（例：在线 `resolved`、重建 `active`） | **方案 A**：`memory_apply_cursor` 持久化「已处理到哪条现存记录」，每次处理**全部** `id > cursor` 的行并按 id 升序推进，因此锁顺序不影响处理顺序；**不要求 id 连续**（空洞可能来自已提交的失败 INSERT；完整事务回滚分配的 ROWID 会被复用，v15 修正原理）；禁止手工补录 id，补录走 `rebuild_all()`；空洞只累计 `id_gap_skipped`；K15/K19/K20/K23 专测 |
 | drain 早于 stale 被写反（v13/v14） | 已到期但尚未消费的 supports 还没刷新 `last_supported_at`，记忆就被 60 天 stale 归档，样本随关轮被清 | §5.3.4 固定**先 `_drain_pending`、后 `_materialize_stale`**；**drain 内部写完证据后还要先判 stale**（v14 P1-6），否则一批反证会先 `resolved` 再 `archived`、写出三条事件并立刻作废边界；K16（T0 / T0+55d / T0+62d）、K22（超 60 天 + 3 条反证）专测 |
-| 游标初始化 / 空洞 / 清空后（v14） | cursor 初值 0 会把老库历史当待处理（违反「不回填」）；把空洞当缺口会永久卡死；`DELETE` 后归零会让新反馈永久阻塞 | 迁移末尾真实 `INSERT`（空库 0、老库 `MAX(id)`）；空洞只记 `info.id_gap_skipped` 并照常处理；`DELETE` 前读 `sqlite_sequence` 高水位并写回、不重置序列；M7–M9、X7–X8、K20/K21 专测 |
+| 游标初始化 / 空洞 / 清空后 / 重建回退（v14，v15 扩） | cursor 初值 0 会把老库历史当待处理（违反「不回填」）；升级前已清空的老库只取 `MAX(id)` 会落到 0；把空洞当缺口会永久卡死；`DELETE` 后归零会让新反馈永久阻塞；`rebuild_all()` 写 `MAX(id)` 会把高水位降回 0 | 迁移末尾真实 `INSERT`，初值 = `MAX(COALESCE(sqlite_sequence.seq,0), COALESCE(MAX(id),0))`；`DELETE` 前读同一高水位写回、**不重置序列**；`rebuild_all()` 写回 `max(read_cursor(), MAX(id))`（**不回退**）；空洞只累计 `info.id_gap_skipped` 并照常处理；`apply_pending_updates()` 事务前求值一次 `effective_now`，`updated_at` 永不写 None；M7–M10、X7–X8、K20/K21/K23 专测 |
 | 越界未来 pending 只计数不删（v13） | 时钟跳变后缓冲区残留永远无法生效的行，`future_out_of_range` 计数与表内容不一致 | `_pending_window` 在同一事务内**原地 DELETE** 已越界行，计 `pending_out_of_range_dropped`（与 `future_out_of_range` 分开），K14 断言行数与计数在 rebuild 后一致 || 重建边界漂移 | 重建用真实当前时间取窗口，会把历史反馈错误排除 / 把未来反馈提前读入 | 统一 `as_of = trigger.created_at` + `candidate.id <= trigger.id` + 窗口 `as_of−30d ≤ created_at ≤ as_of`（§5.2）；B 组三条专门用例 |
 | stale 归档不可重放 | 归档时刻没持久化，重建时 pending 归属错乱 | stale 改为 `as_of − last_supported_at > 60d` 的**派生判定**，处理每条反馈前先 `_drain_pending` 再 materialize（§5.3.4，v13 定序）；`archive_stale()` 只说"批量化"，不再是唯一入口 |
 | 自动裁决出错 | 误判 weakened/resolved | 全留痕；可 reopened / 复活；记忆只作依据 |
