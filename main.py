@@ -1,6 +1,6 @@
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import json
 
@@ -54,6 +54,20 @@ import model_usage
 model_usage.install()
 
 
+# 反馈枚举（第二阶段 Task 0）：取值范围在服务端定死，前端选项只是提示。
+# 历史库里可能存在任意字符串（旧前端/直接调 API 写入），读取侧必须 fail-closed，
+# 不能把脏值当成合法记忆证据。
+FeedbackStatus = Literal["completed", "partial", "not_completed"]
+
+FeedbackReason = Literal[
+    "任务时间太长",
+    "任务难度太高",
+    "临时有事情",
+    "今天状态不好",
+    "其他",
+]
+
+
 class Feedback(BaseModel):
     task: str = Field(min_length=1)
 
@@ -61,9 +75,9 @@ class Feedback(BaseModel):
 
     actual_minutes: int = Field(ge=0)
 
-    status: str
+    status: FeedbackStatus
 
-    reason: str | None = None
+    reason: FeedbackReason | None = None
 
     completed_subtasks: int = Field(
         default=0,
@@ -396,6 +410,18 @@ def feedback(data: Feedback):
                     "error_type": "plan_task_mismatch",
                 },
             )
+
+    # reason 的条件必填只能放在路由体内：Pydantic 的 Literal 管取值范围，
+    # 「未完成必须说明原因」是业务规则，返回 400（带 error_type）而不是 422。
+    # 顺序在 plan_id / 任务名校验之后，与既有测试的依赖顺序一致。
+    if data.status in ("partial", "not_completed") and not (data.reason or "").strip():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": "未完成或部分完成时必须说明原因",
+                "error_type": "reason_required",
+            },
+        )
 
     created_at = datetime.now().isoformat()
 

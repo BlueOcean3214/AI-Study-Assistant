@@ -31,7 +31,7 @@ class ActivePlanExistsError(RuntimeError):
 # ==========================
 
 # 当前 schema 版本：每次结构变更追加一个迁移函数，禁止修改已有迁移
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 
 def _migration_v1_feedbacks(conn):
@@ -156,6 +156,180 @@ def _migration_v6_feedback_plan_link(conn):
     )
 
 
+def _read_feedback_high_water(conn):
+    """feedbacks 的已用高水位：max(sqlite_sequence.seq, MAX(id))。
+
+    为什么不能只看 MAX(id)：旧版 delete_all_feedback() 只 DELETE 不清序列，
+    表被清空后 MAX(id) 回到 0，而下一个反馈会拿到「旧序列 + 1」。只按 MAX(id)
+    初始化游标会把这段历史 id 区间当成待处理空洞。sqlite_sequence 表只在存在
+    AUTOINCREMENT 表时才被创建，因此先查存在性。
+    """
+
+    seq = 0
+
+    has_sequence = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'"
+    ).fetchone()
+
+    if has_sequence is not None:
+        row = conn.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'feedbacks'"
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            seq = int(row[0])
+
+    row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM feedbacks").fetchone()
+    max_id = int(row[0] or 0) if row is not None else 0
+
+    return max(seq, max_id)
+
+
+def _migration_v7_learning_memory(conn):
+    """v7：学习记忆五张表（memories / evidence / events / pending / cursor）。
+
+    - 只建结构，不给历史反馈回填任何记忆（无可靠依据，回填等于伪造）
+    - 游标行必须真实写入：列默认 0 只对「插入时的缺省」生效，只建表不插行
+      会让读取方拿到 NULL；初值取迁移时刻的已用高水位，保证升级不会把老库
+      的全部历史反馈当成待处理
+    - 五张表都用 IF NOT EXISTS + 唯一索引，可重复执行
+    """
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS learning_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_type TEXT NOT NULL,
+            subject_key TEXT NOT NULL,
+            subject_label TEXT NOT NULL,
+            content TEXT NOT NULL,
+            value_json TEXT NOT NULL,
+            strength REAL NOT NULL DEFAULT 0,
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            contradict_count INTEGER NOT NULL DEFAULT 0,
+            episode INTEGER NOT NULL DEFAULT 1,
+            episode_start_feedback_id INTEGER,
+            episode_started_at TEXT,
+            pending_episode INTEGER,
+            pending_start_feedback_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'active',
+            first_seen_at TEXT NOT NULL,
+            last_supported_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_type_subject "
+        "ON learning_memories(memory_type, subject_key)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_status_updated "
+        "ON learning_memories(status, updated_at)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            feedback_id INTEGER NOT NULL,
+            plan_id INTEGER,
+            episode INTEGER NOT NULL DEFAULT 1,
+            relation TEXT NOT NULL,
+            weight REAL NOT NULL DEFAULT 1.0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    # 一条反馈对同一条记忆只有一行；写入后 relation / episode 不再改（证据不可变）
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_memory_feedback "
+        "ON memory_evidence(memory_id, feedback_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_memory_episode "
+        "ON memory_evidence(memory_id, episode, relation)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_evidence_feedback "
+        "ON memory_evidence(feedback_id)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            event_type TEXT NOT NULL,
+            detail_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_memory "
+        "ON memory_events(memory_id, created_at)"
+    )
+
+    # 缓冲区不存 relation：方向未定时先入库，达门槛时再按已固定的 direction 判定
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_pending_evidence (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id INTEGER NOT NULL,
+            feedback_id INTEGER NOT NULL,
+            plan_id INTEGER,
+            episode INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        )
+        """
+    )
+
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_memory_feedback "
+        "ON memory_pending_evidence(memory_id, feedback_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_memory_episode "
+        "ON memory_pending_evidence(memory_id, episode)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_feedback "
+        "ON memory_pending_evidence(feedback_id)"
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_apply_cursor (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_applied_feedback_id INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+
+    migration_as_of = datetime.now().isoformat()
+
+    conn.execute(
+        """
+        INSERT INTO memory_apply_cursor (id, last_applied_feedback_id, updated_at)
+        SELECT 1,
+               MAX(COALESCE(
+                       (SELECT seq FROM sqlite_sequence WHERE name = 'feedbacks'), 0
+                   ),
+                   COALESCE((SELECT MAX(id) FROM feedbacks), 0)
+               ),
+               ?
+        WHERE NOT EXISTS (SELECT 1 FROM memory_apply_cursor WHERE id = 1)
+        """,
+        (migration_as_of,),
+    )
+
+
 # 迁移按版本号升序执行；每个迁移都必须可重复执行（IF NOT EXISTS / 存在性检查）
 MIGRATIONS = (
     (1, _migration_v1_feedbacks),
@@ -164,6 +338,7 @@ MIGRATIONS = (
     (4, _migration_v4_query_indexes),
     (5, _migration_v5_model_usage),
     (6, _migration_v6_feedback_plan_link),
+    (7, _migration_v7_learning_memory),
 )
 
 
@@ -320,14 +495,15 @@ def get_feedback_since(days=7, limit=20):
 
 
 def insert_feedback(feedback_data, created_at):
-    """写入一条学习反馈。
+    """写入一条学习反馈，返回新行的 feedbacks.id。
 
     plan_id 用 .get() 读取：既有调用方（测试、agent_eval）传来的 dict 没有这个键，
     必须保持“不带计划 ID 也能写”的旧行为。
+    返回值是第二阶段新增的（记忆更新要按 id 追溯来源），旧调用方忽略即可。
     """
 
     with sqlite3.connect(DATABASE_PATH) as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO feedbacks
             (task, estimated_minutes, actual_minutes, status, reason,
@@ -344,11 +520,591 @@ def insert_feedback(feedback_data, created_at):
                 feedback_data.get("plan_id"),
             ),
         )
+        return cursor.lastrowid
 
 
 def delete_all_feedback():
+    """清空反馈与由反馈派生的记忆数据（同一事务）。
+
+    顺序固定为子表 -> 父表：memory_events / memory_evidence /
+    memory_pending_evidence / learning_memories / feedbacks。
+    - 清空就是清空：不保留归档记忆，也不写 deleted 事件（写了也会被同事务删掉）
+    - 游标不重置为 0：DELETE 不会回退 sqlite_sequence，若把游标写回 0，之后新反馈
+      拿到「旧序列 + 1」，中间那段已删 id 会被当成待处理历史；因此写回清空前的
+      已用高水位，与新反馈的 id 正好衔接
+    """
+
     with sqlite3.connect(DATABASE_PATH) as conn:
+        high_water = _read_feedback_high_water(conn)
+        cleared_at = datetime.now().isoformat()
+
+        conn.execute("DELETE FROM memory_events")
+        conn.execute("DELETE FROM memory_evidence")
+        conn.execute("DELETE FROM memory_pending_evidence")
+        conn.execute("DELETE FROM learning_memories")
         conn.execute("DELETE FROM feedbacks")
+
+        conn.execute(
+            """
+            INSERT INTO memory_apply_cursor (id, last_applied_feedback_id, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                last_applied_feedback_id = excluded.last_applied_feedback_id,
+                updated_at = excluded.updated_at
+            """,
+            (high_water, cleared_at),
+        )
+
+
+# ==========================
+# 学习记忆：SQL 层（业务规则在 memory_service，本层只做读写）
+# ==========================
+
+# update_memory_state 允许改的列：白名单，避免把任意字段名拼进 SQL
+MEMORY_STATE_FIELDS = (
+    "content",
+    "value_json",
+    "strength",
+    "evidence_count",
+    "contradict_count",
+    "episode",
+    "episode_start_feedback_id",
+    "episode_started_at",
+    "pending_episode",
+    "pending_start_feedback_id",
+    "status",
+    "last_supported_at",
+    "updated_at",
+)
+
+
+def _require_int(value, name, minimum=None):
+    """严格整数校验：bool 不算整数，字符串不做隐式转换。"""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} 必须是整数，收到 {type(value).__name__}")
+
+    if minimum is not None and value < minimum:
+        raise ValueError(f"{name} 不能小于 {minimum}，收到 {value}")
+
+    return value
+
+
+def _require_text(value, name, allow_empty=False):
+    if not isinstance(value, str):
+        raise ValueError(f"{name} 必须是字符串，收到 {type(value).__name__}")
+
+    if not allow_empty and not value.strip():
+        raise ValueError(f"{name} 不能为空")
+
+    return value
+
+
+# ---------- 处理游标 ----------
+
+
+def read_cursor():
+    """读取最后一条已处理反馈的 id（没有游标行时返回 0，不写库）。"""
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            "SELECT last_applied_feedback_id FROM memory_apply_cursor WHERE id = 1"
+        ).fetchone()
+
+    if row is None or row[0] is None:
+        return 0
+
+    return int(row[0])
+
+
+def write_cursor(feedback_id, updated_at):
+    """写入游标（两参数，updated_at 必填非空）。
+
+    updated_at 是 NOT NULL 列，且不参与语义投影比较；调用方必须传入已求值的时刻
+    （例如 apply_pending_updates 在事务开始前算好的 effective_now），本层不做
+    None 兜底，避免把缺失的时间悄悄写成当前时刻。
+    """
+
+    _require_int(feedback_id, "feedback_id", minimum=0)
+    _require_text(updated_at, "updated_at")
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_apply_cursor (id, last_applied_feedback_id, updated_at)
+            VALUES (1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                last_applied_feedback_id = excluded.last_applied_feedback_id,
+                updated_at = excluded.updated_at
+            """,
+            (feedback_id, updated_at),
+        )
+
+
+# ---------- 记忆主体 ----------
+
+
+def _memory_row_to_dict(row):
+    return {
+        "id": row[0],
+        "memory_type": row[1],
+        "subject_key": row[2],
+        "subject_label": row[3],
+        "content": row[4],
+        "value_json": row[5],
+        "strength": row[6],
+        "evidence_count": row[7],
+        "contradict_count": row[8],
+        "episode": row[9],
+        "episode_start_feedback_id": row[10],
+        "episode_started_at": row[11],
+        "pending_episode": row[12],
+        "pending_start_feedback_id": row[13],
+        "status": row[14],
+        "first_seen_at": row[15],
+        "last_supported_at": row[16],
+        "updated_at": row[17],
+    }
+
+
+MEMORY_COLUMNS = (
+    "id, memory_type, subject_key, subject_label, content, value_json, strength, "
+    "evidence_count, contradict_count, episode, episode_start_feedback_id, "
+    "episode_started_at, pending_episode, pending_start_feedback_id, status, "
+    "first_seen_at, last_supported_at, updated_at"
+)
+
+
+def list_memories(memory_type=None, subject_key=None, status=None, limit=10):
+    """按类型 / 主题键 / 状态过滤，按 strength 降序返回。"""
+
+    limit = _require_int(limit, "limit", minimum=1)
+    limit = min(limit, 100)
+
+    sql = f"SELECT {MEMORY_COLUMNS} FROM learning_memories WHERE 1 = 1"
+    params = []
+
+    if memory_type is not None:
+        sql += " AND memory_type = ?"
+        params.append(memory_type)
+
+    if subject_key is not None:
+        sql += " AND subject_key = ?"
+        params.append(subject_key)
+
+    if status is not None:
+        sql += " AND status = ?"
+        params.append(status)
+
+    sql += " ORDER BY strength DESC, id ASC LIMIT ?"
+    params.append(limit)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    return [_memory_row_to_dict(row) for row in rows]
+
+
+def get_memory_by_key(memory_type, subject_key):
+    _require_text(memory_type, "memory_type")
+    _require_text(subject_key, "subject_key")
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            f"SELECT {MEMORY_COLUMNS} FROM learning_memories "
+            "WHERE memory_type = ? AND subject_key = ?",
+            (memory_type, subject_key),
+        ).fetchone()
+
+    return _memory_row_to_dict(row) if row is not None else None
+
+
+def insert_memory(memory, first_seen_at):
+    """插入记忆；唯一索引冲突时不抛错，返回 inserted=False。
+
+    调用方必须核对 inserted：把「已存在」当成「刚创建」会让事件与计数错乱。
+    """
+
+    _require_text(memory["memory_type"], "memory_type")
+    _require_text(memory["subject_key"], "subject_key")
+    _require_text(memory["content"], "content")
+    _require_text(memory["value_json"], "value_json")
+    _require_text(first_seen_at, "first_seen_at")
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO learning_memories
+            (memory_type, subject_key, subject_label, content, value_json, strength,
+             evidence_count, contradict_count, episode, episode_start_feedback_id,
+             episode_started_at, pending_episode, pending_start_feedback_id, status,
+             first_seen_at, last_supported_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory["memory_type"], memory["subject_key"],
+                memory["subject_label"], memory["content"], memory["value_json"],
+                memory.get("strength", 0), memory.get("evidence_count", 0),
+                memory.get("contradict_count", 0), memory.get("episode", 1),
+                memory.get("episode_start_feedback_id"),
+                memory.get("episode_started_at"),
+                memory.get("pending_episode"),
+                memory.get("pending_start_feedback_id"),
+                memory.get("status", "active"),
+                first_seen_at,
+                memory.get("last_supported_at", first_seen_at),
+                memory.get("updated_at", first_seen_at),
+            ),
+        )
+
+        inserted = cursor.rowcount == 1
+        return {"inserted": inserted, "row_id": cursor.lastrowid if inserted else None}
+
+
+def update_memory_state(memory_id, fields):
+    """更新状态必填列（白名单）。返回 True 表示确实更新到一行。"""
+
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    if not fields:
+        raise ValueError("fields 不能为空")
+
+    unknown = [name for name in fields if name not in MEMORY_STATE_FIELDS]
+    if unknown:
+        raise ValueError(f"不允许更新的字段：{unknown}")
+
+    assignments = ", ".join(f"{name} = ?" for name in fields)
+    params = list(fields.values()) + [memory_id]
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            f"UPDATE learning_memories SET {assignments} WHERE id = ?", params
+        )
+        return cursor.rowcount == 1
+
+
+# ---------- 证据 ----------
+
+
+def _evidence_row_to_dict(row):
+    return {
+        "id": row[0],
+        "memory_id": row[1],
+        "feedback_id": row[2],
+        "plan_id": row[3],
+        "episode": row[4],
+        "relation": row[5],
+        "weight": row[6],
+        "created_at": row[7],
+    }
+
+
+EVIDENCE_COLUMNS = (
+    "id, memory_id, feedback_id, plan_id, episode, relation, weight, created_at"
+)
+
+
+def insert_evidence(memory_id, feedback_id, plan_id, episode, relation, created_at,
+                    weight=1.0):
+    """插入一条证据；冲突时不覆盖（证据不可变）。
+
+    返回 {"inserted": bool, "row_id": int|None, "row": dict}：
+    调用方拿到 inserted=False 时必须读回已有行核对 relation / episode / plan_id，
+    不一致说明数据被改过，应报 data_inconsistency 而不是静默继续。
+    """
+
+    _require_int(memory_id, "memory_id", minimum=1)
+    _require_int(feedback_id, "feedback_id", minimum=1)
+    _require_int(episode, "episode", minimum=1)
+    _require_text(relation, "relation")
+    _require_text(created_at, "created_at")
+
+    if plan_id is not None:
+        _require_int(plan_id, "plan_id", minimum=1)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO memory_evidence
+            (memory_id, feedback_id, plan_id, episode, relation, weight, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (memory_id, feedback_id, plan_id, episode, relation, weight, created_at),
+        )
+
+        row = conn.execute(
+            f"SELECT {EVIDENCE_COLUMNS} FROM memory_evidence "
+            "WHERE memory_id = ? AND feedback_id = ?",
+            (memory_id, feedback_id),
+        ).fetchone()
+
+    return {
+        "inserted": cursor.rowcount == 1,
+        "row_id": cursor.lastrowid if cursor.rowcount == 1 else None,
+        "row": _evidence_row_to_dict(row) if row is not None else None,
+    }
+
+
+def get_evidence(memory_id, feedback_id):
+    _require_int(memory_id, "memory_id", minimum=1)
+    _require_int(feedback_id, "feedback_id", minimum=1)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(
+            f"SELECT {EVIDENCE_COLUMNS} FROM memory_evidence "
+            "WHERE memory_id = ? AND feedback_id = ?",
+            (memory_id, feedback_id),
+        ).fetchone()
+
+    return _evidence_row_to_dict(row) if row is not None else None
+
+
+def list_evidence(memory_id, episode=None, relation=None, limit=None):
+    """按 feedback_id 升序返回证据行（回放顺序固定）。"""
+
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    sql = f"SELECT {EVIDENCE_COLUMNS} FROM memory_evidence WHERE memory_id = ?"
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
+
+    if relation is not None:
+        _require_text(relation, "relation")
+        sql += " AND relation = ?"
+        params.append(relation)
+
+    sql += " ORDER BY feedback_id ASC"
+
+    if limit is not None:
+        limit = _require_int(limit, "limit", minimum=1)
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    return [_evidence_row_to_dict(row) for row in rows]
+
+
+def max_evidence_feedback_id(memory_id, episode=None):
+    """该记忆（可限定轮次）已计入的最大 feedback id；无证据返回 0。"""
+
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    sql = "SELECT COALESCE(MAX(feedback_id), 0) FROM memory_evidence WHERE memory_id = ?"
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(sql, params).fetchone()
+
+    return int(row[0] or 0)
+
+
+def count_evidence(memory_id, episode=None, relation=None):
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    sql = "SELECT COUNT(*) FROM memory_evidence WHERE memory_id = ?"
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
+
+    if relation is not None:
+        _require_text(relation, "relation")
+        sql += " AND relation = ?"
+        params.append(relation)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        row = conn.execute(sql, params).fetchone()
+
+    return int(row[0] or 0)
+
+
+# ---------- 事件 ----------
+
+
+def insert_memory_event(memory_id, event_type, detail_json, created_at):
+    _require_int(memory_id, "memory_id", minimum=1)
+    _require_text(event_type, "event_type")
+    _require_text(detail_json, "detail_json")
+    _require_text(created_at, "created_at")
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO memory_events (memory_id, event_type, detail_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (memory_id, event_type, detail_json, created_at),
+        )
+        return cursor.lastrowid
+
+
+def delete_all_memories():
+    """清空四张派生表（rebuild 用）；不动游标，也不动原始 feedbacks。
+
+    重建的输入是 feedbacks 全量重放，所以凡是「由 feedbacks 派生」的表都必须
+    一起清空：漏掉 pending 会让旧缓冲区在 rebuild 后把已重放过的证据再算一遍。
+    四张表在同一个事务里删，避免中途失败留下半清空状态。
+    """
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        conn.execute("DELETE FROM memory_events")
+        conn.execute("DELETE FROM memory_pending_evidence")
+        conn.execute("DELETE FROM memory_evidence")
+        conn.execute("DELETE FROM learning_memories")
+
+
+# ---------- pending 缓冲区 ----------
+
+
+def _pending_row_to_dict(row):
+    return {
+        "id": row[0],
+        "memory_id": row[1],
+        "feedback_id": row[2],
+        "plan_id": row[3],
+        "episode": row[4],
+        "created_at": row[5],
+        "recorded_at": row[6],
+    }
+
+
+def insert_pending(memory_id, feedback_id, plan_id, episode, created_at, recorded_at):
+    """写入待判定证据；同一 (memory_id, feedback_id) 只允许一行。"""
+
+    _require_int(memory_id, "memory_id", minimum=1)
+    _require_int(feedback_id, "feedback_id", minimum=1)
+    _require_int(episode, "episode", minimum=1)
+    _require_text(created_at, "created_at")
+    _require_text(recorded_at, "recorded_at")
+
+    if plan_id is not None:
+        _require_int(plan_id, "plan_id", minimum=1)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT OR IGNORE INTO memory_pending_evidence
+            (memory_id, feedback_id, plan_id, episode, created_at, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (memory_id, feedback_id, plan_id, episode, created_at, recorded_at),
+        )
+
+        inserted = cursor.rowcount == 1
+        return {"inserted": inserted, "row_id": cursor.lastrowid if inserted else None}
+
+
+def list_pending(memory_id, episode=None):
+    """按 feedback_id 升序返回某条记忆的缓冲区行，可按 episode 过滤。
+
+    memory_id 必填：缓冲区只服务于「某条记忆下次更新时重算」，脱离记忆的全局
+    列表没有明确语义，也容易在 rebuild/调试时被误当成「全部记忆的待判定证据」。
+    """
+
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    sql = (
+        "SELECT id, memory_id, feedback_id, plan_id, episode, created_at, recorded_at "
+        "FROM memory_pending_evidence WHERE memory_id = ?"
+    )
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
+
+    sql += " ORDER BY feedback_id ASC"
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    return [_pending_row_to_dict(row) for row in rows]
+
+
+def count_pending(memory_id, episode=None):
+    """返回某条记忆的缓冲区行数（可按 episode 过滤）。"""
+
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    sql = "SELECT COUNT(*) FROM memory_pending_evidence WHERE memory_id = ?"
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        return int(conn.execute(sql, params).fetchone()[0])
+
+
+def _require_pending_feedback_ids(feedback_ids):
+    """校验删除用的 feedback_id 列表，返回去重后的列表。"""
+
+    if isinstance(feedback_ids, (str, bytes)) or not hasattr(feedback_ids, "__iter__"):
+        raise ValueError("feedback_ids 必须是整数序列")
+
+    values = [_require_int(value, "feedback_id", minimum=1) for value in feedback_ids]
+
+    return list(dict.fromkeys(values))
+
+
+def delete_pending(memory_id, episode=None, feedback_ids=None):
+    """删除某条记忆的缓冲区行；返回实际删除行数。
+
+    episode 与 feedback_ids 都是可选收窄条件，同时给出时取交集。任何情况下都
+    以 memory_id 为硬边界，绝不会跨记忆删除；换到的行数只反映本条记忆的删除量。
+    """
+
+    _require_int(memory_id, "memory_id", minimum=1)
+
+    sql = "DELETE FROM memory_pending_evidence WHERE memory_id = ?"
+    params = [memory_id]
+
+    if episode is not None:
+        _require_int(episode, "episode", minimum=1)
+        sql += " AND episode = ?"
+        params.append(episode)
+
+    if feedback_ids is not None:
+        ids = _require_pending_feedback_ids(feedback_ids)
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        sql += f" AND feedback_id IN ({placeholders})"
+        params.extend(ids)
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(sql, params)
+        return cursor.rowcount
+
+
+def delete_expired_pending(memory_id, cutoff_created_at):
+    """删除某条记忆中 created_at 早于 cutoff 的缓冲区行；返回删除行数。"""
+
+    _require_int(memory_id, "memory_id", minimum=1)
+    _require_text(cutoff_created_at, "cutoff_created_at")
+
+    with sqlite3.connect(DATABASE_PATH) as conn:
+        cursor = conn.execute(
+            "DELETE FROM memory_pending_evidence WHERE memory_id = ? AND created_at < ?",
+            (memory_id, cutoff_created_at),
+        )
+        return cursor.rowcount
 
 
 # ==========================
