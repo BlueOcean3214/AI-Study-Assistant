@@ -1060,7 +1060,7 @@ reason: FeedbackReason | None = None
 
 | 文件 | 类型 | 改动 |
 | --- | --- | --- |
-| `database.py` | 改 | `SCHEMA_VERSION` 7；`_migration_v7_learning_memory`；§4.3 的 17 个函数（含 pending 五件套、`get_evidence`、游标 `read_cursor`/`write_cursor`）；`insert_feedback()` 返回 `lastrowid`；`delete_all_feedback()` **五表**级联并把游标重置为 0 |
+| `database.py` | 改 | `SCHEMA_VERSION` 7；`_migration_v7_learning_memory`；§4.3 的 17 个函数（含 pending 五件套、`get_evidence`、游标 `read_cursor`/`write_cursor`）；`insert_feedback()` 返回 `lastrowid`；`_migration_v7_learning_memory` 末尾**真实 INSERT** 游标行（空库 0、老库 `COALESCE(MAX(id),0)`）；`delete_all_feedback()` **五表**级联，并在同一事务内把游标写成**清空前的高水位**（`COALESCE(sqlite_sequence.seq, MAX(id))`，**不是 0**） |
 | `memory_service.py` | **新增** | §4.2 接口 + §5.3 状态机（`apply_pending_updates` 游标循环 / `apply_feedback` / `_drain_pending` / `_pending_window` / `_materialize_stale` / `_append_pending` / `_try_promote`）+ 模板 + 规则/门槛常量（约 650–780 行） |
 | `memory_context.py` | **新增** | `collect_short_term`（I/O）+ `render_short_term`（纯函数）（约 140 行） |
 | `agent_tools.py` | 改 | `get_learning_memory()` + 3 个预算常量 |
