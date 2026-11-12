@@ -1,0 +1,137 @@
+{
+  "sample_id": "S6",
+  "title": "刚被削弱，记忆不该进提示",
+  "scenario": "30 天内 6 次「高等数学极限练习」：前 5 次全部因难度太高没做完，最后一次突然 20 分钟做完。difficulty 与 task_performance 刚被判为 weakened，两条都不注入；只有 task_topic 仍注入。",
+  "feedbacks": [
+    {
+      "offset_days": -27,
+      "task": "高等数学极限练习",
+      "estimated_minutes": 45,
+      "actual_minutes": 75,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 3,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -24,
+      "task": "高等数学极限练习",
+      "estimated_minutes": 45,
+      "actual_minutes": 72,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 4,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -21,
+      "task": "高等数学极限练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 68,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 5,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -18,
+      "task": "高等数学极限练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 65,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 5,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -15,
+      "task": "高等数学极限练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 62,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 6,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -1,
+      "task": "高等数学极限练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 20,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 8,
+      "total_questions": 8
+    }
+  ],
+  "plan": null,
+  "current_user_request": "明天 40 分钟，极限这块继续练，上次做得挺顺。",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "任务名、时间戳与反馈数值均为构造数据，不代表真实用户"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "高等数学极限",
+        "subject_label": "高等数学极限练习",
+        "status": "weakened",
+        "strength": 0.434181,
+        "supports": 5,
+        "contradicts": 1,
+        "unit": 5,
+        "has_prefix": false,
+        "injected": false,
+        "content": "「高等数学极限练习」近期 5 次因难度太高未完成（30 天内）"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "高等数学极限",
+        "subject_label": "高等数学极限练习",
+        "status": "weakened",
+        "strength": 0.434181,
+        "supports": 5,
+        "contradicts": 1,
+        "unit": 6,
+        "has_prefix": false,
+        "injected": false,
+        "content": "「高等数学极限练习」近期 6 次任务完成率 17%"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "高等数学极限",
+        "subject_label": "高等数学极限练习",
+        "status": "active",
+        "strength": 0.9,
+        "supports": 6,
+        "contradicts": 0,
+        "unit": 6,
+        "has_prefix": false,
+        "injected": true,
+        "content": "「高等数学极限练习」近期反馈中 6 次出现"
+      }
+    ],
+    "must_not_exist": [
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "*",
+        "why": "没有计划行，缺少 estimated_minutes 基准"
+      }
+    ]
+  }
+}

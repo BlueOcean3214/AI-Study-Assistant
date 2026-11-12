@@ -1,0 +1,137 @@
+{
+  "sample_id": "S3",
+  "title": "先难后顺，困难与完成率记忆已被解决",
+  "scenario": "30 天内 6 次「Python列表推导式练习」：前 3 次难到做不完，最近 3 次全部完成。difficulty 与 task_performance 两条记忆已被判为 resolved（不再注入），只有 task_topic 仍为 active。",
+  "feedbacks": [
+    {
+      "offset_days": -26,
+      "task": "Python列表推导式练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 65,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 4,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -22,
+      "task": "Python列表推导式练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 60,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 5,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -18,
+      "task": "Python列表推导式练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 55,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 6,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -13,
+      "task": "Python列表推导式练习",
+      "estimated_minutes": 35,
+      "actual_minutes": 40,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 8,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -8,
+      "task": "Python列表推导式练习",
+      "estimated_minutes": 35,
+      "actual_minutes": 32,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 8,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -3,
+      "task": "Python列表推导式练习",
+      "estimated_minutes": 35,
+      "actual_minutes": 28,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 8,
+      "total_questions": 8
+    }
+  ],
+  "plan": null,
+  "current_user_request": "明天 45 分钟，想继续练列表推导式，可以加点难度吗？",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "任务名、时间戳与反馈数值均为构造数据，不代表真实用户"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "python列表推导式",
+        "subject_label": "Python列表推导式练习",
+        "status": "resolved",
+        "strength": 0.114551,
+        "supports": 3,
+        "contradicts": 3,
+        "unit": 3,
+        "has_prefix": true,
+        "injected": false,
+        "content": "初步观察：「Python列表推导式练习」近期 3 次因难度太高未完成（30 天内）"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "python列表推导式",
+        "subject_label": "Python列表推导式练习",
+        "status": "resolved",
+        "strength": 0.152735,
+        "supports": 3,
+        "contradicts": 3,
+        "unit": 6,
+        "has_prefix": false,
+        "injected": false,
+        "content": "「Python列表推导式练习」近期 6 次任务完成率 50%"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "python列表推导式",
+        "subject_label": "Python列表推导式练习",
+        "status": "active",
+        "strength": 0.9,
+        "supports": 6,
+        "contradicts": 0,
+        "unit": 6,
+        "has_prefix": false,
+        "injected": true,
+        "content": "「Python列表推导式练习」近期反馈中 6 次出现"
+      }
+    ],
+    "must_not_exist": [
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "*",
+        "why": "没有计划行，缺少 estimated_minutes 基准"
+      }
+    ]
+  }
+}

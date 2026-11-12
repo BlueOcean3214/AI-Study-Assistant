@@ -1,0 +1,125 @@
+{
+  "sample_id": "S1",
+  "title": "近期反复因难度太高未完成",
+  "scenario": "30 天内 5 次「一元二次方程练习」都因难度太高没做完，其中 3 次完全未完成、2 次部分完成。",
+  "feedbacks": [
+    {
+      "offset_days": -24,
+      "task": "一元二次方程练习",
+      "estimated_minutes": 45,
+      "actual_minutes": 70,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 2,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -19,
+      "task": "一元二次方程练习",
+      "estimated_minutes": 45,
+      "actual_minutes": 65,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 3,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -14,
+      "task": "一元二次方程练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 60,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 6,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -9,
+      "task": "一元二次方程练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 58,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 5,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -4,
+      "task": "一元二次方程练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 55,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 4,
+      "total_questions": 8
+    }
+  ],
+  "plan": null,
+  "current_user_request": "明天大概有 60 分钟，想继续练一元二次方程，帮我安排一下。",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "任务名、时间戳与反馈数值均为构造数据，不代表真实用户"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "一元二次方程",
+        "subject_label": "一元二次方程练习",
+        "status": "active",
+        "strength": 0.9,
+        "supports": 5,
+        "contradicts": 0,
+        "unit": 5,
+        "has_prefix": false,
+        "injected": true,
+        "content": "「一元二次方程练习」近期 5 次因难度太高未完成（30 天内）"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "一元二次方程",
+        "subject_label": "一元二次方程练习",
+        "status": "active",
+        "strength": 0.6,
+        "supports": 5,
+        "contradicts": 0,
+        "unit": 5,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「一元二次方程练习」近期 5 次任务完成率 0%"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "一元二次方程",
+        "subject_label": "一元二次方程练习",
+        "status": "active",
+        "strength": 0.6,
+        "supports": 5,
+        "contradicts": 0,
+        "unit": 5,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「一元二次方程练习」近期反馈中 5 次出现"
+      }
+    ],
+    "must_not_exist": [
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "*",
+        "why": "没有可用的计划（estimated_minutes 基准来自计划行），不生成用时模式"
+      }
+    ]
+  }
+}

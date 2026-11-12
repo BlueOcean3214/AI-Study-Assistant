@@ -1,0 +1,73 @@
+{
+  "sample_id": "S7",
+  "title": "冷启动，只够一条初步观察",
+  "scenario": "30 天内只有 2 次「数据结构练习」，都因难度太高没做完。task_topic 需要 3 次才生成，task_performance 需要 3 个样本才生成，所以只有 difficulty 一条记忆（且带初步观察前缀）。",
+  "feedbacks": [
+    {
+      "offset_days": -6,
+      "task": "数据结构练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 50,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 3,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -2,
+      "task": "数据结构练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 48,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 4,
+      "total_questions": 8
+    }
+  ],
+  "plan": null,
+  "current_user_request": "刚开始准备数据结构，明天 30 分钟，先带我入门。",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "任务名、时间戳与反馈数值均为构造数据，不代表真实用户"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "数据结构",
+        "subject_label": "数据结构练习",
+        "status": "active",
+        "strength": 0.5,
+        "supports": 2,
+        "contradicts": 0,
+        "unit": 2,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「数据结构练习」近期 2 次因难度太高未完成（30 天内）"
+      }
+    ],
+    "must_not_exist": [
+      {
+        "memory_type": "task_topic",
+        "subject_key": "数据结构",
+        "why": "只有 2 次出现，未达 REQUIRED=3"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "数据结构",
+        "why": "只有 2 个样本，未达 REQUIRED=3"
+      },
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "*",
+        "why": "没有计划行，缺少 estimated_minutes 基准"
+      }
+    ]
+  }
+}

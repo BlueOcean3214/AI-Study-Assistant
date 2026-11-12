@@ -1,0 +1,192 @@
+{
+  "sample_id": "S5",
+  "title": "两个学科并存，注入条数顶到上限",
+  "scenario": "30 天内先练 3 次「线性代数练习」（都没做完，难度太高），再练 5 次「概率论练习」（4 次完成）。两个学科各留下记忆，注入条数为 5 条，正好等于 limit 上限。",
+  "feedbacks": [
+    {
+      "offset_days": -26,
+      "task": "线性代数练习",
+      "estimated_minutes": 45,
+      "actual_minutes": 70,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 2,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -22,
+      "task": "线性代数练习",
+      "estimated_minutes": 45,
+      "actual_minutes": 68,
+      "status": "partial",
+      "reason": "任务难度太高",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 4,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -19,
+      "task": "线性代数练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 66,
+      "status": "not_completed",
+      "reason": "任务难度太高",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 3,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -15,
+      "task": "概率论练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 45,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 6,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -12,
+      "task": "概率论练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 42,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 6,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -8,
+      "task": "概率论练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 60,
+      "status": "not_completed",
+      "reason": "临时有事情",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 4,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -4,
+      "task": "概率论练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 38,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 7,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -1,
+      "task": "概率论练习",
+      "estimated_minutes": 35,
+      "actual_minutes": 36,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 7,
+      "total_questions": 8
+    }
+  ],
+  "plan": null,
+  "current_user_request": "这周想主攻概率论，明天 50 分钟，安排一次练习。",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "任务名、时间戳与反馈数值均为构造数据，不代表真实用户"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "线性代数",
+        "subject_label": "线性代数练习",
+        "status": "active",
+        "strength": 0.6,
+        "supports": 3,
+        "contradicts": 0,
+        "unit": 3,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「线性代数练习」近期 3 次因难度太高未完成（30 天内）"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "线性代数",
+        "subject_label": "线性代数练习",
+        "status": "active",
+        "strength": 0.5,
+        "supports": 3,
+        "contradicts": 0,
+        "unit": 3,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「线性代数练习」近期 3 次任务完成率 0%"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "线性代数",
+        "subject_label": "线性代数练习",
+        "status": "active",
+        "strength": 0.5,
+        "supports": 3,
+        "contradicts": 0,
+        "unit": 3,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「线性代数练习」近期反馈中 3 次出现"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "概率论",
+        "subject_label": "概率论练习",
+        "status": "active",
+        "strength": 0.5,
+        "supports": 4,
+        "contradicts": 1,
+        "unit": 5,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「概率论练习」近期 5 次任务完成率 80%"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "概率论",
+        "subject_label": "概率论练习",
+        "status": "active",
+        "strength": 0.6,
+        "supports": 5,
+        "contradicts": 0,
+        "unit": 5,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「概率论练习」近期反馈中 5 次出现"
+      }
+    ],
+    "must_not_exist": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "概率论",
+        "why": "概率论 5 次里只有一次未完成，且原因是「临时有事情」而非难度"
+      },
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "*",
+        "why": "没有计划行，缺少 estimated_minutes 基准"
+      }
+    ]
+  }
+}
