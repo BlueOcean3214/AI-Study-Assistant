@@ -29,6 +29,7 @@ import time
 import ai_service
 import agent_loop
 import agent_tools
+import memory_context
 import plan_service
 
 
@@ -211,6 +212,21 @@ def _collect_tool_data(steps):
     return feedback_result, knowledge_results, search_failed
 
 
+def _short_term_block(plan_date=None):
+    """收集并渲染一次短期学习上下文（v16 §2.2）。
+
+    返回可注入的消息块字符串；任何失败都退化为空串：
+    短期上下文是"锦上添花"的程序统计，读不到数据不应该让计划起草整体失败。
+    """
+
+    try:
+        data = memory_context.collect_short_term(plan_date)
+        return memory_context.render_short_term(data)["text"]
+    except Exception as error:  # noqa: BLE001 - 上下文集失败不阻断起草
+        _log(False, "[Draft]", f"短期上下文收集失败：{type(error).__name__}: {error}")
+        return ""
+
+
 def _knowledge_block(knowledge_results, search_failed):
     if knowledge_results:
         return (
@@ -231,12 +247,20 @@ def _knowledge_block(knowledge_results, search_failed):
 
 
 def _build_draft_user_content(
-    user_message, feedback_result, knowledge_results, search_failed, difficult
+    user_message,
+    feedback_result,
+    knowledge_results,
+    search_failed,
+    difficult,
+    short_term_block=None,
 ):
     """起草阶段的用户消息：真实数据 + 复用现有计划规则 + 输出契约。
 
     计划字段与数值规则复用 ai_service.build_plan_prompt（与 /next-plan 同一份规则文本），
     不新建第二套 plan 规则；真正的校验由 normalize_plan + validate_plan 负责。
+
+    short_term_block：短期学习上下文（v16 §2.2）。为 None 或空串时**不改变原消息任何字节**，
+    保证既有 prompt 断言的二进制等价；非空时插在「用户请求」之后、「反馈/统计」之前。
     """
 
     feedback_list = (feedback_result or {}).get("feedback") or []
@@ -250,6 +274,13 @@ def _build_draft_user_content(
         '{"answer": "给用户阅读的自然语言说明", "plan": {上面要求的计划 JSON}}\n'
         "answer 与 plan.reason 只能依据上面提供的真实数据。"
     )
+
+    if isinstance(short_term_block, str) and short_term_block.strip():
+        return (
+            f"用户请求：{user_message}\n\n"
+            f"{short_term_block}\n\n"
+            f"{base}\n{knowledge}\n\n{wrapper}"
+        )
 
     return f"用户请求：{user_message}\n\n{base}\n{knowledge}\n\n{wrapper}"
 
@@ -432,6 +463,9 @@ def run_plan_draft(
     # 3) 起草依据只来自研究阶段的真实 Tool Result
     feedback_result, knowledge_results, search_failed = _collect_tool_data(steps)
 
+    # 3.1) 短期学习上下文只算一次，注入真正生成计划的那次调用（v16 §2.2）
+    short_term_block = _short_term_block()
+
     deadline = agent_loop._Deadline(draft_max_run_seconds, clock)
 
     messages = [
@@ -439,7 +473,12 @@ def run_plan_draft(
         {
             "role": "user",
             "content": _build_draft_user_content(
-                user_message, feedback_result, knowledge_results, search_failed, difficult
+                user_message,
+                feedback_result,
+                knowledge_results,
+                search_failed,
+                difficult,
+                short_term_block=short_term_block,
             ),
         },
     ]

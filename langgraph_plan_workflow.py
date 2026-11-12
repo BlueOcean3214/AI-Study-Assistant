@@ -47,6 +47,7 @@ class DraftState(TypedDict, total=False):
     corrections_used: int
     last_reason: str | None
     last_raw: str | None
+    short_term_block: str
     result: dict
 
 
@@ -71,7 +72,14 @@ def node_research(state: DraftState) -> DraftState:
         verbose=False,
     )
 
-    return {"research": research, "steps": research.get("steps") or []}
+    # 短期上下文只算一次并写入 state（v16 §2.2：node_prepare 直接复用，不重复读取）
+    short_term_block = agent_plan_draft._short_term_block()
+
+    return {
+        "research": research,
+        "steps": research.get("steps") or [],
+        "short_term_block": short_term_block,
+    }
 
 
 def node_prepare(state: DraftState) -> DraftState:
@@ -95,7 +103,12 @@ def node_prepare(state: DraftState) -> DraftState:
         {
             "role": "user",
             "content": agent_plan_draft._build_draft_user_content(
-                state["user_message"], feedback_result, knowledge_results, search_failed, difficult
+                state["user_message"],
+                feedback_result,
+                knowledge_results,
+                search_failed,
+                difficult,
+                short_term_block=state.get("short_term_block"),
             ),
         },
     ]
