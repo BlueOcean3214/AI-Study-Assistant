@@ -630,6 +630,226 @@ def test_collect_failure_does_not_block_draft():
     check("P5 collect 异常时注入空块", block == "")
 
 
+# ---------------------------------------------------------------- P6 长期记忆进最终 draft
+
+
+SPECIAL_MEMORY = "测试专用记忆：用户近期反复在定积分换元中出错"
+
+
+def memory_steps():
+    """研究阶段真实 steps：反馈 + 一条带内部字段的长期记忆。"""
+
+    return research_steps() + [
+        {
+            "tool": "get_learning_memory",
+            "ok": True,
+            "result": {
+                "ok": True,
+                "count": 1,
+                "reason": "",
+                "memories": [
+                    {
+                        "type": "difficulty",
+                        "subject": "定积分换元",
+                        "content": SPECIAL_MEMORY,
+                        "strength": 0.8,
+                        "evidence_count": 3,
+                        "episode": 2,
+                        "evidence_feedback_ids": [11, 12, 13],
+                        "updated_at": "2026-11-10T09:00:00",
+                        # 内部字段：不得进入最终 draft 消息
+                        "memory_id": 99,
+                        "value_json": '{"subject": "定积分换元"}',
+                    }
+                ],
+            },
+        }
+    ]
+
+
+def test_collect_tool_data_extracts_memory():
+    _, _, _, memory_result = agent_plan_draft._collect_tool_data(memory_steps())
+
+    check("P6 collect：提取到记忆结果", isinstance(memory_result, dict), str(memory_result))
+    check("P6 collect：count 与条数一致", memory_result["count"] == 1, str(memory_result["count"]))
+
+    memories = memory_result["memories"]
+    check("P6 collect：记忆内容原样保留", memories[0]["content"] == SPECIAL_MEMORY)
+    check(
+        "P6 collect：只保留公开字段白名单",
+        set(memories[0]) == set(agent_plan_draft.MEMORY_RESULT_FIELDS),
+        str(sorted(memories[0])),
+    )
+
+    # 失败 / 空结果 / result.ok=False 都不能算有效记忆
+    for label, steps in (
+        ("失败", [{"tool": "get_learning_memory", "ok": False, "result": None}]),
+        (
+            "空结果",
+            [{"tool": "get_learning_memory", "ok": True, "result": {"ok": True, "count": 0, "memories": []}}],
+        ),
+        (
+            "ok=False",
+            [
+                {
+                    "tool": "get_learning_memory",
+                    "ok": True,
+                    "result": {"ok": False, "count": 0, "error_type": "memory_unavailable", "memories": []},
+                }
+            ],
+        ),
+    ):
+        _, _, _, extracted = agent_plan_draft._collect_tool_data(steps)
+        check(f"P6 collect：{label}不算有效记忆", extracted is None, str(extracted))
+
+
+def test_native_draft_prompt_contains_memory():
+    fresh()
+
+    payload = {
+        "answer": "根据学习记忆，你近期反复在定积分换元中出错，今天先复盘换元步骤。",
+        "plan": valid_plan(),
+    }
+    stub = StubAgent(memory_steps(), payload)
+
+    with stub:
+        result = agent_plan_draft.run_plan_draft("帮我安排今天的学习", verbose=False)
+
+    check("P6 Native：草案生成成功", result["ok"] is True, str(result.get("message")))
+
+    content = stub.draft_user_content
+
+    check("P6 Native：prompt 含真实记忆区块标题", "【真实长期学习记忆检索结果】" in content)
+    check("P6 Native：prompt 含真实记忆内容", SPECIAL_MEMORY in content)
+    check("P6 Native：说明是历史事实", "历史记录，不代表用户当前状态" in content)
+    check("P6 Native：说明 strength 不是概率", "strength 是强度刻度，不是概率" in content)
+    check("P6 Native：不带 memory_id", "memory_id" not in content)
+    check("P6 Native：不带 value_json", "value_json" not in content)
+    check("P6 Native：记忆区块在用户请求之后", content.index("用户请求：") < content.index("【真实长期学习记忆检索结果】"))
+
+
+def test_langgraph_draft_prompt_contains_memory():
+    fresh()
+
+    payload = {
+        "answer": "根据学习记忆，你近期反复在定积分换元中出错，今天先复盘换元步骤。",
+        "plan": valid_plan(),
+    }
+    stub = StubAgent(memory_steps(), payload)
+
+    with stub:
+        researched = langgraph_plan_workflow.node_research(
+            {"user_message": "帮我安排今天的学习", "max_corrections": 2}
+        )
+        state = {"user_message": "帮我安排今天的学习", "max_corrections": 2, **researched}
+        prepared = langgraph_plan_workflow.node_prepare(state)
+
+    content = prepared["messages"][1]["content"]
+
+    check("P6 LangGraph：prepare prompt 含真实记忆区块", "【真实长期学习记忆检索结果】" in content)
+    check("P6 LangGraph：prompt 含真实记忆内容", SPECIAL_MEMORY in content)
+    check("P6 LangGraph：不带 memory_id", "memory_id" not in content)
+    check("P6 LangGraph：state 带 memory_result", prepared.get("memory_result") is not None)
+    check(
+        "P6 LangGraph：state 的 memory_result 与 prompt 同源",
+        prepared["memory_result"]["memories"][0]["content"] == SPECIAL_MEMORY,
+    )
+
+
+def test_memory_failure_or_empty_adds_no_block():
+    fresh()
+
+    for label, steps in (
+        (
+            "查询失败",
+            research_steps() + [{"tool": "get_learning_memory", "ok": False, "result": None}],
+        ),
+        (
+            "查询为空",
+            research_steps()
+            + [
+                {
+                    "tool": "get_learning_memory",
+                    "ok": True,
+                    "result": {"ok": True, "count": 0, "memories": []},
+                }
+            ],
+        ),
+    ):
+        stub = StubAgent(steps, {"answer": "今天先巩固基础。", "plan": valid_plan()})
+
+        with stub:
+            result = agent_plan_draft.run_plan_draft("帮我安排今天的学习", verbose=False)
+
+        content = stub.draft_user_content
+
+        check(f"P6 {label}：草案仍生成", result["ok"] is True, str(result.get("message")))
+        check(f"P6 {label}：不出现记忆区块", "【真实长期学习记忆检索结果】" not in content)
+
+
+def test_langgraph_research_sees_short_term_once():
+    fresh()
+    insert_plan_row(task="定积分基础巩固练习")
+    insert_feedback_row(task="定积分练习", status="partial", reason="任务难度太高", created_at=days_ago(1))
+
+    stub = StubAgent(research_steps(), {"answer": "x", "plan": valid_plan()})
+    calls = []
+    original = agent_plan_draft._short_term_block
+
+    def counting(plan_date=None):
+        calls.append(plan_date)
+        return original(plan_date)
+
+    agent_plan_draft._short_term_block = counting
+    try:
+        with stub:
+            researched = langgraph_plan_workflow.node_research(
+                {"user_message": "帮我安排今天的学习", "max_corrections": 2}
+            )
+            state = {"user_message": "帮我安排今天的学习", "max_corrections": 2, **researched}
+            prepared = langgraph_plan_workflow.node_prepare(state)
+    finally:
+        agent_plan_draft._short_term_block = original
+
+    check("P6 LangGraph：短期上下文只收集一次", len(calls) == 1, str(len(calls)))
+
+    research_message = stub.research_seen[0]
+    check("P6 LangGraph：研究阶段就看到短期上下文", SECTION_TITLE in research_message)
+    check("P6 LangGraph：研究消息含今日计划", "定积分基础巩固练习" in research_message)
+    check(
+        "P6 LangGraph：prepare 复用同一份 block",
+        prepared["messages"][1]["content"].count(SECTION_TITLE) == 1,
+    )
+
+
+def test_memory_claim_without_memory_is_rejected():
+    fresh()
+
+    # 查询过但结果为空：Tool 记录了、steps 里也有，但没有真实记忆可传
+    steps = research_steps() + [
+        {
+            "tool": "get_learning_memory",
+            "ok": True,
+            "result": {"ok": True, "count": 0, "memories": []},
+        }
+    ]
+    payload = {
+        "answer": "根据学习记忆，你近期反复在定积分换元中出错。",
+        "plan": valid_plan(),
+    }
+    stub = StubAgent(steps, payload)
+
+    with stub:
+        result = agent_plan_draft.run_plan_draft("帮我安排今天的学习", verbose=False)
+
+    check("P6 空查询不放行记忆主张：草案被拒", result.get("ok") is False, str(result.get("type")))
+    check(
+        "P6 空查询不放行记忆主张：原因指向学习记忆",
+        "学习记忆" in (result.get("message") or ""),
+        str(result.get("message")),
+    )
+
+
 def test_real_database_untouched():
     current = REAL_DB.read_bytes() if REAL_DB.exists() else b""
     check("P5 真实 feedback.db 字节未变", current == REAL_DB_BYTES_BEFORE)
@@ -649,6 +869,12 @@ def _run_all():
         test_langgraph_prepare_contains_short_term,
         test_empty_block_keeps_old_prompt_bytes,
         test_collect_failure_does_not_block_draft,
+        test_collect_tool_data_extracts_memory,
+        test_native_draft_prompt_contains_memory,
+        test_langgraph_draft_prompt_contains_memory,
+        test_memory_failure_or_empty_adds_no_block,
+        test_langgraph_research_sees_short_term_once,
+        test_memory_claim_without_memory_is_rejected,
         test_real_database_untouched,
     ]
 

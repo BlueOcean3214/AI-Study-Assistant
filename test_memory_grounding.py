@@ -221,11 +221,36 @@ def test_grounding_flags_memory_claims_without_memory_tool():
         {
             "tool": "get_learning_memory",
             "ok": True,
-            "result": {"ok": True, "count": 2, "memories": [{"type": "difficulty"}]},
+            "result": {
+                "ok": True,
+                "count": 2,
+                "memories": [
+                    {
+                        "type": "difficulty",
+                        "subject": "定积分换元",
+                        "content": "定积分换元连续 3 次出错",
+                        "strength": 0.8,
+                        "evidence_count": 3,
+                    }
+                ],
+            },
         }
     ]
+    _, _, _, memory_result = agent_plan_draft._collect_tool_data(ok_memory)
+    check("有效记忆能被 _collect_tool_data 提取", memory_result is not None, memory_result)
+
+    violations = agent_plan_draft.check_grounding(
+        [memory_claim], ok_memory, memory_result=memory_result
+    )
+    check("有真实记忆且传入最终消息时不判违规", violations == [], violations)
+
+    # 同一条 steps，但最终生成计划的消息没有拿到记忆 -> 来源验证必须拒绝
     violations = agent_plan_draft.check_grounding([memory_claim], ok_memory)
-    check("有真实记忆结果时不判违规", violations == [], violations)
+    check(
+        "查过记忆但没传入最终消息仍判违规",
+        any("学习记忆" in item for item in violations),
+        violations,
+    )
 
 
 def test_grounding_normal_wording_is_not_flagged():

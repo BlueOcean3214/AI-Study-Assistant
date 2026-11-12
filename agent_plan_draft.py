@@ -106,6 +106,19 @@ MEMORY_CLAIM_MARKERS = (
     "我记得你",
 )
 
+# 长期记忆结果允许进入最终 draft 消息的字段白名单（与 Agent Tool 的公开投影一致）。
+# 不含 memory_id / value_json / memory_events / pending 等内部数据。
+MEMORY_RESULT_FIELDS = (
+    "type",
+    "subject",
+    "content",
+    "strength",
+    "evidence_count",
+    "episode",
+    "evidence_feedback_ids",
+    "updated_at",
+)
+
 # 最后一次模型原始输出在错误结果里最多保留的字符数
 MAX_LAST_RAW_CHARS = 2000
 
@@ -124,13 +137,20 @@ def _claims_source(text, markers):
     return isinstance(text, str) and any(marker in text for marker in markers)
 
 
-def check_grounding(texts, steps):
+def check_grounding(texts, steps, memory_result=None):
     """来源完整性检查：texts 里不得声称没有真实依据的来源。
 
     steps 是研究阶段的真实 Tool Call 记录。规则：
     - 声称依据知识库 -> 必须存在成功的 search_knowledge 且检索到内容
     - 声称依据学习反馈 -> 必须存在成功的 get_recent_feedback
-    - 声称依据长期学习记忆 -> 必须存在成功的 get_learning_memory 且返回了记忆
+    - 声称依据长期学习记忆 -> 三个条件同时成立：
+      ① 存在成功的 get_learning_memory 且返回了记忆
+      ② 该结果被 _collect_tool_data() 提取为 memory_result
+      ③ 同一份 memory_result 确实拼进了本次最终 draft 消息
+      （②③由调用方传入 memory_result 体现：传进来的就是拼进消息的那一份）
+
+    memory_result 为 None 表示最终模型调用没有拿到长期记忆，
+    此时即使研究阶段成功查过 Tool 也不放行记忆来源主张。
 
     返回违规说明列表（空列表表示通过）。
     """
@@ -146,8 +166,8 @@ def check_grounding(texts, steps):
         and step["result"].get("count", 0) > 0
         for step in steps
     )
-    # 记忆来源更严格：必须真的取到至少一条记忆，空结果不算"掌握了用户记忆"
-    memory_ok = any(
+    # 记忆来源最严格：研究阶段真的取到记忆，且这份结果确实进了最终 draft 消息
+    memory_queried = any(
         step.get("tool") == "get_learning_memory"
         and step.get("ok") is True
         and isinstance(step.get("result"), dict)
@@ -155,6 +175,8 @@ def check_grounding(texts, steps):
         and step["result"].get("count", 0) > 0
         for step in steps
     )
+    memory_forwarded = bool(_memory_block(memory_result))
+    memory_ok = memory_queried and memory_forwarded
 
     violations = []
 
@@ -175,7 +197,10 @@ def check_grounding(texts, steps):
                 violations.append(violation)
 
         if not memory_ok and _claims_source(text, MEMORY_CLAIM_MARKERS):
-            violation = "声称依据学习记忆，但本次没有成功读取学习记忆"
+            if not memory_queried:
+                violation = "声称依据学习记忆，但本次没有成功读取学习记忆"
+            else:
+                violation = "声称依据学习记忆，但本次记忆检索结果没有传入最终生成计划的消息"
 
             if violation not in violations:
                 violations.append(violation)
@@ -216,22 +241,65 @@ def _extract_json(text):
     return None
 
 
+def _memory_memories(result):
+    """从 get_learning_memory 的 Tool Result 里取出有效记忆（只保留公开字段白名单）。
+
+    只有"调用成功、result.ok 不为 False、且真的带回记忆条目"才算有效结果；
+    调用失败、result.ok=False、count=0 都返回空列表，绝不冒充"掌握了用户记忆"。
+    """
+
+    if not isinstance(result, dict) or result.get("ok") is False:
+        return []
+
+    raw = result.get("memories")
+
+    if not isinstance(raw, list):
+        return []
+
+    memories = []
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        projected = {
+            key: item[key] for key in MEMORY_RESULT_FIELDS if key in item
+        }
+
+        if projected.get("content"):
+            memories.append(projected)
+
+    return memories
+
+
 def _collect_tool_data(steps):
     """从研究阶段真实 steps 中收集起草依据。
 
-    返回 (feedback_result, knowledge_results, search_failed)：
+    返回 (feedback_result, knowledge_results, search_failed, memory_result)：
     - feedback_result：最后一次成功的 get_recent_feedback 完整结果（None 表示没有）
     - knowledge_results：所有成功 search_knowledge 返回的内容条目（合并）
     - search_failed：是否出现过失败的 search_knowledge
+    - memory_result：最后一次真正带回记忆的 get_learning_memory 结果，
+      结构为 {"count": N, "memories": [公开字段白名单]}；没有有效记忆时为 None。
+
+    memory_result 必须真的拼进最终 draft 消息（见 _build_draft_user_content），
+    check_grounding 才放行记忆来源主张。
     """
 
     feedback_result = None
     knowledge_results = []
     search_failed = False
+    memory_result = None
 
     for step in steps:
         if step.get("tool") == "get_recent_feedback" and step.get("ok") is True:
             feedback_result = step.get("result")
+        elif step.get("tool") == "get_learning_memory":
+            memories = _memory_memories(step.get("result"))
+
+            # 失败、ok=False、空结果都不算依据：不覆盖已有的有效记忆结果
+            if step.get("ok") is True and memories:
+                memory_result = {"count": len(memories), "memories": memories}
         elif step.get("tool") == "search_knowledge":
             result = step.get("result")
 
@@ -246,7 +314,7 @@ def _collect_tool_data(steps):
             else:
                 search_failed = True
 
-    return feedback_result, knowledge_results, search_failed
+    return feedback_result, knowledge_results, search_failed, memory_result
 
 
 def _short_term_block(plan_date=None):
@@ -283,6 +351,37 @@ def _knowledge_block(knowledge_results, search_failed):
     )
 
 
+def _memory_block(memory_result):
+    """长期记忆区块：内容只来自研究阶段 get_learning_memory 的真实 Tool Result。
+
+    没有有效记忆时返回空串——绝不伪造一个"记忆"区块。
+    """
+
+    if not isinstance(memory_result, dict):
+        return ""
+
+    memories = memory_result.get("memories")
+
+    if not isinstance(memories, list) or not memories:
+        return ""
+
+    payload = [
+        {key: item[key] for key in MEMORY_RESULT_FIELDS if key in item}
+        for item in memories
+        if isinstance(item, dict)
+    ]
+
+    if not payload:
+        return ""
+
+    return (
+        "【真实长期学习记忆检索结果】\n"
+        "以下是程序调用 get_learning_memory 得到的历史事实（历史记录，不代表用户当前状态；\n"
+        "strength 是强度刻度，不是概率）：\n"
+        + json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+
+
 def _build_draft_user_content(
     user_message,
     feedback_result,
@@ -290,6 +389,7 @@ def _build_draft_user_content(
     search_failed,
     difficult,
     short_term_block=None,
+    memory_result=None,
 ):
     """起草阶段的用户消息：真实数据 + 复用现有计划规则 + 输出契约。
 
@@ -298,6 +398,8 @@ def _build_draft_user_content(
 
     short_term_block：短期学习上下文（v16 §2.2）。为 None 或空串时**不改变原消息任何字节**，
     保证既有 prompt 断言的二进制等价；非空时插在「用户请求」之后、「反馈/统计」之前。
+    memory_result：研究阶段 get_learning_memory 的真实结果。只有真正取到记忆时才插入
+    「真实长期学习记忆检索结果」区块，且只带公开字段；为空时不出现该区块。
     """
 
     feedback_list = (feedback_result or {}).get("feedback") or []
@@ -305,6 +407,7 @@ def _build_draft_user_content(
 
     base = ai_service.build_plan_prompt(feedback_list, summary, difficult, None)
     knowledge = _knowledge_block(knowledge_results, search_failed)
+    memory = _memory_block(memory_result)
 
     wrapper = (
         "输出契约：只返回一个 JSON 对象，外层包含 answer 与 plan 两个字段：\n"
@@ -312,12 +415,28 @@ def _build_draft_user_content(
         "answer 与 plan.reason 只能依据上面提供的真实数据。"
     )
 
-    if isinstance(short_term_block, str) and short_term_block.strip():
-        return (
-            f"用户请求：{user_message}\n\n"
-            f"{short_term_block}\n\n"
-            f"{base}\n{knowledge}\n\n{wrapper}"
+    if memory:
+        wrapper = (
+            "answer 与 plan.reason 不得把上面的长期学习记忆说成用户当前状态；"
+            "引用记忆时只能按它写的历史事实表述。\n" + wrapper
         )
+
+    has_short_term = isinstance(short_term_block, str) and short_term_block.strip()
+
+    if has_short_term or memory:
+        parts = [f"用户请求：{user_message}"]
+
+        if has_short_term:
+            parts.append(short_term_block)
+
+        parts.append(f"{base}\n{knowledge}")
+
+        if memory:
+            parts.append(memory)
+
+        parts.append(wrapper)
+
+        return "\n\n".join(parts)
 
     return f"用户请求：{user_message}\n\n{base}\n{knowledge}\n\n{wrapper}"
 
@@ -498,7 +617,12 @@ def run_plan_draft(
         )
 
     # 3) 起草依据只来自研究阶段的真实 Tool Result
-    feedback_result, knowledge_results, search_failed = _collect_tool_data(steps)
+    (
+        feedback_result,
+        knowledge_results,
+        search_failed,
+        memory_result,
+    ) = _collect_tool_data(steps)
 
     # 3.1) 短期学习上下文只算一次，注入真正生成计划的那次调用（v16 §2.2）
     short_term_block = _short_term_block()
@@ -516,6 +640,7 @@ def run_plan_draft(
                 search_failed,
                 difficult,
                 short_term_block=short_term_block,
+                memory_result=memory_result,
             ),
         },
     ]
@@ -597,7 +722,9 @@ def run_plan_draft(
                             reason = validation["reason"]
                         else:
                             violations = check_grounding(
-                                [answer, normalized.get("reason")], steps
+                                [answer, normalized.get("reason")],
+                                steps,
+                                memory_result=memory_result,
                             )
 
                             if violations:

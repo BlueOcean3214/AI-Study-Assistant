@@ -12,25 +12,27 @@
 | 文件 | 类型 | 所属任务 | 改动 |
 | --- | --- | --- | --- |
 | `memory_context.py` | 新建 | Task 5 | 短期上下文的收集（只读）与渲染（纯函数），342 行 |
-| `agent_plan_draft.py` | 修改 | Task 5 / Task 8 | +`_short_term_block()` 与注入；+`MEMORY_CLAIM_MARKERS` 与 grounding 的 `memory_ok` |
-| `langgraph_plan_workflow.py` | 修改 | Task 5 | `DraftState.short_term_block`；`node_research` 收集、`node_prepare` 传入；未加节点、未改拓扑 |
+| `agent_plan_draft.py` | 修改 | Task 5 / Task 8 / 复审 P1 | +`_short_term_block()` 与注入；+`MEMORY_CLAIM_MARKERS` 与 grounding 的 `memory_ok`；+`MEMORY_RESULT_FIELDS`、`_memory_memories()`、`_memory_block()`，记忆结果进最终 draft 并参与 grounding |
+| `langgraph_plan_workflow.py` | 修改 | Task 5 / 复审 P1·P2 | `DraftState.short_term_block`、`memory_result`；`node_research` **先**收集短期上下文并拼进 research 消息，再调 `run_agent`；`node_prepare` 复用同一份 block 并传入 `memory_result`；未加节点、未改拓扑 |
+| `agent_eval.py` | 修改 | 复审 P1 | 评测回放时从同一份 `steps` 提取 `memory_result` 再判 grounding，与生产一致 |
 | `agent_tools.py` | 修改 | Task 6 | +`get_learning_memory()` 只读 Tool 与其参数校验、结果投影、预算丢弃 |
 | `agent_schema.py` | 修改 | Task 6 | +`TOOL_SCHEMAS` 条目、`TOOL_NAMES`、`ARGUMENT_RULES` |
 | `agent_dispatcher.py` | 修改 | Task 6 | 注册第 4 个 Tool |
 | `memory_service.py` | 修改 | Task 7 | +`update_from_feedback()` 包装 `apply_pending_updates()`，返回结构化结果 |
 | `main.py` | 修改 | Task 7 | `/feedback` 提交后触发记忆更新并回填 `memory` 字段；新增 `GET /memory` |
 | `prompt_registry.py` | 修改 | Task 8 | `agent_system` 默认版本 `v1` → `v2`，v1 原样保留 |
-| `test_memory_context.py` | 新建 | Task 5 | 13 个用例 |
+| `test_memory_context.py` | 新建 | Task 5 / 复审 P1·P2 | 19 个用例（含 P6 记忆进 draft、LangGraph 只收集一次） |
 | `test_learning_memory_tool.py` | 新建 | Task 6 | 11 个用例 |
 | `test_feedback_memory_trigger.py` | 新建 | Task 7 | 11 个用例 |
-| `test_memory_grounding.py` | 新建 | Task 8 | 9 个用例 |
+| `test_memory_grounding.py` | 新建 | Task 8 / 复审 P1 | 9 个用例（含"查过但没传进最终消息仍判违规"） |
 | `test_agent_schema.py` / `test_agent_dispatcher.py` / `test_agent_plan_draft.py` | 修改 | Task 6 | 工具面从三个 Tool 同步为 v16 §6.2 的四个 Tool |
 
 未改动：`agent_loop.py`（工具次数 4、循环次数、超时预算全部不动）、五张记忆表的 Schema、
 `plans` 表、`confirmation_service.py`、`rag_service.py` / `embedding_service.py` / `vector_cache.py`、
 `/ask` 链路、`docs/STAGE2-LEARNING-MEMORY-DESIGN.md`。
 
-Task 5–8 各自一个 commit；`4fbffd1` 只修一处被 Task 6 打破的旧断言（见 §七末）。
+Task 5–8 各自一个 commit；`4fbffd1` 只修一处被 Task 6 打破的旧断言（见 §七末）；
+复审 P1/P2 的修复是单独一个 commit（见 §九）。
 
 ## 二、短期学习上下文（Task 5）
 
@@ -80,13 +82,13 @@ feedback_count / recent_feedback / summary / difficulties / error_type
 
 | 路径 | 位置 | 行为 |
 | --- | --- | --- |
-| Native 草案 | `agent_plan_draft.py:504`（`_short_term_block()` 定义在 `agent_plan_draft.py:252`） | 调一次，在 `agent_plan_draft.py:512-519` 作为 `short_term_block=` 传给 `_build_draft_user_content()` |
-| LangGraph 草案 | `langgraph_plan_workflow.py:76/81` → `langgraph_plan_workflow.py:111` | 收集后写进 `DraftState.short_term_block`（`langgraph_plan_workflow.py:50`），prepare 节点取出传入；节点与拓扑未变 |
+| Native 草案 | `agent_plan_draft.py:628`（`_short_term_block()` 定义在 `agent_plan_draft.py:320`） | 调一次，在 `agent_plan_draft.py:636-644` 作为 `short_term_block=` 传给 `_build_draft_user_content()` |
+| LangGraph 草案 | `langgraph_plan_workflow.py:65`（**research 之前**）→ `langgraph_plan_workflow.py:89` 写进 `DraftState.short_term_block`（`langgraph_plan_workflow.py:51`）→ `langgraph_plan_workflow.py:117-126` prepare 取出传入 | 先收集、拼进 `research_message`（`langgraph_plan_workflow.py:73-78`）再调 `run_agent`（`langgraph_plan_workflow.py:80`），同一份 block 全程只算一次；节点与拓扑未变 |
 
-`_build_draft_user_content(..., short_term_block=None)`（line 286）只在
-`isinstance(short_term_block, str) and short_term_block.strip()` 时把块插到
+`_build_draft_user_content(..., short_term_block=None, memory_result=None)`（line 385）只在
+`isinstance(short_term_block, str) and short_term_block.strip()`（或存在真实记忆）时把块插到
 `用户请求：{user_message}` 之后、原有 `base / knowledge / wrapper` 之前；
-否则**原样返回旧字符串，零字节变化**（已用测试固定，保证 Batch B 行为不受影响）。
+两者都为空时**原样返回旧字符串，零字节变化**（已用测试固定，保证 Batch B 行为不受影响）。
 
 `/ask` 不注入短期上下文——这轮只改计划草案链路。
 
@@ -98,6 +100,19 @@ feedback_count / recent_feedback / summary / difficulties / error_type
 | 读反馈失败 | 只置 `error_type = "database"`，计划段仍可用 |
 | 收集或渲染抛异常 | `_short_term_block()` 记日志后返回 `""`；草案按旧路径继续，不阻塞 |
 | 块为空 | 提示词与 Batch B 完全一致（字节级断言） |
+
+### 2.5 长期记忆结果进最终 draft（复审 P1 修复）
+
+研究阶段查到记忆，不等于最终生成计划的模型看到了记忆。现在两者被程序绑在一起：
+
+| 环节 | 位置 | 行为 |
+| --- | --- | --- |
+| 提取 | `agent_plan_draft.py:244` `_memory_memories()` / `agent_plan_draft.py:275` `_collect_tool_data()` | 只有"调用成功 + `result.ok` 不为 False + 确实带回记忆条目"才算有效；失败、`ok=False`、`count=0` 一律不算，也不覆盖已有的有效结果 |
+| 字段白名单 | `agent_plan_draft.py:111` `MEMORY_RESULT_FIELDS` | 只透传 `type / subject / content / strength / evidence_count / episode / evidence_feedback_ids / updated_at`；`memory_id`、`value_json`、事件、`pending` 一律不进 prompt |
+| 渲染 | `agent_plan_draft.py:354` `_memory_block()` | 以 `【真实长期学习记忆检索结果】` 开头，声明"历史记录，不代表用户当前状态；strength 是强度刻度，不是概率"；没有有效记忆时返回 `""`，**不伪造区块** |
+| Native | `agent_plan_draft.py:636-644` | 与短期上下文一起传 `memory_result=`；`check_grounding(..., memory_result=memory_result)`（`agent_plan_draft.py:724-728`） |
+| LangGraph | `langgraph_plan_workflow.py:107-112` 提取 → `:117-126` 传入 → `:135` 写入 `DraftState.memory_result` → `:202-206` 传给 grounding | 与 Native 完全同源同规则 |
+| 评测回放 | `agent_eval.py:372-383` | 从同一份 `steps` 提取 `memory_result` 再判 grounding，与生产一致 |
 
 ## 三、只读记忆 Tool（Task 6）
 
@@ -181,18 +196,27 @@ v2 = v1 + 第 17 条：
 | --- | --- | --- |
 | 1 | 无写 Tool | `TOOL_NAMES` 里没有任何 `save_memory / add_memory / update_memory` |
 | 2 | 文本程序生成 | `content` 只由 `render_content()` 从 `value_json` 渲染 |
-| 3 | 来源诚实性 | `MEMORY_CLAIM_MARKERS` + 无成功 `get_learning_memory` 即判违规（本节） |
+| 3 | 来源诚实性 | `MEMORY_CLAIM_MARKERS` + 成功 `get_learning_memory` **且结果确实进了本次 final draft messages**，否则判违规（本节） |
 | 4 | 结果可核对 | 每条带 `evidence_count / episode / evidence_feedback_ids` |
 
-Grounding（`agent_plan_draft.check_grounding`）：新增 `memory_ok`。只要草案正文命中
-`MEMORY_CLAIM_MARKERS`（15 条"记忆"语义措辞，如"根据学习记忆""长期记忆显示""我记得你"；
-**不收**"你近期的情况"这类可由短期上下文支撑的措辞），就必须有一步满足
-`step["tool"] == "get_learning_memory"` 且 `ok is True` 且 `result["ok"] is not False`
-且 `result["count"] > 0`。否则违规：
+Grounding（`agent_plan_draft.check_grounding(texts, steps, memory_result=None)`，line 140）：新增
+`memory_ok = memory_queried and memory_forwarded`，三个条件必须同时成立：
+
+1. 存在一步 `step["tool"] == "get_learning_memory"` 且 `ok is True` 且 `result["ok"] is not False`
+   且 `result["count"] > 0`（研究阶段真的读到了记忆，见 §2.5）；
+2. 该结果被 `_collect_tool_data()` 提取成 `memory_result`（失败 / `ok=False` / `count=0` 不算）；
+3. 同一份 `memory_result` 被 `_build_draft_user_content()` 拼进了本次最终 draft 消息
+   （判断依据是调用方传入的 `memory_result`，即"传进来的就是拼进消息的那一份"）。
+
+只要草案正文命中 `MEMORY_CLAIM_MARKERS`（15 条"记忆"语义措辞，如"根据学习记忆""长期记忆显示"
+"我记得你"；**不收**"你近期的情况"这类可由短期上下文支撑的措辞）而上面三条不齐，即违规：
 
 > 声称依据学习记忆，但本次没有成功读取学习记忆
 
-即"读了但空结果"与"没读"一样算不成立——空结果不能被当成依据。
+> 声称依据学习记忆，但本次记忆检索结果没有传入最终生成计划的消息
+
+第二句专门覆盖"查过但没传进去"的情况——这正是本轮复审 P1 指出的脱节：
+研究阶段查到记忆 ≠ 最终生成计划的模型看到了记忆。空结果与失败同样算不成立，不能被当成依据。
 
 ## 六、安全边界（三层）
 
@@ -224,15 +248,20 @@ Grounding（`agent_plan_draft.check_grounding`）：新增 `memory_ok`。只要�
 
 | 文件 | 用例数 | 断言 | 退出码 | 说明 |
 | --- | --- | --- | --- | --- |
-| `test_memory_context.py` | 13 | 75 PASS | 0 | 全部通过 |
+| `test_memory_context.py` | 19 | 105 PASS | 0 | 含本轮新增的 P6 记忆进 draft 用例 |
 | `test_learning_memory_tool.py` | 11 | 87 PASS | 0 | 全部通过 |
 | `test_feedback_memory_trigger.py` | 11 | 157 PASS | 0 | 全部通过 |
-| `test_memory_grounding.py` | 9 | 38 PASS | 0 | 全部通过 |
+| `test_memory_grounding.py` | 9 | 40 PASS | 0 | 含"查过但没传进最终消息仍判违规" |
+| `test_langgraph_plan.py` | — | 16 PASS | 0 | 全部通过 |
+| `test_agent_eval.py` | — | 72 PASS | 0 | 全部通过 |
+| `test_eval_metrics.py` | — | 40 PASS | 0 | 全部通过 |
 | `test_agent_schema.py` | — | 37 PASS | 0 | 全部通过 |
 | `test_agent_dispatcher.py` | — | 56 PASS | 0 | 全部通过 |
 | `test_prompt_registry.py` | — | 26 PASS | 0 | 全部通过 |
 | `test_agent_plan_draft.py` | — | 75 PASS | 1 | deterministic 段全过；最后停在既有 Ollama 守卫 |
 | `test_save_plan_tool.py` | — | 41 PASS | 1 | 旧工具面断言修正后全过；最后停在既有 Ollama 守卫 |
+| `test_learning_memory.py` | — | 126 PASS | 0 | 全仓回归抽样复核 |
+| `test_learning_memory_state.py` | — | 216 PASS | 0 | 全仓回归抽样复核 |
 
 环境说明：`test_agent_plan_draft.py` 的退出码 1 不是断言失败，而是脚本末尾的既有环境守卫
 
@@ -278,6 +307,63 @@ PASS/FAIL 行数与 stderr 尾部）。除上表两处旧断言外，没有出�
    跨会话的长期结论要靠 `get_learning_memory`。
 3. 记忆 Tool 固定只读 `status="active"`，不提供查看 `pending`/失效记忆的入口；排查需要直接查库。
 4. 前端记忆管理页面与向量检索不在任务 0–9 的交付节奏内，本批未实现。
-5. grounding 只校验"是否成功读过记忆"，不校验模型转述得准不准；转述准确性仍属人工评审范围。
+5. grounding 只校验"记忆是否真的取到、且真的传进了最终 draft 消息"，不校验模型转述得准不准；
+   转述准确性仍属人工评审范围。
 6. `test_agent_plan_draft.py`、`test_save_plan_tool.py` 与 `test_upload.py`、`test_embedding*.py` 等的后半段
    依赖本机 Ollama，CI 环境需要 `ollama pull bge-m3` 才能跑完整段。
+
+## 九、复审修复记录（P1 / P2）
+
+第一轮复审（head `9ada5aa`）指出两个问题，本轮在原分支修复，未开新 PR、未合并：
+
+### P1：长期记忆 Tool 结果没有进入最终生成计划的模型调用
+
+复审原文要点：`_collect_tool_data()` 只处理 `get_recent_feedback` 与 `search_knowledge`，
+但 `check_grounding()` 只要 steps 里有成功的记忆查询就放行"依据长期记忆"，
+于是"研究阶段查到记忆 ≠ 最终生成计划的模型看到了记忆"，来源验证与真实输入脱节。
+
+修复：
+
+- `_collect_tool_data()` 返回 4 元组，多出 `memory_result`；严格区分调用失败、`result.ok=false`、
+  `count=0`、真正取到记忆四种情况，只有最后一种算有效依据。
+- `_build_draft_user_content()` 新增 `memory_result` 参数，真正取到记忆时插入
+  `【真实长期学习记忆检索结果】` 区块（只带 8 个公开字段，声明历史事实、`strength` 非概率）；
+  失败或空结果不出现任何记忆区块，不伪造。
+- `check_grounding()` 的 `memory_ok` 改为 `memory_queried and memory_forwarded`，
+  并要求调用方传入真正拼进消息的那一份 `memory_result`；新增第二种违规文案
+  「声称依据学习记忆，但本次记忆检索结果没有传入最终生成计划的消息」。
+- Native 与 LangGraph 两条路径都传同一份 `memory_result`；`agent_eval.py` 回放时同样从 steps 提取。
+- 新增 6 个测试（`test_memory_context.py` P6 段）：提取、Native prompt、LangGraph prompt、
+  失败/空不加区块、LangGraph 只收集一次、空查询不放行记忆主张；
+  `test_memory_grounding.py` 追加"查过但没传进最终消息仍判违规"。
+
+### P2：LangGraph 短期上下文的收集顺序
+
+复审原文要点：`node_research()` 先 `agent_loop.run_agent()`，之后才 `_short_term_block()`，
+研究阶段拿不到短期上下文，与 v16 §2.2 不符。
+
+修复：`node_research()` 改成先收集、先渲染（`langgraph_plan_workflow.py:65`），
+把同一份 block 拼进 `research_message`（`:73-78`）再调 `run_agent`（`:80`），
+并写进 `DraftState.short_term_block`（`:89`）；`node_prepare()` 直接复用，不重复收集。
+拓扑与节点数量未变，`agent_loop.py` 的预算/轮数/超时未动。
+新增测试断言"短期上下文只收集一次"且研究阶段消息里就能看到。
+
+### 本轮验证（2026-11-12，本机实跑）
+
+| 文件 | 断言 | 结果 |
+| --- | --- | --- |
+| `test_memory_context.py` | 105 PASS | 19 个用例全过，退出码 0 |
+| `test_memory_grounding.py` | 40 PASS | 退出码 0 |
+| `test_langgraph_plan.py` | 16 PASS | 退出码 0 |
+| `test_agent_eval.py` / `test_eval_metrics.py` | 72 / 40 PASS | 退出码 0 |
+| `test_agent_plan_draft.py` / `test_save_plan_tool.py` | 75 / 41 PASS | 0 个断言失败；退出码 1 仍是既有 Ollama 守卫 |
+| `test_agent_schema.py` / `test_agent_dispatcher.py` / `test_prompt_registry.py` | 37 / 56 / 26 PASS | 退出码 0 |
+| `test_learning_memory_tool.py` / `test_feedback_memory_trigger.py` | 87 / 157 PASS | 退出码 0 |
+| `test_learning_memory.py` / `test_learning_memory_state.py` | 126 / 216 PASS | 退出码 0 |
+
+全仓回归（本轮，40 个 `test_*.py`，1756 条 PASS、0 条 FAIL）：
+`test_agent_loop.py` 在 22 PASS 后 120s 超时（卡在 Ollama embedding 连接，基线同样如此）；
+`test_rag_service.py`、`test_embedding*.py` 等因 Ollama 缺席直接停在内置守卫，PASS=0。
+
+未解决的仍是同一个环境前提：本机没有运行 Ollama，凡是需要 embedding 的段落只能跑到守卫为止；
+仓库没有配置 GitHub Actions，check 数为 0，以上全部是本机实跑结果。
