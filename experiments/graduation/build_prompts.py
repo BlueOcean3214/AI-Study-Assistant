@@ -120,14 +120,23 @@ def project_api(config=None):
     }
 
 
-def activate_sample(sample_id, config, reuse=False):
-    """建库（或复用）并把 database.DATABASE_PATH 指向该样本的库。"""
+def activate_sample(sample_id, config, reuse=False, sample=None):
+    """建库（或复用）并把 database.DATABASE_PATH 指向该样本的库。
+
+    复用分支在切换 DATABASE_PATH、读取任何数据之前，先调用
+    seed_fixture.inspect_sample_db()：只有完整的库才能拿来出 Prompt，
+    残缺库必须在这里直接失败，而不是带着缺表继续生成。
+    """
+
+    sample = sample or seed_fixture.load_sample(sample_id, config)
 
     if reuse:
         db_path = seed_fixture.workspace_dir(config) / f"{sample_id}.db"
 
         if not db_path.is_file():
             raise FileNotFoundError(f"{sample_id} 还没有库，请先运行 seed_fixture.py")
+
+        seed_fixture.inspect_sample_db(db_path, sample)
     else:
         seeded = seed_fixture.seed_sample(sample_id, config)
 
@@ -364,7 +373,7 @@ def build_sample_prompts(sample_id, config, reuse=False):
     """构建一个样本的四组 Prompt（含核验与 Diff），不写文件。"""
 
     sample = seed_fixture.load_sample(sample_id, config)
-    db_path, api = activate_sample(sample_id, config, reuse=reuse)
+    db_path, api = activate_sample(sample_id, config, reuse=reuse, sample=sample)
     moment = seed_fixture.ref_datetime(config)
 
     inputs = collect_inputs(sample, config, api, moment)

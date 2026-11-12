@@ -42,18 +42,25 @@ $env:PYTHONIOENCODING='utf-8'
 ```
 
 `--reuse` 表示复用已建好的库（不重跑 rebuild）；不加则每次重新建库并重建记忆。
+`--reuse` 与 `--keep` 走同一套完整性校验：`check_memory.py --reuse` 与 `build_prompts.py --reuse`
+在读取库之前都先调用 `seed_fixture.inspect_sample_db()`，残缺库直接失败，不会带着缺表的库
+继续做 Gold Standard 核验或生成 Prompt。
 `seed_fixture.py --keep` 的语义是**只复用、不写入**：库已存在且**完整校验通过**时直接返回，不插入计划/反馈、
 也不重复重建；库不存在时照常创建。完整性校验逐项比对 Gold Standard 而不是只数行数——
 7 张业务表必须齐全（含 `memory_apply_cursor`）、反馈与计划条数一致、
 `learning_memories` 的 `(memory_type, subject_key)` 集合不多不少不重复、
-每条记忆的 `supports`/`contradicts` 证据行数逐条相符、`memory_pending_evidence` 为 0、
+每条记忆的 `supports`/`contradicts` 证据行数逐条相符、
+每条证据的 `memory_id`/`feedback_id`/`plan_id` 必须指向真实记录（表上没有实际外键，
+所以由脚手架逐行查孤立行）、`relation` 只允许 `supports`/`contradicts`、
+`memory_pending_evidence` 为 0、
 游标表有且仅有 `id=1` 一行且 `last_applied_feedback_id` 等于反馈高水位。
-任何一项不符直接报错，不会静默写到别的库。
+任何一项不符直接报错（报错写明异常类型与条数），不会静默写到别的库。
 
 三个脚本都支持 `--sample S3` 只跑单个样本，`--config <path>` 换配置文件。
 
-自测：`.\.venv\Scripts\python.exe test_graduation_experiments.py`（23 项，覆盖七个样本的四组构建、
-A/C 空反馈摘要与 B/D 真实摘要、核验的负向用例、`--keep` 的七种残缺库拒绝路径与正常复用）。
+自测：`.\.venv\Scripts\python.exe test_graduation_experiments.py`（33 项，覆盖七个样本的四组构建、
+A/C 空反馈摘要与 B/D 真实摘要、核验的负向用例、`--keep` 的七种残缺库 + 五种残缺证据拒绝路径、
+两个 `--reuse` 入口的负向用例与正常复用）。
 
 ## 产物位置
 

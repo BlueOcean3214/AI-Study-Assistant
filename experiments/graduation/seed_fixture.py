@@ -184,6 +184,49 @@ REQUIRED_TABLES = (
 
 CURSOR_COLUMNS = ("id", "last_applied_feedback_id", "updated_at")
 
+# 产品只往正式证据表写这两种关系；neutral 留在 pending 缓冲区，不能混进 memory_evidence
+EVIDENCE_RELATIONS = ("supports", "contradicts")
+
+
+def _evidence_anomalies(conn):
+    """逐行检查 memory_evidence 的引用完整性与 relation 合法性（只读，不改库）。
+
+    memory_evidence 建表时没有声明实际外键，SQLite 不会替脚手架兜底：
+    指向不存在记忆/反馈/计划的证据行、以及非法 relation，都只能在这里查出来。
+    返回异常 id 列表与非法 relation 计数，由 inspect_sample_db 汇总成一条报错。
+    """
+
+    def ids(sql):
+        return [row[0] for row in conn.execute(sql).fetchall()]
+
+    placeholders = ", ".join("?" for _ in EVIDENCE_RELATIONS)
+
+    return {
+        "orphan_memory_ids": ids(
+            "SELECT e.memory_id FROM memory_evidence e "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM learning_memories m WHERE m.id = e.memory_id)"
+        ),
+        "orphan_feedback_ids": ids(
+            "SELECT e.feedback_id FROM memory_evidence e "
+            "WHERE NOT EXISTS (SELECT 1 FROM feedbacks f WHERE f.id = e.feedback_id)"
+        ),
+        "orphan_plan_ids": ids(
+            "SELECT e.plan_id FROM memory_evidence e "
+            "WHERE e.plan_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM plans p WHERE p.id = e.plan_id)"
+        ),
+        "bad_relations": [
+            (relation, count)
+            for relation, count in conn.execute(
+                f"SELECT relation, COUNT(*) FROM memory_evidence "
+                f"WHERE relation NOT IN ({placeholders}) "
+                "GROUP BY relation ORDER BY relation",
+                EVIDENCE_RELATIONS,
+            ).fetchall()
+        ],
+    }
+
 
 def _db_state(db_path):
     """读出现有库的结构、行数与关键内容；缺表或不是 SQLite 时抛 RuntimeError（fail-closed）。"""
@@ -233,6 +276,7 @@ def _db_state(db_path):
                 "JOIN learning_memories m ON m.id = e.memory_id "
                 "GROUP BY m.memory_type, m.subject_key, e.relation"
             ).fetchall(),
+            "evidence_anomalies": _evidence_anomalies(conn),
         }
     except sqlite3.DatabaseError as exc:
         raise RuntimeError(f"{db_path.name} 不是可用的样本库：{exc}") from exc
@@ -241,7 +285,11 @@ def _db_state(db_path):
 
 
 def _evidence_totals(rows):
-    """把 (type, key, relation, count) 聚成 {(type, key): {supports, contradicts}}。"""
+    """把 (type, key, relation, count) 聚成 {(type, key): {supports, contradicts}}。
+
+    只累加两种正式关系；其它 relation 已被 _evidence_anomalies 判为非法，
+    不会走到这里被静默忽略。
+    """
 
     totals = {}
 
@@ -261,7 +309,9 @@ def inspect_sample_db(db_path, sample):
 
     逐项比对 Gold Standard，而不是只看总行数：
     记忆集合（少一条 / 多一条 / 重复一条）、每条记忆的 supports 与 contradicts 证据行数、
-    pending 缓冲区、游标表记录与反馈高水位。任何一项不符都判定为不可复用。
+    证据行的引用完整性（memory_id / feedback_id / plan_id 必须指向真实记录，relation 只允许
+    supports 与 contradicts）、pending 缓冲区、游标表记录与反馈高水位。
+    任何一项不符都判定为不可复用。全程只读，不修改库。
     """
 
     db_path = Path(db_path)
@@ -304,7 +354,36 @@ def inspect_sample_db(db_path, sample):
     if extra_keys:
         problems.append(f"多出 Gold Standard 之外的记忆 {extra_keys}")
 
-    # 3) 证据：每条记忆的 supports / contradicts 必须与 Gold Standard 逐条一致
+    # 3) 证据引用完整性：孤立的 memory_id / feedback_id / plan_id 与非法 relation 都不允许出现
+    anomalies = state["evidence_anomalies"]
+
+    if anomalies["orphan_memory_ids"]:
+        problems.append(
+            f"孤立证据 {len(anomalies['orphan_memory_ids'])} 条，memory_id "
+            f"{sorted(set(anomalies['orphan_memory_ids']))} 在 learning_memories 中不存在"
+        )
+
+    if anomalies["orphan_feedback_ids"]:
+        problems.append(
+            f"孤立证据 {len(anomalies['orphan_feedback_ids'])} 条，feedback_id "
+            f"{sorted(set(anomalies['orphan_feedback_ids']))} 在 feedbacks 中不存在"
+        )
+
+    if anomalies["orphan_plan_ids"]:
+        problems.append(
+            f"孤立证据 {len(anomalies['orphan_plan_ids'])} 条，plan_id "
+            f"{sorted(set(anomalies['orphan_plan_ids']))} 在 plans 中不存在"
+        )
+
+    if anomalies["bad_relations"]:
+        detail = "、".join(
+            f"{relation}×{count}" for relation, count in anomalies["bad_relations"]
+        )
+        problems.append(
+            f"非法证据关系 {detail}，只允许 {'/'.join(EVIDENCE_RELATIONS)}"
+        )
+
+    # 4) 证据：每条记忆的 supports / contradicts 必须与 Gold Standard 逐条一致
     totals = _evidence_totals(state["evidence"])
 
     for item in gold:
@@ -321,13 +400,13 @@ def inspect_sample_db(db_path, sample):
                 f"Gold Standard 要求 {want}"
             )
 
-    # 4) pending 缓冲区必须为空
+    # 5) pending 缓冲区必须为空
     if counts["memory_pending_evidence"] != 0:
         problems.append(
             f"pending 证据 {counts['memory_pending_evidence']} 条，应为 0"
         )
 
-    # 5) 游标表：结构完整、有且仅有 id=1 的记录、游标值与反馈高水位一致
+    # 6) 游标表：结构完整、有且仅有 id=1 的记录、游标值与反馈高水位一致
     missing_columns = [
         name for name in CURSOR_COLUMNS if name not in state["cursor_columns"]
     ]

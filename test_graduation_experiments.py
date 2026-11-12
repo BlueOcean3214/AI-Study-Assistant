@@ -674,11 +674,11 @@ def _sql(db_path, *statements):
         conn.close()
 
 
-def _expect_keep_failure(mutate, expected_substring):
-    """把 S1 的库改坏 → --keep 必须报错 → 还原字节 → 必须又能正常复用。"""
+def _expect_keep_failure(mutate, expected_substring, sample_id="S1"):
+    """把样本库改坏 → --keep 必须报错 → 还原字节 → 必须又能正常复用。"""
 
     config = _config()
-    seeded = seed_fixture.seed_sample("S1", config)
+    seeded = seed_fixture.seed_sample(sample_id, config)
     db_path = Path(seeded["db_path"])
     healthy = db_path.read_bytes()
 
@@ -689,7 +689,7 @@ def _expect_keep_failure(mutate, expected_substring):
         gc.collect()
 
         try:
-            seed_fixture.seed_sample("S1", config, keep=True)
+            seed_fixture.seed_sample(sample_id, config, keep=True)
         except RuntimeError as exc:
             assert expected_substring in str(exc), (expected_substring, str(exc))
         else:
@@ -702,7 +702,7 @@ def _expect_keep_failure(mutate, expected_substring):
         gc.collect()
 
     # 还原后必须仍可复用：证明上面的失败确实来自被改坏的库，而不是路径问题
-    restored = seed_fixture.seed_sample("S1", config, keep=True)
+    restored = seed_fixture.seed_sample(sample_id, config, keep=True)
 
     assert restored["reused"] is True and restored["rebuild"] is None, restored
     assert restored["counts"]["memory_apply_cursor"] == 1, restored["counts"]
@@ -741,16 +741,22 @@ def test_keep_rejects_deleted_evidence():
 
 
 def test_keep_rejects_extra_evidence():
+    # S5 的证据矩阵有空闲 (memory_id, feedback_id) 组合（唯一索引不许重复），
+    # 其余样本矩阵已满，只能在这里插入「引用全部合法但多出来」的一条证据。
     def add_evidence(db_path):
         _sql(
             db_path,
             "INSERT INTO memory_evidence "
             "(memory_id, feedback_id, plan_id, episode, relation, weight, created_at) "
-            "SELECT id, 9999, NULL, 1, 'supports', 1.0, '2026-11-12T21:00:00' "
-            "FROM learning_memories ORDER BY id LIMIT 1",
+            "SELECT m.id, f.id, NULL, 1, 'supports', 1.0, '2026-11-12T21:00:00' "
+            "FROM learning_memories m CROSS JOIN feedbacks f "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM memory_evidence e "
+            "WHERE e.memory_id = m.id AND e.feedback_id = f.id) "
+            "LIMIT 1",
         )
 
-    _expect_keep_failure(add_evidence, "supports/contradicts")
+    _expect_keep_failure(add_evidence, "supports/contradicts", sample_id="S5")
 
 
 def test_keep_rejects_wrong_memory_key_with_same_count():
@@ -799,6 +805,184 @@ def test_keep_reuses_all_seven_healthy_databases():
 
 
 # ---------------------------------------------------------------------------
+# T24 证据引用完整性：孤立引用与非法 relation 都必须被拒绝
+# ---------------------------------------------------------------------------
+
+
+def test_keep_rejects_orphan_memory_id_evidence():
+    def add_orphan_memory(db_path):
+        _sql(
+            db_path,
+            "INSERT INTO memory_evidence "
+            "(memory_id, feedback_id, plan_id, episode, relation, weight, created_at) "
+            "SELECT 999999, MIN(id), NULL, 1, 'supports', 1.0, '2026-11-12T21:00:00' "
+            "FROM feedbacks",
+        )
+
+    _expect_keep_failure(add_orphan_memory, "learning_memories 中不存在")
+
+
+def test_keep_rejects_orphan_feedback_id_evidence():
+    def add_orphan_feedback(db_path):
+        _sql(
+            db_path,
+            "INSERT INTO memory_evidence "
+            "(memory_id, feedback_id, plan_id, episode, relation, weight, created_at) "
+            "SELECT MIN(id), 999999, NULL, 1, 'supports', 1.0, '2026-11-12T21:00:00' "
+            "FROM learning_memories",
+        )
+
+    _expect_keep_failure(add_orphan_feedback, "feedbacks 中不存在")
+
+
+def test_keep_rejects_orphan_plan_id_on_existing_evidence():
+    def point_to_missing_plan(db_path):
+        _sql(
+            db_path,
+            "UPDATE memory_evidence SET plan_id = 999999 "
+            "WHERE id = (SELECT MIN(id) FROM memory_evidence)",
+        )
+
+    _expect_keep_failure(point_to_missing_plan, "plans 中不存在")
+
+
+def test_keep_rejects_neutral_relation_evidence():
+    def add_neutral(db_path):
+        _sql(
+            db_path,
+            "INSERT INTO memory_evidence "
+            "(memory_id, feedback_id, plan_id, episode, relation, weight, created_at) "
+            "SELECT m.id, f.id, NULL, 1, 'neutral', 1.0, '2026-11-12T21:00:00' "
+            "FROM learning_memories m CROSS JOIN feedbacks f "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM memory_evidence e "
+            "WHERE e.memory_id = m.id AND e.feedback_id = f.id) "
+            "LIMIT 1",
+        )
+
+    _expect_keep_failure(add_neutral, "非法证据关系 neutral×1", sample_id="S5")
+
+
+def test_keep_rejects_unknown_relation_evidence():
+    def add_unsupported(db_path):
+        _sql(
+            db_path,
+            "INSERT INTO memory_evidence "
+            "(memory_id, feedback_id, plan_id, episode, relation, weight, created_at) "
+            "SELECT m.id, f.id, NULL, 1, 'unsupported', 1.0, '2026-11-12T21:00:00' "
+            "FROM learning_memories m CROSS JOIN feedbacks f "
+            "WHERE NOT EXISTS ("
+            "SELECT 1 FROM memory_evidence e "
+            "WHERE e.memory_id = m.id AND e.feedback_id = f.id) "
+            "LIMIT 1",
+        )
+
+    _expect_keep_failure(add_unsupported, "非法证据关系 unsupported×1", sample_id="S5")
+
+
+# ---------------------------------------------------------------------------
+# T25 所有 --reuse 入口都必须先做同一套完整性检查
+# ---------------------------------------------------------------------------
+
+
+def _check_reuse_entry(config):
+    return check_memory.check_sample("S1", config, reuse=True)
+
+
+def _build_reuse_entry(config):
+    return build_prompts.build_sample_prompts("S1", config, reuse=True)
+
+
+def _expect_reuse_failure(entry, mutate, expected_substring):
+    """把 S1 的库改坏 → 复用入口必须报错 → 还原字节 → 入口必须又能正常运行。
+
+    两个入口（check_memory --reuse 与 build_prompts --reuse）都走同一个
+    inspect_sample_db()，这里验证它们确实在读取数据之前就 fail-closed。
+    """
+
+    config = _config()
+    seeded = seed_fixture.seed_sample("S1", config)
+    db_path = Path(seeded["db_path"])
+    healthy = db_path.read_bytes()
+
+    gc.collect()
+
+    try:
+        mutate(db_path)
+        gc.collect()
+
+        try:
+            entry(config)
+        except RuntimeError as exc:
+            assert expected_substring in str(exc), (expected_substring, str(exc))
+        else:
+            raise AssertionError(
+                f"残缺库必须被复用入口拒绝（期望包含「{expected_substring}」）"
+            )
+    finally:
+        gc.collect()
+        db_path.write_bytes(healthy)
+        gc.collect()
+
+    # 还原后入口必须正常运行：证明失败来自库缺陷，不是路径或状态问题
+    return entry(config)
+
+
+def _drop_cursor_table(db_path):
+    _sql(db_path, "DROP TABLE memory_apply_cursor")
+
+
+def _drop_first_evidence(db_path):
+    _sql(
+        db_path,
+        "DELETE FROM memory_evidence WHERE id = "
+        "(SELECT MIN(id) FROM memory_evidence)",
+    )
+
+
+def test_check_reuse_rejects_missing_cursor_table():
+    result = _expect_reuse_failure(_check_reuse_entry, _drop_cursor_table, "缺少表")
+
+    assert result["failure_count"] == 0, result
+
+
+def test_check_reuse_rejects_deleted_evidence():
+    result = _expect_reuse_failure(
+        _check_reuse_entry, _drop_first_evidence, "supports/contradicts"
+    )
+
+    assert result["failure_count"] == 0, result
+
+
+def test_build_reuse_rejects_missing_cursor_table():
+    result = _expect_reuse_failure(_build_reuse_entry, _drop_cursor_table, "缺少表")
+
+    assert [c for c in result["checks"] if not c[1]] == [], result["checks"]
+
+
+def test_build_reuse_rejects_deleted_evidence():
+    result = _expect_reuse_failure(
+        _build_reuse_entry, _drop_first_evidence, "supports/contradicts"
+    )
+
+    assert [c for c in result["checks"] if not c[1]] == [], result["checks"]
+
+
+def test_reuse_entries_accept_all_healthy_databases():
+    config = _config()
+
+    for sample_id in seed_fixture.sample_ids(config):
+        seed_fixture.seed_sample(sample_id, config)
+
+        checked = check_memory.check_sample(sample_id, config, reuse=True)
+        assert checked["failure_count"] == 0, (sample_id, checked["reasons"])
+
+        built = build_prompts.build_sample_prompts(sample_id, config, reuse=True)
+        failed = [c for c in built["checks"] if not c[1]]
+        assert failed == [], (sample_id, failed)
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -830,6 +1014,16 @@ def _run_all():
         test_keep_rejects_wrong_memory_key_with_same_count,
         test_keep_rejects_pending_evidence,
         test_keep_reuses_all_seven_healthy_databases,
+        test_keep_rejects_orphan_memory_id_evidence,
+        test_keep_rejects_orphan_feedback_id_evidence,
+        test_keep_rejects_orphan_plan_id_on_existing_evidence,
+        test_keep_rejects_neutral_relation_evidence,
+        test_keep_rejects_unknown_relation_evidence,
+        test_check_reuse_rejects_missing_cursor_table,
+        test_check_reuse_rejects_deleted_evidence,
+        test_build_reuse_rejects_missing_cursor_table,
+        test_build_reuse_rejects_deleted_evidence,
+        test_reuse_entries_accept_all_healthy_databases,
     ]
 
     for test in tests:

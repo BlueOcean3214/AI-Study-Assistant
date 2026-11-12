@@ -106,10 +106,16 @@ def check_sample(sample_id, config, reuse=False):
 
     if reuse:
         db_path = seed_fixture.workspace_dir(config) / f"{sample_id}.db"
+
         if not db_path.is_file():
             raise FileNotFoundError(f"{sample_id} 还没有库，请先运行 seed_fixture.py")
+
+        # 复用前必须先验完整性：文件存在不等于「已成功重建」，
+        # 缺表或引用残缺的库不能绕过检查直接进入 Gold Standard 核验。
+        seed_fixture.inspect_sample_db(db_path, sample)
+
         dump = seed_fixture.dump_memories(db_path)
-        rebuild = {"ok": True, "reused": True}
+        rebuild = {"ok": True, "reused": True, "verified": True}
     else:
         seeded = seed_fixture.seed_sample(sample_id, config)
         db_path = Path(seeded["db_path"])
