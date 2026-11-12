@@ -3,6 +3,8 @@
 对外提供四个函数：
     get_recent_feedback(days=7)        只读：最近学习反馈 + 确定性统计
     search_knowledge(query, top_k=3)   只读：知识库语义检索（内部复用 rag_service）
+    get_learning_memory(memory_type=None, subject=None, limit=5)
+                                       只读：程序生成的长期学习记忆（复用 memory_service.retrieve）
     validate_plan_for_save(plan)       只读校验：计划保存前的确定性校验入口
     save_plan(plan, plan_date, confirmation_id)  唯一写入口：保存"用户已确认"的计划
 
@@ -28,7 +30,10 @@ save_plan 与其他工具的本质区别：
     plan_service.save_plan（旧 API 路径，confirmed_by_user 参数不允许出现在 Agent 工具面）
 """
 
+import json
+
 import embedding_service
+import memory_service
 import plan_service
 import rag_service
 import ai_service
@@ -49,10 +54,19 @@ MAX_TOP_K = 5
 MAX_QUERY_CHARS = 200
 MAX_RESULT_CHARS = 500
 
+# ---- 长期记忆 Tool 的参数上限（v16 §6.2） ----
+
+MEMORY_TYPES = ("difficulty", "task_performance", "time_pattern", "task_topic")
+DEFAULT_MEMORY_LIMIT = 5
+MAX_MEMORY_LIMIT = 5
+MAX_MEMORY_SUBJECT_CHARS = 60
+MAX_MEMORY_RESULT_CHARS = 2000
+
 # ---- 错误类型（供未来的 Guardrail 层区分“参数错误”和“服务异常”） ----
 
 ERROR_INVALID_ARGUMENT = "invalid_argument"
 ERROR_EMBEDDING_UNAVAILABLE = "embedding_service_unavailable"
+ERROR_MEMORY_UNAVAILABLE = "memory_unavailable"
 ERROR_UNEXPECTED = "unexpected_error"
 
 
@@ -170,6 +184,162 @@ def get_recent_feedback(days=DEFAULT_FEEDBACK_DAYS):
         "summary": summary,
         "feedback": [_sanitize_feedback(row) for row in rows],
     }
+
+
+def _memory_failure(message, error_type):
+    """get_learning_memory 的失败结构（字段与成功路径完全一致）。"""
+
+    return {
+        "ok": False,
+        "count": 0,
+        "memories": [],
+        "reason": None,
+        "error": message,
+        "error_type": error_type,
+        "info": {"dropped_by_budget": 0, "chars": 0, "max_chars": MAX_MEMORY_RESULT_CHARS},
+    }
+
+
+def _sanitize_memory(row):
+    """把一条记忆投影成 Tool 可见字段。
+
+    刻意不返回 memory_id / value_json / 事件记录 / pending 缓冲区：
+    Agent 只需要"程序生成的结论"，任何内部键都会诱导它自行推断统计。
+    """
+
+    return {
+        "type": row.get("memory_type"),
+        "subject": row.get("subject_label") or row.get("subject_key"),
+        "content": row.get("content"),
+        "strength": row.get("strength"),
+        "evidence_count": row.get("evidence_count"),
+        "episode": row.get("episode"),
+        "evidence_feedback_ids": list(row.get("evidence_feedback_ids") or []),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def get_learning_memory(memory_type=None, subject=None, limit=DEFAULT_MEMORY_LIMIT):
+    """Tool：读取程序生成的长期学习记忆（v16 §6.2，只读）。
+
+    - memory_type 只能取 difficulty / task_performance / time_pattern / task_topic；
+      非法值直接拒绝，绝不"忽略它去查全部"（静默扩范围会让 Agent 以为过滤生效了）
+    - subject 为 1~60 字符，由 retrieve() 归一化后精确匹配
+    - limit 为 1~5 的整数（不是"最多 5 条"的软约束，超出直接拒绝）
+    - 只调用 memory_service.retrieve()，不复制检索或状态机逻辑
+    - 返回不含 memory_id / value_json / 事件 / pending；每条最多 5 个证据 id
+    - 总返回字符不超过 MAX_MEMORY_RESULT_CHARS，超出按 strength 升序丢弃并记 info
+    - 记忆是"过去的事实"，不是用户当前状态；strength 不是概率（由 Prompt 约束表达）
+    """
+
+    if memory_type is not None:
+        if not isinstance(memory_type, str) or memory_type not in MEMORY_TYPES:
+            return _memory_failure(
+                f"memory_type 必须是 {' / '.join(MEMORY_TYPES)} 之一",
+                ERROR_INVALID_ARGUMENT,
+            )
+
+    if subject is not None:
+        if not isinstance(subject, str) or not subject.strip():
+            return _memory_failure("subject 必须是非空字符串", ERROR_INVALID_ARGUMENT)
+
+        subject = subject.strip()
+
+        if len(subject) > MAX_MEMORY_SUBJECT_CHARS:
+            return _memory_failure(
+                f"subject 过长（最多 {MAX_MEMORY_SUBJECT_CHARS} 个字符）",
+                ERROR_INVALID_ARGUMENT,
+            )
+
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= MAX_MEMORY_LIMIT
+    ):
+        return _memory_failure(
+            f"limit 必须是 1-{MAX_MEMORY_LIMIT} 的整数", ERROR_INVALID_ARGUMENT
+        )
+
+    try:
+        result = memory_service.retrieve(
+            memory_type=memory_type,
+            subject=subject,
+            status="active",
+            limit=limit,
+        )
+    except Exception as error:  # noqa: BLE001 - 记忆层异常不能炸掉 Agent Loop
+        return _memory_failure(
+            f"记忆检索失败：{type(error).__name__}: {error}", ERROR_MEMORY_UNAVAILABLE
+        )
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        message = "记忆检索失败"
+
+        if isinstance(result, dict) and result.get("message"):
+            message = result["message"]
+
+        error_type = ERROR_MEMORY_UNAVAILABLE
+
+        if isinstance(result, dict) and result.get("error_type"):
+            error_type = result["error_type"]
+
+        return _memory_failure(message, error_type)
+
+    kept = [_sanitize_memory(row) for row in result.get("memories") or []]
+    dropped = 0
+
+    def build(rows, dropped_count):
+        if dropped_count:
+            # 截断必须让模型看见，否则它会把"只返回前几条"当成完整结论
+            reason = (
+                f"返回内容超过 {MAX_MEMORY_RESULT_CHARS} 字符预算，"
+                f"已按强度升序丢弃 {dropped_count} 条记忆"
+            )
+        elif rows:
+            reason = None
+        else:
+            reason = "没有符合条件的学习记忆"
+
+        payload = {
+            "ok": True,
+            "count": len(rows),
+            "memories": rows,
+            "reason": reason,
+            "error": None,
+            "error_type": None,
+            "info": {
+                "dropped_by_budget": dropped_count,
+                "chars": 0,
+                "max_chars": MAX_MEMORY_RESULT_CHARS,
+            },
+        }
+
+        payload["info"]["chars"] = 0
+
+        # chars 自身也会占字符：迭代到稳定，保证 info.chars 与真实长度一致
+        for _ in range(5):
+            measured = len(json.dumps(payload, ensure_ascii=False))
+
+            if measured == payload["info"]["chars"]:
+                break
+
+            payload["info"]["chars"] = measured
+
+        return payload
+
+    while True:
+        payload = build(kept, dropped)
+
+        if not kept or payload["info"]["chars"] <= MAX_MEMORY_RESULT_CHARS:
+            return payload
+
+        # 按 strength 升序丢弃：同强度时丢靠后的一条，保留更强的靠前结果
+        weakest = min(
+            range(len(kept)),
+            key=lambda index: (kept[index].get("strength") or 0.0, -index),
+        )
+        kept.pop(weakest)
+        dropped += 1
 
 
 def search_knowledge(query, top_k=DEFAULT_TOP_K):

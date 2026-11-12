@@ -13,12 +13,13 @@
 """
 
 from agent_schema import ARGUMENT_RULES, TOOL_NAMES
-from agent_tools import get_recent_feedback, save_plan, search_knowledge
+from agent_tools import get_learning_memory, get_recent_feedback, save_plan, search_knowledge
 
 
 # 显式白名单：Agent 产生的 tool name 必须在这里
 TOOLS = {
     "get_recent_feedback": get_recent_feedback,
+    "get_learning_memory": get_learning_memory,
     "search_knowledge": search_knowledge,
     "save_plan": save_plan,
 }
@@ -92,6 +93,11 @@ def _validate_arguments(tool_name, arguments):
 
             if len(value) > rule["max_length"]:
                 return None, f"{name} 过长（最多 {rule['max_length']} 个字符）"
+
+            allowed = rule.get("enum")
+
+            if allowed and value not in allowed:
+                return None, f"{name} 必须是 {', '.join(allowed)} 之一"
 
         elif rule["type"] == "object":
             if not isinstance(value, dict):

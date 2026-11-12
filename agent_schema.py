@@ -5,6 +5,7 @@
 
 当前开放的工具：
     get_recent_feedback          只读：学习反馈
+    get_learning_memory          只读：程序生成的长期学习记忆
     search_knowledge             只读：知识库检索
     save_plan                    写入：保存"用户已确认"的计划（凭证由服务端校验）
 
@@ -23,10 +24,14 @@ from copy import deepcopy
 
 from agent_tools import (
     DEFAULT_FEEDBACK_DAYS,
+    DEFAULT_MEMORY_LIMIT,
     DEFAULT_TOP_K,
     MAX_FEEDBACK_DAYS,
+    MAX_MEMORY_LIMIT,
+    MAX_MEMORY_SUBJECT_CHARS,
     MAX_QUERY_CHARS,
     MAX_TOP_K,
+    MEMORY_TYPES,
 )
 
 
@@ -45,6 +50,43 @@ TOOL_SCHEMAS = [
                             f"查询最近多少天，范围 1-{MAX_FEEDBACK_DAYS}，"
                             f"默认 {DEFAULT_FEEDBACK_DAYS}"
                         ),
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_learning_memory",
+            "description": (
+                "获取程序生成并维护的长期学习记忆（过去的事实，不是用户当前状态；"
+                "strength 是程序算出的可信度权重，不是概率）。"
+                "仅当需要结合用户以往的学习情况、反复出现的困难或近期关注的主题时调用；"
+                "纯概念解释不要调用。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "memory_type": {
+                        "type": "string",
+                        "enum": list(MEMORY_TYPES),
+                        "description": (
+                            "记忆类型：" + " / ".join(MEMORY_TYPES) +
+                            "（difficulty=反复卡在难度，task_performance=完成率，"
+                            "time_pattern=用时倍率，task_topic=反复出现的主题）"
+                        ),
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": (
+                            f"主题/任务名，1-{MAX_MEMORY_SUBJECT_CHARS} 个字符，"
+                            "归一化后精确匹配"
+                        ),
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": f"最多返回 1-{MAX_MEMORY_LIMIT} 条，默认 {DEFAULT_MEMORY_LIMIT}",
                     },
                 },
             },
@@ -109,7 +151,12 @@ TOOL_SCHEMAS = [
 
 
 # 开放给 LLM 的工具名（白名单的唯一来源）
-TOOL_NAMES = ("get_recent_feedback", "search_knowledge", "save_plan")
+TOOL_NAMES = (
+    "get_recent_feedback",
+    "get_learning_memory",
+    "search_knowledge",
+    "save_plan",
+)
 
 
 # Dispatcher 用的参数守门规则（与上面的 parameters 描述一一对应，
@@ -120,6 +167,27 @@ ARGUMENT_RULES = {
             "type": "integer",
             "min": 1,
             "max": MAX_FEEDBACK_DAYS,
+            "required": False,
+        },
+    },
+    "get_learning_memory": {
+        "memory_type": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": 32,
+            "enum": MEMORY_TYPES,
+            "required": False,
+        },
+        "subject": {
+            "type": "string",
+            "min_length": 1,
+            "max_length": MAX_MEMORY_SUBJECT_CHARS,
+            "required": False,
+        },
+        "limit": {
+            "type": "integer",
+            "min": 1,
+            "max": MAX_MEMORY_LIMIT,
             "required": False,
         },
     },

@@ -64,11 +64,16 @@ database.insert_feedback(
 try:
     # 1. 白名单
     check(
-        "白名单为两个只读工具 + 受确认保护的 save_plan",
-        set(agent_dispatcher.TOOLS) == {"get_recent_feedback", "search_knowledge", "save_plan"},
+        "白名单为三个只读工具 + 受确认保护的 save_plan",
+        set(agent_dispatcher.TOOLS)
+        == {"get_recent_feedback", "get_learning_memory", "search_knowledge", "save_plan"},
         f"tools={sorted(agent_dispatcher.TOOLS)}",
     )
     check("save_plan 已加入白名单", "save_plan" in agent_dispatcher.TOOLS)
+    check(
+        "get_learning_memory 已加入白名单",
+        "get_learning_memory" in agent_dispatcher.TOOLS,
+    )
     for forbidden in ("insert_feedback", "delete_all_feedback", "init_db", "migrate_json_to_db",
                       "get_embedding", "get_embeddings", "compact_cache", "archive_cache",
                       "save_document", "call_ollama", "validate_plan_for_save"):
