@@ -21,7 +21,8 @@
         填写 query 与 expected_source 并把 verified 改为 true，脚本才会采用。
 
     python eval_rag_metrics.py rag --labels rag_eval_labels.json [--top-k 3]
-        用 rag_service.retrieve_chunks 真实检索（需要 Ollama + bge-m3），
+        用 rag_service.retrieve_chunks 真实检索（需要可用的 Embedding API，
+        见 docs/MODEL-API-MIGRATION.md），
         实时计算 Recall@3 / MRR / 检索延迟。verified=false 的条目跳过并明确提示。
 
     python eval_rag_metrics.py rag-log --labels rag_eval_labels.json --file rag_metrics.jsonl
@@ -480,7 +481,7 @@ def cmd_rag(args):
     if embedding_failed:
         print(f"MISSING: {embedding_failed}")
         print("        检索服务不可用时无法得到真实指标，不输出任何数字。")
-        print("        请确认 Ollama 已启动且已 ollama pull bge-m3。")
+        print("        请确认云端 Embedding API 配置可用（EMBEDDING_PROVIDER/EMBEDDING_BASE_URL/EMBEDDING_MODEL/EMBEDDING_API_KEY）。")
         return 2
 
     recall3, mrr, per_case = compute_rag_metrics(rows, args.top_k)
@@ -583,7 +584,7 @@ def main(argv=None):
 
     sub.add_parser("labels-template", help="根据 knowledge/ 真实文件生成标注模板（verified=false）")
 
-    rag = sub.add_parser("rag", help="真实检索计算 Recall@3 / MRR（需要 Ollama + bge-m3）")
+    rag = sub.add_parser("rag", help="真实检索计算 Recall@3 / MRR（需要可用的 Embedding API）")
     rag.add_argument("--labels", default=str(LABELS_DEFAULT))
     rag.add_argument("--top-k", type=int, default=3)
 

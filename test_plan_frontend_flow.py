@@ -14,12 +14,8 @@
 
 import os
 
-# 测试夹具：真实模型/Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
+# 确定性测试：不配置模型后端（stub_app 子进程用 stub_embedding，不依赖本地 Ollama）
 # uvicorn 子进程继承本进程环境变量
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
-os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
 
 import socket
 import sqlite3

@@ -17,9 +17,13 @@ LangGraph 计划工作流全部走同一个入口，因此**只配一处**即可
 | 环境变量 | 必填 | 说明 | 默认值 |
 | --- | --- | --- | --- |
 | `LLM_PROVIDER` | 否 | `openai_compatible`（默认）或 `ollama` | `openai_compatible` |
-| `LLM_BASE_URL` | 是（云端） | 服务商 OpenAI 兼容地址，例如 `https://<服务商>/v1` | `https://dashscope.aliyuncs.com/compatible-mode/v1` |
+| `LLM_BASE_URL` | 是（云端） | 服务商 OpenAI 兼容地址，例如 `https://<服务商>/v1` | `https://dashscope.aliyuncs.com/compatible-mode/v1`（代码内置**示例值**，非用户已确认配置） |
 | `LLM_API_KEY` | 是（云端） | 服务商 Key，**只从环境变量读，绝不写进代码/README/日志** | 无 |
-| `LLM_MODEL` | 否 | 对话模型名，以服务商控制台实际可用为准 | 见 `llm_client.DEFAULT_MODEL` |
+| `LLM_MODEL` | 否 | 对话模型名，以服务商控制台实际可用为准 | 见 `llm_client.DEFAULT_MODEL`（`qwen-plus`，同样是**示例值**） |
+
+> 说明：当前只明确了「对话模型和 Embedding 模型均使用云端 API」，**具体服务商、模型名称、
+> Base URL 和 Embedding 维度需以实际配置为准**。上表与下表里出现的 DashScope / `qwen-plus` /
+> `text-embedding-v4` / `1024` 都只是代码内置的示例默认值，不代表用户已经确认的实际配置。
 
 配置读取点：`llm_client.py:163` `get_settings()`。
 
@@ -38,8 +42,8 @@ Embedding 统一由 `embedding_service.py` 读取配置，文档入库与查询�
 | `EMBEDDING_PROVIDER` | 否 | `openai_compatible`（默认）或 `ollama` | `openai_compatible` |
 | `EMBEDDING_BASE_URL` | 是（云端） | OpenAI 兼容地址 | 见 `embedding_service.DEFAULT_BASE_URL` |
 | `EMBEDDING_API_KEY` | 是（云端） | 服务商 Key | 无 |
-| `EMBEDDING_MODEL` | 否 | Embedding 模型名 | `text-embedding-v4` |
-| `EMBEDDING_DIMENSIONS` | 否 | 向量维度，必须与服务商返回一致 | `1024` |
+| `EMBEDDING_MODEL` | 否 | Embedding 模型名 | `text-embedding-v4`（**示例值**，以实际服务商为准） |
+| `EMBEDDING_DIMENSIONS` | 否 | 向量维度，必须与服务商返回一致 | `1024`（**示例值**，真实维度需实际调用确认） |
 
 配置读取点：`embedding_service.py:135` `get_settings()`。
 

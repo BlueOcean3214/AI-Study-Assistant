@@ -21,8 +21,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent
 
 os.environ.setdefault("FEEDBACK_DB_PATH", str(PROJECT_DIR / "_test_memory_tool_env.db"))
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+# 确定性测试：不配置模型后端（不依赖本地 Ollama，也不调用云端 API 产生费用）
 
 import agent_dispatcher  # noqa: E402
 import agent_schema  # noqa: E402

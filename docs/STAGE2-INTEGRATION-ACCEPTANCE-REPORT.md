@@ -40,7 +40,7 @@
 
 | 项目 | 实际值 |
 |---|---|
-| 新 Embedding 模型 | 由 `EMBEDDING_MODEL` 指定，`openai_compatible` 默认 `text-embedding-v4`；**具体服务商与模型名待用户提供**（用户已选「换别的 OpenAI 兼容服务商」，尚未给出 base URL / 模型名 / Key） |
+| 新 Embedding 模型 | 当前已明确要求对话模型和 Embedding 模型均使用云端 API，**具体服务商、模型名称、Base URL 和 Embedding 维度需以实际配置为准**。代码内置默认值 `text-embedding-v4` / `dashscope.aliyuncs.com/compatible-mode/v1` 仅为示例，不代表用户已确认的实际配置 |
 | 期望维度 | `EMBEDDING_DIMENSIONS` 默认 `1024`；运行时对每条返回向量强制校验维度，不一致即 `EmbeddingError` |
 | 原始文档数量 | 2 篇（`knowledge/math.txt` 480B、`knowledge/条件概率.txt` 136B） |
 | 文本块数量 | 7 个（`rag_service.load_chunks()`，`CHUNK_MAX_CHARS=400`，本次实测） |
@@ -225,28 +225,57 @@ GET /ask -> 200 {'answer': '', 'sources': [], 'error': '模型配置错误：使
 
 **P0：无。**
 
-**P1：无。**
+**P1：无（复审指出的「ollama 可冒充云端」问题已修复，见 7.1）。**
+
+### 7.1 复审 P1 修复证据（真实 API 测试严格限定云端）
+
+`real_backend.py` 新增只认云端的就绪检查，`provider != "openai_compatible"` 一律不算 ready：
+
+| 函数 | 判定依据 |
+|---|---|
+| `cloud_chat_status()` / `cloud_chat_ready()` | `llm_client.get_settings().provider == "openai_compatible"` 且 model/base_url/api_key 齐备 |
+| `cloud_embedding_status()` / `cloud_embedding_ready()` | `embedding_service.get_settings().provider == "openai_compatible"` 且字段齐备 |
+| `local_backend_status()` | 旧 Ollama 探测，**纯诊断**，不参与任何验收断言 |
+
+实测反证（把环境变量显式设成本地后端，测试必须 SKIP 而不是通过）：
+
+```
+# LLM_PROVIDER=ollama  EMBEDDING_PROVIDER=ollama
+INFO: 对话 provider=ollama model=qwen3.5:4b base_url=http://localhost:11434/api/chat api_key=缺失
+INFO: Embedding provider=ollama model=bge-m3 base_url=http://localhost:11434 api_key=缺失
+[SKIP] 真实 API 冒烟测试 未执行：对话：provider=ollama 是本地后端（Ollama），不属于本次云端 API 验收；
+       Embedding：provider=ollama 是本地后端（Ollama），不属于本次云端 API 验收
+       这不是通过：本地 Ollama 不算真实 API，配置好云端后端后必须重跑。
+[exit code: 0]
+
+# LLM_PROVIDER=ollama  EMBEDDING_PROVIDER=openai_compatible（无 Key）
+[SKIP] 真实 API 冒烟测试 未执行：对话：provider=ollama 是本地后端（Ollama），不属于本次云端 API 验收；
+       Embedding：使用 openai_compatible Embedding 时必须设置 EMBEDDING_API_KEY
+[exit code: 0]
+```
+
+三处真实后端测试也各自加了显式断言：`test_real_api_smoke.py`（对话与 Embedding 双方 provider 必须是 `openai_compatible`、base_url 非本机地址、描述不含 Key）、`test_embedding.py` B 节、`test_openai.py` B 节（后两者先调 `cloud_*_ready()`，SKIP 文案直接写出实际 provider/model/url）。
 
 **P2-1（阻断真实 API 验收）真实 API 冒烟未执行。**
-- 复现：`python test_real_api_smoke.py` → `[SKIP] … 这不是通过；配置好后端后必须重跑本文件`；`real_backend.chat_ready()==False`、`embedding_ready()==False`。
-- 原因：用户已选择「换别的 OpenAI 兼容服务商」，但尚未提供 `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY`、`EMBEDDING_BASE_URL` / `EMBEDDING_MODEL` / `EMBEDDING_API_KEY`。
-- 影响：Task B（真实 API）与第 4 节中 7 处 SKIP 无法消除；不影响确定性测试结论。
+- 复现：`python test_real_api_smoke.py` → `[SKIP] … 这不是通过；配置好云端后端后必须重跑本文件`；`real_backend.cloud_chat_ready()==False`、`cloud_embedding_ready()==False`。
+- 原因：当前已明确要求对话模型和 Embedding 模型均使用云端 API，但本机 `.env` 不存在，9 个配置变量全部缺失（`LLM_PROVIDER`/`LLM_BASE_URL`/`LLM_MODEL`/`LLM_API_KEY`/`EMBEDDING_PROVIDER`/`EMBEDDING_BASE_URL`/`EMBEDDING_MODEL`/`EMBEDDING_DIMENSIONS`/`EMBEDDING_API_KEY`），**具体服务商、模型名称、Base URL 和 Embedding 维度需以实际配置为准**。
+- 影响：Task B（真实 API）与第 4 节中 SKIP 项无法消除；不影响确定性测试结论。
 
 **P2-2 新 Embedding 模型的实际维度未经真实调用确认。**
 - 现状：仅按 `EMBEDDING_DIMENSIONS` 默认 1024 做运行时校验；任务要求「实际调用确认维度」，这一条待真实 API 后补测。
 - 复现：`python test_embedding.py` → B 节 SKIP。
 
-**P3-1 部分测试文件仍保留本地模型夹具（不影响运行，但会误导）。**
-- 位置：`test_feedback_memory_trigger.py:28-30`、`test_learning_memory.py:22-24`、`test_feedback_plan_link.py:39-41`、`test_agent_eval.py:9-13`、`test_agent_tools.py:17-20`、`test_document_service.py:12-15`、`test_agent_loop.py:14-18`、`test_agent_plan_draft.py:21-25`、`test_embedding_batching.py:19-22`、`test_langchain_agent.py:23-24`、`test_memory_context.py:27-28`、`test_memory_grounding.py:27-29`、`test_feedback_enum_contract.py:25-27`、`test_learning_memory_tool.py:24-25`，均为 `os.environ.setdefault("EMBEDDING_PROVIDER","ollama")` / `EMBEDDING_MODEL=bge-m3` / `OLLAMA_MODEL`。
-- 为什么不是 P2：这些只是「显式选择 ollama」的旧夹具，默认 Provider 已是云端，且没有 Key 时会明确报错，不会静默回退；本次 41 个脚本在 Ollama 未启动的情况下全部 exit=0。
+**P3-1（本轮已修复）测试文件中的本地模型夹具已清理。**
+- 上一版：14 个测试文件保留 `os.environ.setdefault("EMBEDDING_PROVIDER","ollama")` / `EMBEDDING_MODEL=bge-m3` / `OLLAMA_MODEL`。
+- 本轮：21 个测试文件里的 ollama/bge-m3 默认夹具全部删除（`test_agent_eval`、`test_agent_plan_draft`、`test_agent_tools`、`test_agent_loop`、`test_document_service`、`test_embedding_batching`、`test_feedback_enum_contract`、`test_feedback_memory_trigger`、`test_feedback_plan_link`、`test_langchain_agent`、`test_learning_memory`、`test_memory_context`、`test_learning_memory_tool`、`test_memory_grounding`、`test_plan_frontend_flow`、`test_rag_service`、`test_save_plan_tool`、`test_vector_cache` 等），保留的只有显式 `clean_env(LLM_PROVIDER="ollama")`/显式 ollama Provider 用例——它们在验证 ollama 适配器契约，属**独立命名的本地后端测试**，在 `test_llm_client.py`、`test_embedding_cloud.py` 内单独统计，不混入云端 API 验收。
+- 断言未削弱：删除的只是环境默认值，没有删掉任何 `PASS` 断言；清理后全部用例在无 Key、Ollama 未启动的环境下仍然 exit=0（走 Stub/Mock）。
 
-**P3-2 两处提示语仍指向 Ollama。**
-- `agent_eval.py:808`：`embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3`
-- `eval_rag_metrics.py:483`：同上；`eval_rag_metrics.py:24` / `:586` 帮助文本也写着「需要 Ollama + bge-m3」。
-- 建议：改为「需要可用的 Embedding API（见 docs/MODEL-API-MIGRATION.md）」。
+**P3-2（本轮已修复）提示语不再指向 Ollama。**
+- `agent_eval.py:808`、`eval_rag_metrics.py:24`/`:484`/`:587` 全部改为「云端 Embedding API 配置 / 可用的 Embedding API，见 docs/MODEL-API-MIGRATION.md」。
 
-**P3-3 `MIN_SCORE=0.5` 的标定依据仍是 bge-m3 实测。**
-- 位置：`rag_service.py:52`（注释写明「bge-m3 的相似度整体偏高…取 0.5」）。换 API 模型后相似度分布会变，阈值需要重新标定（已写入迁移文档第 6 节的注意事项）。
+**P3-3 `MIN_SCORE=0.5` 的标定依据仍是 bge-m3 实测（阈值未改，注释已更新）。**
+- 位置：`rag_service.py:51-55`，注释现明确写「尚未在云端 Embedding 模型上重新标定，真实 API 可用后必须用同一批样本重测」。
+- 为什么本轮不改数值：没有真实 Embedding API 就无法重测分布，凭猜测改阈值等于伪造标定结论。
 
 **P3-4 `knowledge/` 的 2 篇文档尚未在真实 Embedding 模型上重建**（`.rag_cache/` 为空属预期，等 Key 到位后按迁移文档第 7 节安全重建流程执行）。
 

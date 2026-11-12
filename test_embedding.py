@@ -127,14 +127,19 @@ finally:
 
 print()
 print("=" * 60)
-print("B. 真实 Embedding 后端（需要真实 API 或显式配置的本地后端）")
+print("B. 真实 Embedding 后端（只认云端 openai_compatible，本地 Ollama 不算）")
 print("=" * 60)
 
-if not real_backend.embedding_ready():
-    print(f"[SKIP] 真实 Embedding 后端未执行：{real_backend.describe()}")
+if not real_backend.cloud_embedding_ready():
+    status = real_backend.cloud_embedding_status()
     print(
-        "[SKIP] 配置 EMBEDDING_API_KEY + EMBEDDING_BASE_URL（或显式 EMBEDDING_PROVIDER=ollama）后重跑；"
-        "缺后端时不会静默回退本地模型。"
+        f"[SKIP] 真实 Embedding 后端未执行：provider={status['provider']} "
+        f"model={status['model']} url={status['base_url']} "
+        f"api_key={status['api_key']} 原因={status['reason']}"
+    )
+    print(
+        "[SKIP] 配置 EMBEDDING_PROVIDER=openai_compatible + EMBEDDING_API_KEY + "
+        "EMBEDDING_BASE_URL + EMBEDDING_MODEL 后重跑；本地 Ollama 不计入本次 API 验收。"
     )
 else:
     settings = embedding_service.get_settings()
@@ -142,6 +147,17 @@ else:
 
     info("Embedding 后端", f"provider={settings.provider} model={settings.model} url={settings.base_url}")
     info("缓存身份 cache_identity()", identity)
+
+    check(
+        "真实后端 Provider 是云端 openai_compatible",
+        settings.provider == embedding_service.PROVIDER_OPENAI,
+        f"provider={settings.provider}",
+    )
+    check(
+        "真实后端 base_url 不是本机地址",
+        "localhost" not in str(settings.base_url) and "127.0.0.1" not in str(settings.base_url),
+        f"url={settings.base_url}",
+    )
 
     expected_identity = f"{settings.provider}:{settings.model}@{settings.dimensions or 'default'}"
 

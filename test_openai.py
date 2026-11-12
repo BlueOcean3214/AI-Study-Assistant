@@ -192,14 +192,29 @@ with model_env(
 
 print()
 print("=" * 60)
-print("B. 真实对话后端（JSON 输出验收，需要真实 API 或显式配置的本地后端）")
+print("B. 真实对话后端（JSON 输出验收；只认云端 openai_compatible）")
 print("=" * 60)
 
-real_backend.require_chat("test_openai.py 的 JSON 输出验收")
+real_backend.require_cloud_chat("test_openai.py 的 JSON 输出验收")
 
 settings = llm_client.get_settings()
 
 info("对话后端", f"provider={settings.provider} model={settings.model} url={settings.chat_url}")
+
+check(
+    "真实后端 Provider 是云端 openai_compatible",
+    settings.provider == llm_client.PROVIDER_OPENAI,
+    f"provider={settings.provider}",
+)
+check(
+    "真实后端 base_url 不是本机地址",
+    "localhost" not in str(settings.chat_url) and "127.0.0.1" not in str(settings.chat_url),
+    f"url={settings.chat_url}",
+)
+check(
+    "真实后端配置描述不含 Key",
+    bool(settings.api_key) and settings.api_key not in settings.describe(),
+)
 
 real_result, real_error = llm_client.chat(PROMPT, read_timeout=60)
 

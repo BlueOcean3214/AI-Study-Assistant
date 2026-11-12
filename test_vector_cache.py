@@ -13,10 +13,7 @@
 
 import os
 
-# 测试夹具：真实 Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+# 确定性测试：Embedding 用 stub_embedding 打桩（不依赖本地 Ollama，也不调用云端 API）
 
 import array
 import contextlib

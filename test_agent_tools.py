@@ -14,10 +14,7 @@
 
 import os
 
-# 测试夹具：真实 Embedding 探测用例显式回退本地 Ollama（代码默认云端百炼）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+# 确定性测试：不配置模型后端（不依赖本地 Ollama，也不调用云端 API 产生费用）
 
 import gc
 import re

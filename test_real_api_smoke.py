@@ -2,10 +2,12 @@ r"""真实 API 冒烟测试（任务书 B 组）：真实云端对话 + 真实 E
 
 原则
 ----
-- 这套用例**必须**打到真实服务商；没有配置后端时打印 [SKIP] 并以退出码 0 退出，
-  绝不静默通过，也不用 Mock 冒充真实 API。
+- 这套用例**必须**打到真实云端服务商，且两个后端都必须是 `openai_compatible`：
+  本机 Ollama 不计入本次 API 化验收，遇到 provider=ollama 一律 SKIP 并说明原因。
+- 没有配置后端时打印 [SKIP] 并以退出码 0 退出，绝不静默通过，也不用 Mock 冒充真实 API。
 - 与 A 组（Stub/Mock 确定性测试）分开跑：确定性用例验证逻辑，本文件验证真实通路。
 - 控制请求量：对话 4 次、Embedding 3 次，全部是短请求。
+- 输出只含 provider / model / base_url，绝不打印 API Key。
 
 运行示例（PowerShell）：
 
@@ -48,12 +50,6 @@ def info(name, detail=""):
     print(f"INFO: {name} {detail}")
 
 
-def skip(reason):
-    print(f"\n[SKIP] 真实 API 冒烟测试未执行：{reason}")
-    print("       这不是通过；配置好后端后必须重跑本文件。")
-    raise SystemExit(0)
-
-
 def cosine(left, right):
     dot = sum(a * b for a, b in zip(left, right))
     norm = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
@@ -62,31 +58,52 @@ def cosine(left, right):
 
 
 def main():
-    chat_settings = None
+    # 严格云端口径：provider 必须是 openai_compatible，本地 Ollama 一律 SKIP。
+    real_backend.require_cloud("真实 API 冒烟测试")
 
-    try:
-        chat_settings = llm_client.get_settings()
-    except llm_client.LLMConfigError as error:
-        info("对话配置不可读", str(error))
-
-    if chat_settings is None or not real_backend.chat_ready():
-        skip("没有可用的真实对话后端（缺 LLM_API_KEY / LLM_BASE_URL，或本地 Ollama 不可用）")
-
-    if not real_backend.embedding_ready():
-        skip("没有可用的真实 Embedding 后端（缺 EMBEDDING_API_KEY / EMBEDDING_BASE_URL）")
-
+    chat_settings = llm_client.get_settings()
     embedding_settings = embedding_service.get_settings()
 
     info("对话后端", chat_settings.describe())
     info("Embedding 后端", embedding_settings.describe())
 
-    # ---------- 1. 配置与密钥不外泄 ----------
+    # ---------- 1. 配置 / Provider 口径 / 密钥不外泄 ----------
+
+    check(
+        "对话 Provider 是云端 openai_compatible",
+        chat_settings.provider == llm_client.PROVIDER_OPENAI,
+        f"provider={chat_settings.provider}",
+    )
+    check(
+        "Embedding Provider 是云端 openai_compatible",
+        embedding_settings.provider == embedding_service.PROVIDER_OPENAI,
+        f"provider={embedding_settings.provider}",
+    )
+
+    chat_url = str(chat_settings.chat_url or "")
+    embedding_url = str(embedding_settings.base_url or "")
+
+    check(
+        "对话 base_url 不是本机地址",
+        "localhost" not in chat_url and "127.0.0.1" not in chat_url,
+        f"url={chat_url}",
+    )
+    check(
+        "Embedding base_url 不是本机地址",
+        "localhost" not in embedding_url and "127.0.0.1" not in embedding_url,
+        f"url={embedding_url}",
+    )
 
     check("对话配置含模型名", bool(chat_settings.model))
     check(
         "对话配置描述不含 Key",
         bool(chat_settings.api_key)
         and chat_settings.api_key not in chat_settings.describe(),
+    )
+    check(
+        "Embedding 配置描述不含 Key",
+        bool(embedding_settings.api_key)
+        and embedding_settings.api_key not in embedding_settings.describe(),
     )
 
     # ---------- 2. 普通对话 ----------
