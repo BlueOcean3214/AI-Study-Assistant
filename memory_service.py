@@ -1292,8 +1292,15 @@ def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id
     return value
 
 
-def _write_candidate_evidence(memory, rows, relations, episode, conn, info):
-    """按 relations 写一行行正式证据，返回 (evidence_feedback_ids, wrote_supports, wrote_contradicts, neutral)。"""
+def _write_candidate_evidence(memory, rows, relations, episode, conn, info, neutral_scope=None):
+    """按 relations 写一行行正式证据，返回 (evidence_feedback_ids, wrote_supports, wrote_contradicts, neutral)。
+
+    `neutral_scope` 限定「本批可以计入 neutral_dropped 的 feedback_id 集合」：neutral 不写
+    `memory_evidence`（§5.2），窗口里历史 neutral 的 id 不会推进证据高水位，下一批重扫窗口
+    时它们会再次出现。若每批都按候选行数累计，同一条 neutral 会被重复计数（v16 §3.5
+    `neutral_dropped` 的口径是「本批被判定为 neutral 并丢弃的候选行数」，按反馈计一次）。
+    `None` 表示本批全部候选都可以计（只有首次建行时成立：该记忆此前从未判定过这些行）。
+    """
 
     evidence_ids = []
     wrote_supports = False
@@ -1307,7 +1314,8 @@ def _write_candidate_evidence(memory, rows, relations, episode, conn, info):
             continue
 
         if relation == "neutral":
-            neutral += 1
+            if neutral_scope is None or row["id"] in neutral_scope:
+                neutral += 1
             continue
 
         _, inserted = _write_evidence(memory["id"], row, episode, relation, conn)
@@ -1537,7 +1545,15 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
         return None
 
     evidence_ids, wrote_supports, wrote_contradicts, neutral = _write_candidate_evidence(
-        memory, rows, relations, memory["episode"], conn, info
+        memory,
+        rows,
+        relations,
+        memory["episode"],
+        conn,
+        info,
+        # 已有记忆的后续批次里，本批真正新出现的候选只有触发器这一条；高水位以上的
+        # 历史 neutral 在各自批次已经计过，重扫窗口时不能再计一次（P2 重复计数）。
+        neutral_scope={trigger["id"]},
     )
 
     if neutral:
@@ -1711,18 +1727,23 @@ def _try_promote(memory, trigger, as_of, conn, info):
     value = dict(conclusion["value"])
     value["direction"] = conclusion["direction"]
     relations = conclusion["relations"]
-    evidence_ids, wrote_supports, wrote_contradicts, neutral = _write_candidate_evidence(
-        memory, rows, relations, episode, conn, info
+    neutral_ids = [row["id"] for row in rows if relations.get(row["id"]) == "neutral"]
+    evidence_ids, wrote_supports, wrote_contradicts, _ = _write_candidate_evidence(
+        memory, rows, relations, episode, conn, info, neutral_scope=set()
     )
 
-    if neutral:
-        info["neutral_dropped"] += neutral
-
     if not evidence_ids:
+        # 本批没有正式证据 → 不晋升、缓冲区原样保留；neutral 行下一批还会被重新判定，
+        # 此刻计数就会变成同一行重复累计（P2），所以这里不计数。
         return False
 
     consumed = [row["id"] for row in rows if relations.get(row["id"]) is not None]
     database.delete_pending(memory["id"], episode=episode, feedback_ids=consumed, conn=conn)
+
+    if neutral_ids:
+        # neutral_dropped 的口径（v16 §3.5）是「本批被判定为 neutral 并丢弃的候选行数」：
+        # 只有随缓冲区一起被删除时才真正丢弃，因此计数放在删除之后，按行计一次。
+        info["neutral_dropped"] += len(neutral_ids)
 
     counts = _episode_counts(memory["id"], episode, conn)
     last_supported_at = counts["last_supported_at"] or as_of
