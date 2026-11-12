@@ -700,6 +700,88 @@ def test_run_one_failure_and_exception(run_dir, api, inputs):
     check("异常信息保留", "mock boom" in (record["error_message"] or ""), record)
 
 
+def test_no_research_phase():
+    """实验入口不执行研究阶段：run_agent 被换成抛错也不会被调用。"""
+
+    import agent_plan_draft
+
+    called = []
+    original_run_agent = agent_plan_draft.agent_loop.run_agent
+    original_chat = agent_plan_draft.agent_loop.chat_with_tools
+
+    def fake_run_agent(*args, **kwargs):
+        called.append("run_agent")
+        raise AssertionError("实验入口不应进入研究阶段")
+
+    def fake_chat(messages, tools=None, deadline=None, sampling=None):
+        return {"role": "assistant", "content": "这不是 JSON"}, None
+
+    agent_plan_draft.agent_loop.run_agent = fake_run_agent
+    agent_plan_draft.agent_loop.chat_with_tools = fake_chat
+
+    try:
+        result = agent_plan_draft.run_plan_draft_from_inputs(
+            "给我一份计划",
+            steps=[],
+            sampling=SAMPLING,
+            verbose=False,
+        )
+    finally:
+        agent_plan_draft.agent_loop.run_agent = original_run_agent
+        agent_plan_draft.agent_loop.chat_with_tools = original_chat
+
+    check("实验入口不调用 run_agent（不执行研究阶段）", called == [], called)
+    check(
+        "实验入口只走起草校验链路（validation_error）",
+        result["ok"] is False and result["error_type"] == "validation_error",
+        result.get("error_type"),
+    )
+
+
+def test_main_aborts_before_model_calls(run_dir):
+    """隔离失败必须立即中止，且一次模型请求都不发、不写结果。"""
+
+    original_isolate = run_experiment.isolate_database
+    original_chat = llm_client.chat
+    chat_calls = []
+
+    def broken_isolate(*args, **kwargs):
+        raise RuntimeError("mock isolation failure")
+
+    def fake_chat(*args, **kwargs):
+        chat_calls.append(1)
+        return None, "不应被调用"
+
+    run_experiment.isolate_database = broken_isolate
+    llm_client.chat = fake_chat
+
+    target = Path(run_dir) / "isolation_failure"
+    raised = None
+
+    try:
+        try:
+            run_experiment.main(
+                ["--sample", "S2", "--group", "B0", "--run-dir", str(target)]
+            )
+        except RuntimeError as error:
+            raised = error
+    finally:
+        run_experiment.isolate_database = original_isolate
+        llm_client.chat = original_chat
+
+    check(
+        "隔离失败时主流程抛错中止",
+        raised is not None and "mock isolation failure" in str(raised),
+        raised,
+    )
+    check("隔离失败时模型请求为 0", chat_calls == [], len(chat_calls))
+    check(
+        "隔离失败时不写 results.jsonl",
+        not (target / "results.jsonl").exists(),
+        str(target),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 运行入口
 # ---------------------------------------------------------------------------
@@ -757,6 +839,8 @@ def _run_all():
         test_prompt_sha256_manual()
         test_slots()
         test_draft_loop_corrections()
+        test_no_research_phase()
+        test_main_aborts_before_model_calls(run_dir)
 
         baseline = build_prompts.build_sample_prompts("S2", config, reuse=False)
 
