@@ -85,6 +85,27 @@ FEEDBACK_CLAIM_MARKERS = (
     "反馈数据显示",
 )
 
+# 这些措辞等于"答案来自长期学习记忆（get_learning_memory 的结果）"。
+# 只收录"记忆"语义的措辞：短期上下文是程序注入的事实块，
+# 模型引用它（例如"你近期的情况"）不算伪造记忆来源。
+MEMORY_CLAIM_MARKERS = (
+    "根据学习记忆",
+    "根据你的学习记忆",
+    "根据我的学习记忆",
+    "根据长期记忆",
+    "根据你的长期记忆",
+    "长期记忆显示",
+    "长期记忆中提到",
+    "学习记忆显示",
+    "学习记忆中提到",
+    "记忆库显示",
+    "记忆库中显示",
+    "记忆库里显示",
+    "记忆记录显示",
+    "记忆数据显示",
+    "我记得你",
+)
+
 # 最后一次模型原始输出在错误结果里最多保留的字符数
 MAX_LAST_RAW_CHARS = 2000
 
@@ -109,6 +130,7 @@ def check_grounding(texts, steps):
     steps 是研究阶段的真实 Tool Call 记录。规则：
     - 声称依据知识库 -> 必须存在成功的 search_knowledge 且检索到内容
     - 声称依据学习反馈 -> 必须存在成功的 get_recent_feedback
+    - 声称依据长期学习记忆 -> 必须存在成功的 get_learning_memory 且返回了记忆
 
     返回违规说明列表（空列表表示通过）。
     """
@@ -121,6 +143,15 @@ def check_grounding(texts, steps):
         step.get("tool") == "search_knowledge"
         and step.get("ok") is True
         and isinstance(step.get("result"), dict)
+        and step["result"].get("count", 0) > 0
+        for step in steps
+    )
+    # 记忆来源更严格：必须真的取到至少一条记忆，空结果不算"掌握了用户记忆"
+    memory_ok = any(
+        step.get("tool") == "get_learning_memory"
+        and step.get("ok") is True
+        and isinstance(step.get("result"), dict)
+        and step["result"].get("ok") is not False
         and step["result"].get("count", 0) > 0
         for step in steps
     )
@@ -139,6 +170,12 @@ def check_grounding(texts, steps):
 
         if not feedback_ok and _claims_source(text, FEEDBACK_CLAIM_MARKERS):
             violation = "声称依据学习反馈，但本次没有成功读取学习反馈"
+
+            if violation not in violations:
+                violations.append(violation)
+
+        if not memory_ok and _claims_source(text, MEMORY_CLAIM_MARKERS):
+            violation = "声称依据学习记忆，但本次没有成功读取学习记忆"
 
             if violation not in violations:
                 violations.append(violation)
