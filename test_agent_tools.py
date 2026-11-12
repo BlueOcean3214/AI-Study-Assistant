@@ -14,10 +14,7 @@
 
 import os
 
-# 测试夹具：真实 Embedding 探测用例显式回退本地 Ollama（代码默认云端百炼）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+# 确定性测试：不配置模型后端（不依赖本地 Ollama，也不调用云端 API 产生费用）
 
 import gc
 import re
@@ -30,7 +27,11 @@ import agent_tools
 import database
 import embedding_service
 import rag_service
+import stub_embedding
 import vector_cache
+
+# 测试夹具：确定性 Embedding 打桩——不连 Ollama / 云端 API，也不需要 API Key
+stub_embedding.install()
 from feedback_service import calculate_summary
 
 
@@ -279,7 +280,7 @@ try:
     try:
         embedding_service.get_embedding("前置检查")
     except embedding_service.EmbeddingError as error:
-        raise SystemExit(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+        raise SystemExit(f"Embedding 通路不可用（打桩失效）：{error}")
 
     # 2.1 正常 query
     result = agent_tools.search_knowledge("定积分怎么学")
@@ -543,9 +544,10 @@ try:
         and getattr(value, "__module__", None) == agent_tools.__name__
     }
     check(
-        "Tool 面为三个只读函数 + 受确认保护的 save_plan",
+        "Tool 面为四个只读函数 + 受确认保护的 save_plan",
         public_tools == {
-            "get_recent_feedback", "search_knowledge", "validate_plan_for_save", "save_plan",
+            "get_learning_memory", "get_recent_feedback", "search_knowledge",
+            "validate_plan_for_save", "save_plan",
         },
         f"public={sorted(public_tools)}",
     )

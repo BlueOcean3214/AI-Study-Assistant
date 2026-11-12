@@ -1,16 +1,17 @@
 """Embedding 服务（Provider 适配层）：文本转向量。
 
 支持两种 Provider（环境变量 EMBEDDING_PROVIDER）：
-- openai_compatible（默认，阿里云百炼等云端 OpenAI 兼容 /embeddings 接口）
-- ollama（本地回退，Ollama /api/embed）
+- openai_compatible（默认，云端 OpenAI 兼容 /embeddings 接口，服务商以实际配置为准）
+- ollama（本地后端，仅显式选择时使用，Ollama /api/embed）
 
 配置（环境变量）：
 - EMBEDDING_PROVIDER    openai_compatible（默认）或 ollama
-- EMBEDDING_BASE_URL    openai_compatible：API 基地址（默认百炼兼容端点，
-                        具体模型/地域/地址以百炼控制台实际可用配置为准）
+- EMBEDDING_BASE_URL    openai_compatible：API 基地址（代码内置默认值是百炼兼容端点，
+                        仅作示例；实际服务商/地域/地址以 EMBEDDING_BASE_URL 配置为准）
                         ollama：服务地址（默认 http://localhost:11434）
 - EMBEDDING_API_KEY     openai_compatible 必填；ollama 忽略（不写进代码/提交）
-- EMBEDDING_MODEL       openai_compatible 默认 text-embedding-v4；ollama 默认 bge-m3
+- EMBEDDING_MODEL       openai_compatible 默认 text-embedding-v4（示例值，需按实际服务商确认）；
+                        ollama 默认 bge-m3
 - EMBEDDING_DIMENSIONS  向量维度（默认 1024；设为 0 表示不传 dimensions 参数、
                         采用模型默认维度）。openai_compatible 路径返回向量长度
                         必须与之一致，不一致直接报错，绝不混用

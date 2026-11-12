@@ -1,14 +1,14 @@
 """统一的大模型调用层（Provider 适配层）。
 
 支持两种 Provider：
-- ollama（默认）：本地 Ollama /api/chat，兼容既有 OLLAMA_URL / OLLAMA_MODEL 环境变量
-- openai_compatible：线上 OpenAI 兼容 API（POST {base_url}/chat/completions）
+- openai_compatible（默认）：线上 OpenAI 兼容 API（POST {base_url}/chat/completions）
+- ollama：本地 Ollama /api/chat，仅作为显式选择的后端，兼容既有 OLLAMA_URL / OLLAMA_MODEL 环境变量
 
 配置（环境变量）：
-- LLM_PROVIDER      "ollama"（默认）或 "openai_compatible"
-- LLM_BASE_URL      ollama 默认 http://localhost:11434；openai_compatible 必填
+- LLM_PROVIDER      "openai_compatible"（默认）或 "ollama"
+- LLM_BASE_URL      openai_compatible 默认百炼兼容端点（示例值）；ollama 用 OLLAMA_URL，默认 http://localhost:11434
 - LLM_API_KEY       openai_compatible 必填；ollama 忽略
-- LLM_MODEL         默认回落 OLLAMA_MODEL，再回落 qwen3.5:4b
+- LLM_MODEL         openai_compatible 默认 qwen-plus（示例值）；ollama 回落 OLLAMA_MODEL，再回落 qwen3.5:4b
 - OLLAMA_URL / OLLAMA_MODEL：旧配置，继续有效（OLLAMA_URL 为完整 /api/chat 地址）
 
 设计要点：

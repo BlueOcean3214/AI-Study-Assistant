@@ -1,6 +1,7 @@
 """Embedding 批处理 / 缓存 / 错误处理测试：直接运行 python test_embedding_batching.py。
 
-需要 Ollama + bge-m3（第 2、3、8 节会真实调用 embedding）；
+第 2、3、8 节走 `stub_embedding` 打桩（进程内确定性向量），不联网、不需要 API Key、
+也不依赖本地 Ollama；
 第 6、7 节用假向量，不联网，只为验证分批与失败处理。
 
 对应任务要求：
@@ -16,20 +17,23 @@
 
 import os
 
-# 测试夹具：真实 Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
-os.environ.setdefault("EMBEDDING_BATCH_SIZE", "32")
-
 import contextlib
+import math
 import shutil
 import time
 from pathlib import Path
 
 import embedding_service
 import rag_service
+import stub_embedding
 import vector_cache
+
+# 批大小不写死：一律从 embedding_service.EMBEDDING_BATCH_SIZE 推导（云端默认 10，可用
+# EMBEDDING_BATCH_SIZE 覆盖；旧版写死 ollama 的 32 会在换 Provider 后误报）。
+BATCH = embedding_service.EMBEDDING_BATCH_SIZE
+
+# 测试夹具：确定性 Embedding 打桩——不连 Ollama / 云端 API，也不需要 API Key
+stub_embedding.install()
 
 # 测试隔离：向量缓存写到临时目录，避免污染真实 .rag_cache/
 CACHE_FIXTURE = Path(__file__).resolve().parent / "_test_cache_batching"
@@ -102,7 +106,7 @@ def fake_embedding(text):
 try:
     embedding_service.get_embedding("前置检查")
 except embedding_service.EmbeddingError as error:
-    raise SystemExit(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+    raise SystemExit(f"Embedding 通路不可用（打桩失效）：{error}")
 
 # 1. 分批工具本身
 check(
@@ -111,7 +115,13 @@ check(
     f"EMBEDDING_BATCH_SIZE={embedding_service.EMBEDDING_BATCH_SIZE}",
 )
 sizes = [len(batch) for batch in embedding_service.split_into_batches(list(range(100)))]
-check("100 条切成多批", sizes == [32, 32, 32, 4], f"sizes={sizes}")
+# 批大小由当前 Provider 配置决定（云端默认 10、ollama 默认 32，可用 EMBEDDING_BATCH_SIZE 覆盖），
+# 因此断言按「配置批量」推导，而不是把某个 Provider 的数字写死。
+_batch = BATCH
+_expected = [_batch] * (100 // _batch) + ([100 % _batch] if 100 % _batch else [])
+check("100 条切成多批", sizes == _expected, f"sizes={sizes} batch_size={_batch}")
+check("每批都不超过配置批量", max(sizes) <= _batch <= 64, f"max={max(sizes)} batch_size={_batch}")
+check("分批不丢不重", sum(sizes) == 100, f"sum={sum(sizes)}")
 check(
     "单条 batch_size 生效",
     [len(batch) for batch in embedding_service.split_into_batches([1, 2, 3], batch_size=1)] == [1, 1, 1],
@@ -144,7 +154,8 @@ spy_batch, batch_calls = make_spy(rag_service.get_embeddings)
 with patched(load_chunks=lambda: hundred_chunks, get_embeddings=spy_batch):
     batch_results = rag_service.retrieve_chunks(hundred_chunks[7]["content"])
 
-check("100 个 chunk 分批请求", len(batch_calls) == 4, f"calls={len(batch_calls)}")
+_expect_calls = math.ceil(100 / embedding_service.EMBEDDING_BATCH_SIZE)
+check("100 个 chunk 分批请求", len(batch_calls) == _expect_calls, f"calls={len(batch_calls)} expect={_expect_calls}")
 check(
     "没有一次性发送 100 条",
     max(len(batch) for batch in batch_calls) <= embedding_service.EMBEDDING_BATCH_SIZE,
@@ -152,8 +163,8 @@ check(
 )
 check(
     "每批都不超过 batch size",
-    [len(batch) for batch in batch_calls] == [32, 32, 32, 4],
-    f"sizes={[len(batch) for batch in batch_calls]}",
+    [len(batch) for batch in batch_calls] == _expected,
+    f"sizes={[len(batch) for batch in batch_calls]} expect={_expected}",
 )
 check("分批后检索结果不变", bool(batch_results) and batch_results[0]["content"] == hundred_chunks[7]["content"])
 
@@ -223,10 +234,10 @@ with patched(
     failed_result = rag_service.retrieve_chunks("随便问一个问题")
 
 check("失败时检索返回空（不把半成品当完整知识库）", failed_result == [], f"n={len(failed_result)}")
-check("失败前的批次已保留在缓存", len(rag_service._EMBEDDING_CACHE) == 32, f"cached={len(rag_service._EMBEDDING_CACHE)}")
+check("失败前的批次已保留在缓存", len(rag_service._EMBEDDING_CACHE) == BATCH, f"cached={len(rag_service._EMBEDDING_CACHE)} batch={BATCH}")
 check(
     "失败的批次内容没有写入伪向量",
-    vector_cache.chunk_hash(fail_chunks[32]["content"]) not in rag_service._EMBEDDING_CACHE,
+    vector_cache.chunk_hash(fail_chunks[BATCH]["content"]) not in rag_service._EMBEDDING_CACHE,
 )
 
 # 直接调用底层函数，检查异常信息
@@ -243,9 +254,9 @@ try:
 except embedding_service.EmbeddingError as error:
     check("失败批次抛出 EmbeddingError", True)
     check("错误信息指出是哪一批", "第 2/" in str(error), f"msg={str(error)[:60]}")
-    check("错误信息带本批条数", "本批 32 条" in str(error), f"msg={str(error)[:60]}")
+    check("错误信息带本批条数", f"本批 {BATCH} 条" in str(error), f"msg={str(error)[:60]}")
 
-check("成功后缓存了第 1 批", len(rag_service._EMBEDDING_CACHE) == 32, f"cached={len(rag_service._EMBEDDING_CACHE)}")
+check("成功后缓存了第 1 批", len(rag_service._EMBEDDING_CACHE) == BATCH, f"cached={len(rag_service._EMBEDDING_CACHE)} batch={BATCH}")
 
 # 重试：只补没成功的部分
 spy_retry, retry_calls = make_spy(fake_embeddings)
@@ -257,7 +268,7 @@ with patched(
     retry_result = rag_service.retrieve_chunks(fail_chunks[70]["content"])
 
 retried_texts = [text for batch in retry_calls for text in batch]
-check("重试只处理未成功的 chunk", len(retried_texts) == 68, f"retried={len(retried_texts)}")
+check("重试只处理未成功的 chunk", len(retried_texts) == 100 - BATCH, f"retried={len(retried_texts)} expect={100 - BATCH}")
 check("重试不再请求已缓存的 chunk", fail_chunks[0]["content"] not in retried_texts)
 check("重试后检索恢复", bool(retry_result) and retry_result[0]["content"] == fail_chunks[70]["content"],
       f"top={retry_result[0]['content'] if retry_result else None}")

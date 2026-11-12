@@ -19,9 +19,7 @@ os.environ.setdefault(
     "FEEDBACK_DB_PATH",
     str(PROJECT_DIR / "_test_learning_memory_env.db"),
 )
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
-os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
+# 确定性测试：不配置模型后端（不依赖本地 Ollama，也不调用云端 API 产生费用）
 
 import database  # noqa: E402  （必须在环境变量之后导入）
 import memory_service  # noqa: E402

@@ -24,8 +24,7 @@ FIXTURE_DB = PROJECT_DIR / "_test_memory_context.db"
 
 # 必须在 import database 之前设置，避免任何模块在导入期读到真实库
 os.environ["FEEDBACK_DB_PATH"] = str(FIXTURE_DB)
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+# 确定性测试：不配置模型后端（不依赖本地 Ollama，也不调用云端 API 产生费用）
 
 import agent_loop  # noqa: E402
 import agent_plan_draft  # noqa: E402

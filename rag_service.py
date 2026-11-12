@@ -1,4 +1,8 @@
-"""Mini-RAG v2.1（Embedding RAG + 向量持久化）：切片后用 bge-m3 向量检索。
+"""Mini-RAG v2.1（Embedding RAG + 向量持久化）：切片后用 Embedding 模型向量检索。
+
+Embedding 后端由 embedding_service 读取配置决定（默认云端 OpenAI 兼容 API，
+`EMBEDDING_PROVIDER=ollama` 时为本地 bge-m3）；文档切片与查询向量始终同一模型，
+缓存身份含 provider:model@dimensions，换模型自动判废重建。
 
 流程：
 knowledge/**/*.txt
@@ -45,7 +49,9 @@ from embedding_service import EmbeddingError, get_embedding, get_embeddings
 TOP_K = 3
 
 # 相似度低于这个值的 chunk 不返回，避免无关问题也把资料塞进 Prompt。
-# bge-m3 的相似度整体偏高：实测无关问题 <= 0.49，相关问题 >= 0.52，所以取 0.5。
+# 历史标定依据：本地 bge-m3 的相似度整体偏高（实测无关问题 <= 0.49，相关问题 >= 0.52），故取 0.5。
+# 注意：该阈值尚未在云端 Embedding 模型上重新标定——换模型后相似度分布会变，
+# 真实 API 可用后必须用同一批样本重测并据此调整（见 docs/MODEL-API-MIGRATION.md 第 6 节）。
 # 如果想无条件返回 Top-3，把它改成 0.0 即可。
 # 该阈值始终只约束向量检索；BM25 通道用“必须含查询词（分数>0）”作为自己的候选规则。
 MIN_SCORE = 0.5

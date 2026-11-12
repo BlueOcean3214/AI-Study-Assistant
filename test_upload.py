@@ -6,14 +6,14 @@
 
 覆盖需求：正常上传 / source / chunk_count / 非 txt / 超 2MB / 空文件名 /
 路径穿越 / 上传后立即可检索 / /ask 与其它接口未受影响。
+
+测试隔离说明：子进程服务用 `stub_app:app` 启动——Embedding 用确定性打桩
+（`stub_embedding.py`），所以「上传后立即可被检索」不依赖本地 Ollama，也不需要
+云端 Embedding Key。涉及真实模型的接口（/ask、/next-plan、/analyze）只有存在
+可用对话后端时才断言，否则打印 [SKIP] 但继续跑完其它用例（见 `real_backend.py`）。
 """
 
 import os
-
-# 测试夹具：检索验证用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
 
 import shutil
 import socket
@@ -24,6 +24,7 @@ from pathlib import Path
 
 import requests
 
+import real_backend
 import vector_cache
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -37,11 +38,15 @@ vector_cache.CACHE_DIR = CACHE_FIXTURE
 
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
-UPLOAD_NAME = "_test_upload_条件概率.txt"
+UPLOAD_NAME = "_test_upload_二叉树.txt"
+# 夹具内容选「知识库里没有的主题」：早期版本用条件概率，与 knowledge/条件概率.txt
+# 内容几乎重复，在确定性打桩向量下排序由文本长度决定（短文档余弦更高），
+# 「检索命中刚上传的文件」这条断言就变成在测打桩的归一化偏差，而不是上传功能。
+# 换成知识库里不存在的主题后，断言回到它本来的含义：新上传的文档能立刻被按内容检索到。
 UPLOAD_CONTENT = (
-    "条件概率是概率论中的重要概念。\n\n"
-    "条件概率表示在已知事件发生的条件下，另一个事件发生的概率。\n\n"
-    "计算公式：P(A|B) = P(AB) / P(B)。\n"
+    "二叉树是一种重要的数据结构。\n\n"
+    "二叉树的遍历方式包括前序遍历、中序遍历和后序遍历。\n\n"
+    "每个树节点最多有两个子树，叶子节点没有子节点。\n"
 ).encode("utf-8")
 
 CREATED_FILES = [UPLOAD_NAME, "evil_test_upload.txt", "evil_win_test_upload.txt"]
@@ -102,7 +107,7 @@ else:
     base_url = f"http://127.0.0.1:{port}"
     log_handle = SERVER_LOG.open("w", encoding="utf-8")
     process = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", str(port)],
+        [sys.executable, "-m", "uvicorn", "stub_app:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=str(PROJECT_DIR),
         stdout=log_handle,
         stderr=subprocess.STDOUT,
@@ -256,9 +261,18 @@ try:
     )
 
     # 8. 上传后 RAG 立即可检索（复用现有 rag_service，不经过上传接口）
+    #    子进程服务用 stub_app 起（已打桩）；这里是本测试进程，需要自己装同一套打桩，
+    #    否则会去连云端 Embedding（缺 Key）或本地 Ollama，两者都不再是测试依赖。
     import rag_service
+    import stub_embedding
 
-    retrieved = rag_service.retrieve_chunks("条件概率怎么算")
+    stub_embedding.install()
+
+    try:
+        retrieved = rag_service.retrieve_chunks("二叉树怎么遍历")
+    finally:
+        stub_embedding.uninstall()
+
     check("上传后立即可被检索", bool(retrieved), f"n={len(retrieved)}")
     check(
         "检索命中刚上传的文件",
@@ -266,32 +280,37 @@ try:
         f"top={retrieved[0]['source'] if retrieved else None} score={retrieved[0]['score'] if retrieved else None}",
     )
 
-    # 10. 现有 /ask 未受影响
-    ask = requests.get(f"{base_url}/ask", params={"question": "条件概率怎么算"}, timeout=180)
-    check("/ask 返回 200", ask.status_code == 200, f"status={ask.status_code}")
-    ask_payload = ask.json()
-    check("返回结构仍为 answer/sources/error", set(ask_payload) == {"answer", "sources", "error"}, f"keys={sorted(ask_payload)}")
-    check("/ask error 为 null", ask_payload["error"] is None, f"error={ask_payload['error']}")
-    check("/ask sources 不为空", bool(ask_payload["sources"]), f"n={len(ask_payload['sources'])}")
-    check(
-        "/ask sources 指向新上传的文件",
-        bool(ask_payload["sources"]) and ask_payload["sources"][0]["source"] == UPLOAD_NAME,
-        f"top={ask_payload['sources'][0]['source'] if ask_payload['sources'] else None}",
-    )
-    check("/ask answer 非空", bool(ask_payload["answer"]), f"len={len(ask_payload['answer'] or '')}")
+    # 10. 现有 /ask 未受影响（需要真实对话后端：问答要模型）
+    if real_backend.chat_ready():
+        ask = requests.get(f"{base_url}/ask", params={"question": "二叉树怎么遍历"}, timeout=180)
+        check("/ask 返回 200", ask.status_code == 200, f"status={ask.status_code}")
+        ask_payload = ask.json()
+        check("返回结构仍为 answer/sources/error", set(ask_payload) == {"answer", "sources", "error"}, f"keys={sorted(ask_payload)}")
+        check("/ask error 为 null", ask_payload["error"] is None, f"error={ask_payload['error']}")
+        check("/ask sources 不为空", bool(ask_payload["sources"]), f"n={len(ask_payload['sources'])}")
+        check(
+            "/ask sources 指向新上传的文件",
+            bool(ask_payload["sources"]) and ask_payload["sources"][0]["source"] == UPLOAD_NAME,
+            f"top={ask_payload['sources'][0]['source'] if ask_payload['sources'] else None}",
+        )
+        check("/ask answer 非空", bool(ask_payload["answer"]), f"len={len(ask_payload['answer'] or '')}")
+    else:
+        print(f"[SKIP] /ask 与依赖模型的接口（/next-plan、/analyze）未执行：{real_backend.describe()}")
 
-    # 其它既有接口
+    # 其它既有接口（不依赖模型）
     check("GET / 正常", requests.get(f"{base_url}/", timeout=10).json() == {"message": "AI Study Assistant"})
     feedback = requests.get(f"{base_url}/feedback", timeout=10)
     check("GET /feedback 正常", feedback.status_code == 200 and "feedback" in feedback.json())
-    check(
-        "GET /next-plan 未受影响",
-        requests.get(f"{base_url}/next-plan", timeout=180).status_code == 200,
-    )
-    check(
-        "GET /analyze 未受影响",
-        requests.get(f"{base_url}/analyze", timeout=180).status_code == 200,
-    )
+
+    if real_backend.chat_ready():
+        check(
+            "GET /next-plan 未受影响",
+            requests.get(f"{base_url}/next-plan", timeout=180).status_code == 200,
+        )
+        check(
+            "GET /analyze 未受影响",
+            requests.get(f"{base_url}/analyze", timeout=180).status_code == 200,
+        )
 finally:
     cleanup_files()
 

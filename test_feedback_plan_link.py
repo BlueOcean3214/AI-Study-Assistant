@@ -35,10 +35,7 @@ os.environ.setdefault(
     "FEEDBACK_DB_PATH",
     str(PROJECT_DIR / "_test_feedback_link_unit.db"),
 )
-# 与既有测试保持一致：不依赖本机 .env 的具体取值
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
-os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
+# 与既有测试保持一致：确定性用例不配置模型后端（不依赖本机 .env 与服务商）
 
 import database  # noqa: E402  （必须在环境变量之后导入）
 import requests  # noqa: E402

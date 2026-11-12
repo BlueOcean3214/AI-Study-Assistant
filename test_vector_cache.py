@@ -13,10 +13,7 @@
 
 import os
 
-# 测试夹具：真实 Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
+# 确定性测试：Embedding 用 stub_embedding 打桩（不依赖本地 Ollama，也不调用云端 API）
 
 import array
 import contextlib
@@ -27,7 +24,11 @@ from pathlib import Path
 import document_service
 import embedding_service
 import rag_service
+import stub_embedding
 import vector_cache
+
+# 测试夹具：确定性 Embedding 打桩——不连 Ollama / 云端 API，也不需要 API Key
+stub_embedding.install()
 
 PROJECT_DIR = Path(__file__).resolve().parent
 CACHE_FIXTURE = PROJECT_DIR / "_test_cache_fixture"
@@ -108,7 +109,7 @@ try:
     try:
         embedding_service.get_embedding("前置检查")
     except embedding_service.EmbeddingError as error:
-        raise SystemExit(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+        raise SystemExit(f"Embedding 通路不可用（打桩失效）：{error}")
 
     # 1~3. hash 稳定性 / 相同 / 不同
     first_hash = vector_cache.chunk_hash("定积分怎么学")

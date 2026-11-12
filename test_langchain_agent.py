@@ -19,9 +19,7 @@ import os
 import time
 from pathlib import Path
 
-# 测试夹具：build_chat_model 用例显式回退本地配置（代码默认云端百炼，测试不依赖云端 Key）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
+# 确定性测试：不配置模型后端（build_chat_model 的断言不依赖真实服务商）
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
@@ -29,6 +27,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 
 import agent_dispatcher
 import langchain_agent
+import llm_client
 import main
 
 
@@ -349,7 +348,14 @@ check("系统 Prompt 明确没有写权限",
       "写权限" in prompt and "不能保存学习计划" in prompt)
 
 # ChatModel 超时用整轮运行预算（不能拿 read timeout 当整请求超时）
-chat_model = langchain_agent.build_chat_model(timeout=77)
+# 显式传入打桩 Settings：不读环境变量、不连任何后端，也不需要 API Key。
+_stub_settings = llm_client.Settings(
+    provider=llm_client.PROVIDER_OPENAI,
+    model="stub-chat-model",
+    chat_url="https://example.invalid/v1/chat/completions",
+    api_key="stub-key-for-contract-test",
+)
+chat_model = langchain_agent.build_chat_model(settings=_stub_settings, timeout=77)
 
 check("ChatModel 超时对齐运行预算",
       getattr(chat_model, "timeout", None) == 77

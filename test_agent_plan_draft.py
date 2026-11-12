@@ -18,11 +18,7 @@
 
 import os
 
-# 测试夹具：真实模型/Embedding 用例显式回退本地 Ollama（代码默认云端百炼，测试不依赖云端 Key）
-os.environ.setdefault("LLM_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_PROVIDER", "ollama")
-os.environ.setdefault("EMBEDDING_MODEL", "bge-m3")
-os.environ.setdefault("OLLAMA_MODEL", "qwen3.5:4b")
+# 确定性测试：不配置模型后端（不依赖本地 Ollama，也不调用云端 API 产生费用）
 
 import contextlib
 import copy
@@ -43,7 +39,12 @@ import database
 import embedding_service
 import plan_service
 import rag_service
+import real_backend
+import stub_embedding
 import vector_cache
+
+# 测试夹具：确定性 Embedding 打桩——不连 Ollama / 云端 API，也不需要 API Key
+stub_embedding.install()
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -778,10 +779,13 @@ try:
     # 5. 真实模型场景（端到端）
     # ==========================
 
+    # 真实模型需要可用的真实对话后端（迁移后不再隐式回退本地 Ollama）
+    real_backend.require_chat("真实模型场景")
+
     try:
         embedding_service.get_embedding("前置检查")
     except embedding_service.EmbeddingError as error:
-        raise SystemExit(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+        raise SystemExit(f"Embedding 通路不可用（打桩失效）：{error}")
 
     seed_difficult_latest()
 

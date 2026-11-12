@@ -805,7 +805,7 @@ def main(argv=None):
     try:
         embedding_service.get_embedding("评测前置检查")
     except embedding_service.EmbeddingError as error:
-        print(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+        print(f"embedding 服务不可用，请检查云端 Embedding API 配置（EMBEDDING_PROVIDER/EMBEDDING_BASE_URL/EMBEDDING_MODEL/EMBEDDING_API_KEY，见 docs/MODEL-API-MIGRATION.md）：{error}")
         return 2
 
     report = run_all(
