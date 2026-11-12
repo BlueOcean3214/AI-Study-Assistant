@@ -38,3 +38,6 @@ _agent_eval_delivery_run.txt
 jieba.cache
 .pip_tmp/
 .workbuddy/
+
+# 毕业设计实验执行层的运行产物（本地生成，不入库）
+experiments/graduation/runs/

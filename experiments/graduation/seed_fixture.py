@@ -133,6 +133,35 @@ def _import_project(work_dir):
 _isolation_state = {"work_dir": None, "database": None, "memory_service": None}
 
 
+def register_project_modules(work_dir, database, memory_service, isolation_root=None):
+    """登记"已由调用方完成隔离导入"的项目模块，避免 project_modules() 二次导入。
+
+    run_experiment.py 需要在任何模型调用之前把 FEEDBACK_DB_PATH 指向运行目录内的
+    临时库，因此它会先自行导入 database/memory_service 并断言隔离，再把结果登记到
+    这里。之后 seed_sample()/activate_sample() 调 project_modules() 时直接复用，
+    既不会重新导入，也不会因为 DATABASE_PATH 指向运行目录而误判。
+
+    - work_dir：样本库工作目录（project_modules 的缓存键，即 workspace_dir(config)）
+    - isolation_root：实际隔离根（默认与 work_dir 相同；run_experiment 传自己的运行目录）
+    """
+
+    work_dir = Path(work_dir).resolve()
+    root = Path(isolation_root).resolve() if isolation_root else work_dir
+    resolved = Path(database.DATABASE_PATH).resolve()
+
+    if root not in resolved.parents:
+        raise RuntimeError(
+            "拒绝登记未隔离的数据库路径："
+            f"database.DATABASE_PATH={resolved} 不在 {root} 之内"
+        )
+
+    _isolation_state.update(
+        work_dir=work_dir, database=database, memory_service=memory_service
+    )
+
+    return database, memory_service
+
+
 def project_modules(config=None):
     """按当前 ref_date 的工作目录返回 (database, memory_service)，并保证隔离。"""
 

@@ -120,20 +120,27 @@ def build_system_prompt():
 SYSTEM_PROMPT = build_system_prompt()
 
 
-def chat_with_tools(messages, tools=None, deadline=None):
+def chat_with_tools(messages, tools=None, deadline=None, sampling=None):
     """本模块唯一的 LLM 边界，返回 (assistant_message, error)。
 
     - 底层统一走 llm_client（Provider 由 LLM_PROVIDER 选择：ollama / openai_compatible），
       业务层不需要知道模型来自哪里。
     - 流式读取期间每个数据块之间都检查绝对 deadline，超过 Run 预算立即关闭连接。
     - deadline 为 None 时不限时（测试用桩替换整个函数）。
+    - sampling 原样透传给 llm_client.chat（None 表示沿用 Provider 默认值）。
     - 超时返回 (None, AGENT_TIMEOUT)，调用方据此产生稳定的超时错误结构。
     """
 
     if deadline is not None and deadline.expired():
         return None, AGENT_TIMEOUT
 
-    result, error = llm_client.chat(messages, tools=tools, deadline=deadline)
+    if sampling is None:
+        # 不传采样参数时保持与既有调用完全一致的调用形状（兼容既有桩/包装）
+        result, error = llm_client.chat(messages, tools=tools, deadline=deadline)
+    else:
+        result, error = llm_client.chat(
+            messages, tools=tools, deadline=deadline, sampling=sampling
+        )
 
     if error:
         return None, error

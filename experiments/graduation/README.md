@@ -1,22 +1,28 @@
-# 毕业设计实验脚手架（第一阶段）
+# 毕业设计实验脚手架
 
 本目录把 `docs/GRADUATION-EXPERIMENT-DESIGN.md` 的 S1–S7 样本固化成可复现的实验输入，
-并复现设计文档里的两组核验：**记忆层 Gold Standard（20 条）** 与 **A/B/C/D 四组 draft prompt**。
+并复现设计文档里的三组核验：**记忆层 Gold Standard（20 条）**、**A/B/B0/C/D 五组 draft prompt**
+与 **离线可复现的运行层**（`run_experiment.py`）。
 
-这一阶段只做三件事：模拟数据、记忆重建、Prompt 构建。
-**不调用对话模型、不调用 Embedding、不执行 165 次生成、不写正式产品逻辑、不产出实验结果。**
+分两层，边界要说清楚：
+
+- **离线层**（`seed_fixture.py` / `check_memory.py` / `build_prompts.py`）：只做模拟数据、
+  记忆重建、Prompt 构建，**不调用任何模型**。
+- **执行层**（`run_experiment.py`）：把同一批 Prompt 真正发给模型，逐次追加写 `results.jsonl`。
+  它**只在用户显式运行时**调用对话模型；**不调用 Embedding、不做知识库检索**（见下"不考察 RAG"）。
 
 ## 目录结构
 
 ```text
 experiments/graduation/
     README.md            本文件
-    config.json          固定 REF_DATE、样本清单、四组、记忆上限、知识库占位
+    config.json          固定 REF_DATE、样本清单、五组、记忆上限、采样参数、知识库占位
     samples/
         S1.json … S7.json  结构化样本：场景/历史反馈/计划记录/当前请求/Gold Standard/模拟标识
     seed_fixture.py      建独立临时库 + 写计划与反馈 + 调 memory_service.rebuild_all()
     check_memory.py      读实跑记忆，与 Gold Standard 逐项比对，输出 Markdown 报告
-    build_prompts.py     调 agent_plan_draft._build_draft_user_content() 生成 A/B/C/D 四组 Prompt
+    build_prompts.py     调 agent_plan_draft._build_draft_user_content() 生成 A/B/B0/C/D 五组 Prompt
+    run_experiment.py    执行层：隔离库 + 逐次调模型 + 追加写 results.jsonl（只在显式运行时调模型）
 ```
 
 ## 前置条件
@@ -37,8 +43,11 @@ $env:PYTHONIOENCODING='utf-8'
 # 2. 记忆层核验（20 条 Gold Standard）
 .\.venv\Scripts\python.exe experiments\graduation\check_memory.py
 
-# 3. Prompt 构建 + 组间等价性核验
+# 3. Prompt 构建 + 组间等价性核验（A/B/B0/C/D）
 .\.venv\Scripts\python.exe experiments\graduation\build_prompts.py --reuse
+
+# 4. 执行层：真正调模型（需要已配置的对话模型；不加 --sample 会跑全部样本）
+.\.venv\Scripts\python.exe experiments\graduation\run_experiment.py --sample S5 --group B0 --repeats 1
 ```
 
 `--reuse` 表示复用已建好的库（不重跑 rebuild）；不加则每次重新建库并重建记忆。
@@ -58,9 +67,52 @@ $env:PYTHONIOENCODING='utf-8'
 
 三个脚本都支持 `--sample S3` 只跑单个样本，`--config <path>` 换配置文件。
 
-自测：`.\.venv\Scripts\python.exe test_graduation_experiments.py`（33 项，覆盖七个样本的四组构建、
-A/C 空反馈摘要与 B/D 真实摘要、核验的负向用例、`--keep` 的七种残缺库 + 五种残缺证据拒绝路径、
-两个 `--reuse` 入口的负向用例与正常复用）。
+自测（都离线、不调模型）：
+
+- `.\.venv\Scripts\python.exe test_graduation_experiments.py`（33 项，覆盖七个样本的五组构建、
+  A/C 空反馈摘要与 B/D 真实摘要、B0 槽位、核验的负向用例、`--keep` 的七种残缺库 + 五种残缺证据
+  拒绝路径、两个 `--reuse` 入口的负向用例与正常复用）
+- `.\.venv\Scripts\python.exe test_graduation_experiment_runner.py`（执行层：采样参数进入 mock
+  payload、失败记录、修正上限、JSONL 追加、prompt_sha256、token 缺失、数据库隔离、CLI 边界）
+
+## 执行层（run_experiment.py）
+
+```powershell
+# 只跑 1 份 B0 冒烟（S5，1 次），结果落到指定运行目录
+.\.venv\Scripts\python.exe experiments\graduation\run_experiment.py `
+    --sample S5 --group B0 --repeats 1 --run-dir %TEMP%\graduation_runs\smoke
+```
+
+参数：`--sample`（可重复，默认全部样本）、`--group`（A/B/B0/C/D，可重复，默认全部）、
+`--repeats`（1–50，默认 1）、`--run-dir`（默认 `experiments/graduation/runs/<ref>-<UTC>`）、
+`--reuse`（复用已建好且通过完整性校验的样本库，否则 `%TEMP%\graduation_experiments\...` 下的库）、
+`--config`。只给 `--group B0` 且不给 `--sample` 时，按设计只跑 S5、S7。
+
+运行前的三道闸门：
+
+1. **数据库隔离**：先建运行目录，把 `FEEDBACK_DB_PATH` 指向运行目录内的
+   `_experiment_isolation.db`，**之后**才 import `database` / `memory_service`，然后断言
+   `database.DATABASE_PATH` 既不等于仓库根目录的真实 `feedback.db`、又确实位于本次运行目录内，
+   否则 `RuntimeError` 直接退出（fail-closed）。随后用
+   `seed_fixture.register_project_modules()` 把已隔离的模块登记给脚手架，避免二次 import 冲突。
+2. **用量回收器**：`llm_client.set_usage_recorder()` 装的是本脚本自己的 recorder，只把记录
+   追加进内存列表，**不落数据库**（不产生 `model_usage` 行）。
+3. **不覆盖**：结果按 JSONL 追加写运行目录下的 `results.jsonl`（`a` 模式 + `flush` + `fsync`），
+   重复运行同一目录只会在文件末尾追加新记录，不修改已有行；Prompt 快照
+   （`prompts/<样本>/<组>.txt`）若已存在且内容不同则报错拒绝覆盖。
+
+每条记录至少包含：`experiment_id`、`sample_id`、`group`、`repeat_index`、`provider`、`model`、
+`temperature`、`top_p`、`max_tokens`（优先取**本次最后一次实际请求**的值，无请求时记录意图值）、
+`prompt_sha256`、`prompt_ref`/`prompt_chars`、`raw_output`（模型原始输出）、`final_output`
+（`{answer, plan}` 或 `null`）、`request_count`、`requests`（逐次请求的用量）、`corrections_used`、
+`token_usage`（缺失记为 `{"available": false, "status": "unavailable"}`，不填 0 冒充）、
+`elapsed_seconds`、`generated_at`、`success`、`error_type`、`error_message`、`stopped_reason`。
+
+生成走的是产品自己的链路 `agent_plan_draft.run_plan_draft_from_inputs()`——跳过研究阶段
+（`tool_calls = 0`、`loop_turns = 0`、`research_final_answer = None`），但仍复用产品的 JSON 解析、
+`plan_service.normalize_plan`、`agent_tools.validate_plan_for_save`、`check_grounding` 与
+`MAX_CORRECTIONS = 2`。`check_grounding` 需要的证据由合成 evidence steps 提供：注入反馈的组
+才有 `get_recent_feedback`，C/D 才有 `get_learning_memory`，知识库一律不合成。
 
 ## 产物位置
 
@@ -70,12 +122,23 @@ A/C 空反馈摘要与 B/D 真实摘要、核验的负向用例、`--keep` 的�
 %TEMP%\graduation_experiments\<yyyyMMddTHHmmss>\
     S1.db … S7.db          每个样本一个独立 SQLite 库
     memory_check.md        记忆层核验报告
-    prompts/<S>/A.txt … D.txt   每一组的 system + user 全文
-    prompts/<S>/diff.md          A→B、A→C、B→D 的 unified diff
+    prompts/<S>/A.txt … D.txt   每一组的 system + user 全文（B0 写成 B0.txt）
+    prompts/<S>/diff.md          A→B、A→B0、B→B0、A→C、B→D 的 unified diff
     prompts/<S>/manifest.json    每组 SHA256、字符数、注入记忆清单
-    prompts/hashes.json         七个样本 × 四组的 SHA256 汇总
+    prompts/hashes.json         七个样本 × 五组的 SHA256 汇总
     prompts/report.md           组间等价性核验结果
 ```
+
+执行层另写自己的运行目录（默认 `experiments/graduation/runs/<ref>-<UTC>`，可 `--run-dir` 指定）：
+
+```text
+<run-dir>\
+    _experiment_isolation.db  本次运行的隔离库（绝不指向仓库根的真实 feedback.db）
+    results.jsonl             逐次生成结果，只追加、不覆盖
+    prompts/<S>/<组>.txt      本次实际发送的 system + user 快照
+```
+
+`runs/` 已在 `.gitignore` 里，实验结果不进仓库。
 
 ## 关键约束（都由脚本强制）
 
@@ -95,21 +158,29 @@ import 之后再断言 `database.DATABASE_PATH` 落在该临时目录内，否�
 `from database import get_feedback_since`，绑的是同一个函数对象，读的是同一个模块全局，
 一次替换对两条路径同时生效；**不改任何产品文件**。
 
-### 3. 四组差异只来自设计允许的槽位
+### 3. 组间差异只来自设计允许的槽位
 
-| 组 | 近期反馈 | 短期上下文 | 长期记忆 |
-|---|---|---|---|
-| A | 无 | 无 | 无 |
-| B | 有（7 天窗口） | 有 | 无 |
-| C | 无 | 无 | 有（active 前 5 条） |
-| D | 有 | 有 | 有 |
+| 组 | 近期反馈 | 统计摘要 / 难度规则 | 短期上下文 | 长期记忆 |
+|---|---|---|---|---|
+| A | 无 | 无 | 无 | 无 |
+| B | 有（7 天窗口） | 有 | 有 | 无 |
+| B0 | 有（原始反馈行） | 无（`summary={}`、`difficult=False`） | 无 | 无 |
+| C | 无 | 无 | 无 | 有（active 前 5 条） |
+| D | 有 | 有 | 有 | 有 |
 
-知识库结果四组共用同一份（当前固定为空列表），`search_failed` 固定 `false`。
-`build_prompts` 用 8 类断言把这件事钉死，其中包括：
+槽位的唯一定义来源是 `GROUP_SLOTS` 与 `group_inputs()`，`build_prompts.py` 与
+`run_experiment.py` 都调它，不存在第二份槽位逻辑。B0 是**探索组**（只在 S5、S7 上生成、
+仅作描述性旁证），A/B/C/D 四组的 Prompt 在本版中**逐字节不变**。
+
+**本实验不考察 RAG**：五组 `knowledge_results` 一律为 `[]`、`search_failed` 固定 `false`，
+运行期不调用 Embedding、不执行向量检索。知识库当前仅 238 字符，`MIN_SCORE=0.5` 是在本地小模型上
+标定的，尚未在云端对话模型上重新校准；把它固定为空是为了不把"这次检索是否命中"混进记忆的主效应。
+`build_prompts` 用若干断言把这件事钉死，其中包括：
 
 - `strip_memory(C) == A`、`strip_memory(D) == B`（记忆是唯一增量）
 - `base_segment(A) == base_segment(C)`、`base_segment(B) == base_segment(D)`（反馈/难度规则一致）
-- 四组的「真实知识库检索状态」段逐字相同
+- 五组的「真实知识库检索状态」段逐字相同（同为空）
+- B0 含原始反馈行、但不含统计摘要（无 `"total_count"`）与难度硬规则，也不含短期/记忆区块
 - 记忆区块里的条目集合恰好等于库里 `status='active'` 按 strength 倒序的前 N 条
 - 记忆区块在 D 里只出现一次
 
@@ -153,6 +224,6 @@ task_performance 与 time_pattern 取 `fields["samples"]`，task_topic 取 `fiel
 
 ## 本阶段不做的事
 
-- B0 组、敏感性分析、统计检验、评分流程：都还没实现
-- 任何模型生成、Embedding、知识库检索：一件都没跑
+- 敏感性分析（C-subj / D-subj）、统计检验、双人评分流程：都还没实现
+- 正式 165 份生成、Embedding、知识库检索：一件都没跑（执行层只做过空 Key 的失败路径冒烟）
 - 仓库没有配置 CI，测试结论只能来自本机实跑

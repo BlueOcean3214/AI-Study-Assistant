@@ -308,6 +308,107 @@ def _to_openai_tools(tools):
     return tools
 
 
+SAMPLING_KEYS = ("temperature", "top_p", "max_tokens")
+
+# 内部采样键 -> 各 Provider 请求体中的键名。Provider 不在表内即视为不支持采样参数。
+PROVIDER_SAMPLING_KEYS = {
+    PROVIDER_OLLAMA: {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "max_tokens": "num_predict",
+    },
+    PROVIDER_OPENAI: {
+        "temperature": "temperature",
+        "top_p": "top_p",
+        "max_tokens": "max_tokens",
+    },
+}
+
+
+def normalize_sampling(sampling, provider):
+    """校验并规范化采样参数；sampling=None 表示完全沿用 Provider 默认值。
+
+    返回 {"temperature", "top_p", "max_tokens"}（未提供的键为 None）或 None。
+    未知键、类型/范围非法、Provider 不支持时抛 LLMConfigError。
+    """
+
+    if sampling is None:
+        return None
+
+    if not isinstance(sampling, dict):
+        raise LLMConfigError(
+            f"sampling 必须是字典，收到 {type(sampling).__name__}"
+        )
+
+    if provider not in PROVIDER_SAMPLING_KEYS:
+        raise LLMConfigError(f"Provider 不支持采样参数：{provider}")
+
+    unknown = sorted(set(sampling) - set(SAMPLING_KEYS))
+
+    if unknown:
+        raise LLMConfigError(f"不支持的采样参数：{', '.join(unknown)}")
+
+    normalized = {key: None for key in SAMPLING_KEYS}
+
+    for key in ("temperature", "top_p"):
+        value = sampling.get(key)
+
+        if value is None:
+            continue
+
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise LLMConfigError(f"{key} 必须是数字，收到 {value!r}")
+
+        upper = 2.0 if key == "temperature" else 1.0
+
+        if not 0.0 <= float(value) <= upper:
+            raise LLMConfigError(f"{key} 必须在 0~{upper:g} 之间，收到 {value!r}")
+
+        normalized[key] = float(value)
+
+    max_tokens = sampling.get("max_tokens")
+
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            raise LLMConfigError(f"max_tokens 必须是整数，收到 {max_tokens!r}")
+
+        if max_tokens < 1:
+            raise LLMConfigError(f"max_tokens 必须为正整数，收到 {max_tokens!r}")
+
+        normalized["max_tokens"] = max_tokens
+
+    return normalized
+
+
+def _sampling_record_fields(sampling):
+    """把实际生效的采样参数放进用量记录（model_usage 只取固定列，多余键被忽略）。"""
+
+    sampling = sampling or {}
+
+    return {key: sampling.get(key) for key in SAMPLING_KEYS}
+
+
+def _apply_sampling(payload, sampling, provider):
+    """把已规范化的采样参数写进请求体；sampling=None 时请求体保持原样。"""
+
+    if not sampling:
+        return payload
+
+    mapping = PROVIDER_SAMPLING_KEYS[provider]
+    values = {
+        mapping[key]: sampling[key]
+        for key in SAMPLING_KEYS
+        if sampling.get(key) is not None
+    }
+
+    if provider == PROVIDER_OLLAMA:
+        payload["options"] = values
+    else:
+        payload.update(values)
+
+    return payload
+
+
 def _usage_from_counts(prompt_tokens, completion_tokens):
     """把 Provider 的计数整理为统一 usage 结构。
 
@@ -352,7 +453,7 @@ def _build_result(message, usage, settings, started):
     }
 
 
-def _finish(message, usage, settings, started, ok=True, error_type=None):
+def _finish(message, usage, settings, started, ok=True, error_type=None, sampling=None):
     """生成结果并顺带发出用量记录（不记录 Prompt / 回答内容 / 密钥）。"""
 
     result = _build_result(message, usage, settings, started)
@@ -367,6 +468,7 @@ def _finish(message, usage, settings, started, ok=True, error_type=None):
         "elapsed_seconds": result["elapsed_seconds"],
         "ok": ok,
         "error_type": error_type,
+        **_sampling_record_fields(sampling),
     })
 
     return result
@@ -393,7 +495,7 @@ def _check_deadline(deadline):
     return deadline is not None and deadline.expired()
 
 
-def _chat_ollama(settings, messages, tools, deadline, read_timeout):
+def _chat_ollama(settings, messages, tools, deadline, read_timeout, sampling=None):
     payload = {
         "model": settings.model,
         "messages": messages,
@@ -403,6 +505,8 @@ def _chat_ollama(settings, messages, tools, deadline, read_timeout):
 
     if tools:
         payload["tools"] = tools
+
+    _apply_sampling(payload, sampling, PROVIDER_OLLAMA)
 
     policy = cloud_errors.RetryPolicy("LLM_MAX_RETRIES")
 
@@ -665,7 +769,7 @@ def _openai_start_stream(client, openai, payload):
     return stream, None
 
 
-def _chat_openai(settings, messages, tools, deadline, read_timeout):
+def _chat_openai(settings, messages, tools, deadline, read_timeout, sampling=None):
     openai = _import_openai()
 
     payload = {
@@ -677,6 +781,8 @@ def _chat_openai(settings, messages, tools, deadline, read_timeout):
 
     if tools:
         payload["tools"] = _to_openai_tools(tools)
+
+    _apply_sampling(payload, sampling, PROVIDER_OPENAI)
 
     try:
         client = _make_openai_client(settings, read_timeout)
@@ -762,8 +868,11 @@ def _chat_openai(settings, messages, tools, deadline, read_timeout):
 # ==========================
 
 
-def chat_stream(messages, deadline=None, read_timeout=None):
+def chat_stream(messages, deadline=None, read_timeout=None, sampling=None):
     """流式文本输出（SSE 问答用；不支持工具调用——工具场景请用 chat()）。
+
+    sampling 为可选的 {"temperature", "top_p", "max_tokens"}；None 表示沿用
+    Provider 默认值（请求体与不带采样参数时完全一致）。
 
     逐块 yield 事件字典：
       {"type": "delta", "text": str}                    文本增量
@@ -774,6 +883,12 @@ def chat_stream(messages, deadline=None, read_timeout=None):
 
     try:
         settings = get_settings()
+    except LLMConfigError as error:
+        yield {"type": "error", "error": f"模型配置错误：{error}", "error_type": "config_error"}
+        return
+
+    try:
+        sampling = normalize_sampling(sampling, settings.provider)
     except LLMConfigError as error:
         yield {"type": "error", "error": f"模型配置错误：{error}", "error_type": "config_error"}
         return
@@ -790,9 +905,13 @@ def chat_stream(messages, deadline=None, read_timeout=None):
     started = time.perf_counter()
 
     if settings.provider == PROVIDER_OLLAMA:
-        iterator = _stream_ollama(settings, messages, deadline, effective_read_timeout)
+        iterator = _stream_ollama(
+            settings, messages, deadline, effective_read_timeout, sampling
+        )
     else:
-        iterator = _stream_openai(settings, messages, deadline, effective_read_timeout)
+        iterator = _stream_openai(
+            settings, messages, deadline, effective_read_timeout, sampling
+        )
 
     usage = _usage_from_counts(None, None)
 
@@ -813,6 +932,7 @@ def chat_stream(messages, deadline=None, read_timeout=None):
                     "elapsed_seconds": round(time.perf_counter() - started, 3),
                     "ok": False,
                     "error_type": event[2],
+                    **_sampling_record_fields(sampling),
                 })
                 logger.warning(
                     "llm_stream provider=%s model=%s ok=False error_type=%s",
@@ -837,6 +957,7 @@ def chat_stream(messages, deadline=None, read_timeout=None):
         "elapsed_seconds": elapsed,
         "ok": True,
         "error_type": None,
+        **_sampling_record_fields(sampling),
     })
     logger.info(
         "llm_stream provider=%s model=%s ok=True elapsed=%.2fs prompt_tokens=%s completion_tokens=%s",
@@ -847,7 +968,7 @@ def chat_stream(messages, deadline=None, read_timeout=None):
     yield {"type": "done", "usage": usage, "model": settings.model, "elapsed_seconds": elapsed}
 
 
-def _stream_ollama(settings, messages, deadline, read_timeout):
+def _stream_ollama(settings, messages, deadline, read_timeout, sampling=None):
     """Ollama NDJSON 流式读取，逐块 yield ("delta", text) / ("usage", ...) / ("error", ...)。"""
 
     payload = {
@@ -856,6 +977,8 @@ def _stream_ollama(settings, messages, deadline, read_timeout):
         "stream": True,
         "think": False,
     }
+
+    _apply_sampling(payload, sampling, PROVIDER_OLLAMA)
 
     try:
         response = _http_post(
@@ -917,7 +1040,7 @@ def _stream_ollama(settings, messages, deadline, read_timeout):
     yield ("usage", _usage_from_counts(prompt_count, completion_count))
 
 
-def _stream_openai(settings, messages, deadline, read_timeout):
+def _stream_openai(settings, messages, deadline, read_timeout, sampling=None):
     """OpenAI 兼容（百炼等）SSE 流式读取，逐块 yield delta/usage/error。"""
 
     openai = _import_openai()
@@ -936,6 +1059,8 @@ def _stream_openai(settings, messages, deadline, read_timeout):
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+
+    _apply_sampling(payload, sampling, PROVIDER_OPENAI)
 
     policy = cloud_errors.RetryPolicy("LLM_MAX_RETRIES")
 
@@ -1004,7 +1129,7 @@ def _stream_openai(settings, messages, deadline, read_timeout):
     ))
 
 
-def chat(messages, tools=None, deadline=None, read_timeout=None):
+def chat(messages, tools=None, deadline=None, read_timeout=None, sampling=None):
     """统一 Chat Completion 入口，返回 (result, error)。
 
     - result: {"message": 内部标准 assistant 消息, "usage": {...},
@@ -1012,10 +1137,18 @@ def chat(messages, tools=None, deadline=None, read_timeout=None):
     - error: 稳定错误描述字符串；超时返回 TIMEOUT_ERROR（"agent_timeout"），
       配置错误返回 "模型配置错误：..."。任何错误信息都不包含 API Key。
     - deadline 为 None 时不限总时长（只受 connect/read timeout 约束）。
+    - sampling: 可选 {"temperature", "top_p", "max_tokens"}；None 时请求体与
+      不带采样参数时逐字节一致。未知键 / 非法值 / Provider 不支持由
+      normalize_sampling() 抛 LLMConfigError，这里转为稳定配置错误返回。
     """
 
     try:
         settings = get_settings()
+    except LLMConfigError as error:
+        return None, f"模型配置错误：{error}"
+
+    try:
+        sampling = normalize_sampling(sampling, settings.provider)
     except LLMConfigError as error:
         return None, f"模型配置错误：{error}"
 
@@ -1032,11 +1165,11 @@ def chat(messages, tools=None, deadline=None, read_timeout=None):
 
     if settings.provider == PROVIDER_OLLAMA:
         result, error, error_type = _chat_ollama(
-            settings, messages, tools, deadline, effective_read_timeout
+            settings, messages, tools, deadline, effective_read_timeout, sampling
         )
     else:
         result, error, error_type = _chat_openai(
-            settings, messages, tools, deadline, effective_read_timeout
+            settings, messages, tools, deadline, effective_read_timeout, sampling
         )
 
     if result is None:
@@ -1050,6 +1183,7 @@ def chat(messages, tools=None, deadline=None, read_timeout=None):
             "elapsed_seconds": round(time.perf_counter() - started, 3),
             "ok": False,
             "error_type": error_type or "llm_error",
+            **_sampling_record_fields(sampling),
         })
         logger.warning(
             "llm_call provider=%s model=%s ok=False error_type=%s",
@@ -1059,7 +1193,8 @@ def chat(messages, tools=None, deadline=None, read_timeout=None):
         return None, error
 
     final_result = _finish(
-        result["message"], result["usage"], settings, started
+        result["message"], result["usage"], settings, started,
+        error_type=None, sampling=sampling,
     )
     logger.info(
         "llm_call provider=%s model=%s ok=True elapsed=%.2fs prompt_tokens=%s completion_tokens=%s",

@@ -531,6 +531,190 @@ def _draft_timeout_error(draft_max_run_seconds, corrections_used, steps, last_ra
     )
 
 
+def _run_draft_loop(
+    user_message,
+    feedback_result,
+    knowledge_results,
+    search_failed,
+    difficult,
+    short_term_block,
+    memory_result,
+    steps,
+    max_corrections=MAX_CORRECTIONS,
+    draft_max_run_seconds=DRAFT_MAX_RUN_SECONDS,
+    clock=None,
+    verbose=True,
+    sampling=None,
+    tool_calls=None,
+    loop_turns=None,
+    research_final_answer=None,
+    raw_sink=None,
+):
+    """起草 + 校验 + 有限修正；研究阶段的输入全部由调用方给定，本函数不调用工具。
+
+    run_plan_draft（真实研究阶段）与 run_plan_draft_from_inputs（实验固定槽位）共用
+    这一条链路，确保 JSON 解析、plan_service.normalize_plan、
+    agent_tools.validate_plan_for_save、check_grounding 与 MAX_CORRECTIONS 语义一致。
+
+    raw_sink：可选的 list，每次模型起草的原始输出都会 append 进去（实验记录用），
+    不改变返回结构。
+    """
+
+    clock = clock if clock is not None else time.monotonic
+
+    _log(verbose, "[PlanDraft]", f"User:\n{user_message}")
+
+    deadline = agent_loop._Deadline(draft_max_run_seconds, clock)
+
+    messages = [
+        {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": _build_draft_user_content(
+                user_message,
+                feedback_result,
+                knowledge_results,
+                search_failed,
+                difficult,
+                short_term_block=short_term_block,
+                memory_result=memory_result,
+            ),
+        },
+    ]
+
+    corrections_used = 0
+    last_reason = None
+    last_raw = None
+
+    # 4) 起草 + 校验 + 有限修正（首次生成 + 最多 max_corrections 次修正）
+    for attempt in range(max_corrections + 1):
+        _log(
+            verbose,
+            "[Draft]",
+            f"起草尝试 {attempt + 1}/{max_corrections + 1}",
+        )
+
+        def _draft_call():
+            if sampling is None:
+                # 未指定采样参数时保持与既有调用完全一致的调用形状
+                return agent_loop.chat_with_tools(messages, None, deadline)
+
+            return agent_loop.chat_with_tools(
+                messages, None, deadline, sampling=sampling
+            )
+
+        value, timed_out = agent_loop._call_with_deadline(_draft_call, deadline)
+
+        # 线程被截断，或调用虽完成但墙钟预算已耗尽（例如单次调用内部推进了时钟）
+        if timed_out or deadline.expired():
+            return _draft_timeout_error(
+                draft_max_run_seconds, corrections_used, steps, last_raw
+            )
+
+        message, error = value
+
+        if error == agent_loop.AGENT_TIMEOUT:
+            return _draft_timeout_error(
+                draft_max_run_seconds, corrections_used, steps, last_raw
+            )
+
+        if error:
+            return _plan_error(
+                ERROR_LLM,
+                f"起草阶段 LLM 调用失败：{error}",
+                STOP_PLAN_LLM_ERROR,
+                corrections_used,
+                steps,
+                last_raw,
+                tool_calls,
+                loop_turns,
+            )
+
+        content = (message or {}).get("content") or ""
+        last_raw = content
+
+        if raw_sink is not None:
+            raw_sink.append(content)
+
+        reason = None
+
+        if message.get("tool_calls"):
+            reason = "起草阶段不允许调用工具"
+        else:
+            parsed = _extract_json(content)
+
+            if not isinstance(parsed, dict):
+                reason = "返回内容不是合法 JSON 或为空"
+            else:
+                answer = parsed.get("answer")
+                plan_raw = parsed.get("plan")
+
+                if not isinstance(answer, str) or not answer.strip():
+                    reason = "缺少非空的 answer 字段"
+                elif not isinstance(plan_raw, dict):
+                    reason = "缺少 plan 对象"
+                else:
+                    # 结构白名单：复用 plan_service.normalize_plan，不新建第二套字段定义
+                    normalized, structure_error = plan_service.normalize_plan(plan_raw)
+
+                    if structure_error:
+                        reason = structure_error
+                    else:
+                        # 规则校验：复用 validate_plan_for_save，
+                        # difficult_previous_task 由程序内部推导，Agent 不可指定
+                        validation = agent_tools.validate_plan_for_save(normalized)
+
+                        if not validation["valid"]:
+                            reason = validation["reason"]
+                        else:
+                            violations = check_grounding(
+                                [answer, normalized.get("reason")],
+                                steps,
+                                memory_result=memory_result,
+                            )
+
+                            if violations:
+                                reason = "；".join(violations)
+
+        if reason is None:
+            # 走到这里说明结构、规则、来源全部通过
+            _log(verbose, "[Draft]", f"Final Answer:\n{answer.strip()}")
+
+            return {
+                "ok": True,
+                "type": TYPE_PLAN_DRAFT,
+                "answer": answer.strip(),
+                "plan": normalized,
+                "difficult_previous_task": difficult,
+                "corrections_used": corrections_used,
+                "tool_calls": tool_calls,
+                "loop_turns": loop_turns,
+                "steps": steps,
+                "research_final_answer": research_final_answer,
+                "stopped_reason": STOP_PLAN_DRAFT_READY,
+            }
+
+        last_reason = reason
+        _log(verbose, "[Draft]", f"校验失败：{reason}")
+
+        if attempt < max_corrections:
+            corrections_used += 1
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": _correction_message(reason)})
+
+    # 5) 修正次数用尽仍未通过：稳定错误，绝不返回未校验的 plan
+    return _plan_error(
+        ERROR_VALIDATION,
+        f"计划草案经过 {corrections_used} 次修正仍未通过校验：{last_reason}",
+        STOP_PLAN_VALIDATION_FAILED,
+        corrections_used,
+        steps,
+        last_raw,
+        tool_calls,
+        loop_turns,
+    )
+
+
 def run_plan_draft(
     user_message,
     max_corrections=MAX_CORRECTIONS,
@@ -538,14 +722,16 @@ def run_plan_draft(
     draft_max_run_seconds=DRAFT_MAX_RUN_SECONDS,
     clock=None,
     verbose=True,
+    sampling=None,
 ):
-    """跑一次"研究 -> 起草 -> 校验 -> 有限修正"的计划草案流程。
+    """跑一次"研究 -> 起草 -> 校验 -> 有限修正"的计划草案流程（产品路径）。
 
     参数：
     - max_corrections：校验失败后的最多修正次数（默认 2）
     - research_max_run_seconds：研究阶段（run_agent）的墙钟预算
     - draft_max_run_seconds：起草阶段的独立墙钟预算
     - clock：可注入的单调时钟（研究阶段与起草阶段共用）
+    - sampling：可选采样参数，只作用于起草阶段（研究阶段沿用产品默认值）
 
     返回（成功）：
     {
@@ -627,143 +813,73 @@ def run_plan_draft(
     # 3.1) 短期学习上下文只算一次，注入真正生成计划的那次调用（v16 §2.2）
     short_term_block = _short_term_block()
 
-    deadline = agent_loop._Deadline(draft_max_run_seconds, clock)
-
-    messages = [
-        {"role": "system", "content": DRAFT_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": _build_draft_user_content(
-                user_message,
-                feedback_result,
-                knowledge_results,
-                search_failed,
-                difficult,
-                short_term_block=short_term_block,
-                memory_result=memory_result,
-            ),
-        },
-    ]
-
-    corrections_used = 0
-    last_reason = None
-    last_raw = None
-
-    # 4) 起草 + 校验 + 有限修正（首次生成 + 最多 max_corrections 次修正）
-    for attempt in range(max_corrections + 1):
-        _log(
-            verbose,
-            "[Draft]",
-            f"起草尝试 {attempt + 1}/{max_corrections + 1}",
-        )
-
-        value, timed_out = agent_loop._call_with_deadline(
-            lambda: agent_loop.chat_with_tools(messages, None, deadline),
-            deadline,
-        )
-
-        # 线程被截断，或调用虽完成但墙钟预算已耗尽（例如单次调用内部推进了时钟）
-        if timed_out or deadline.expired():
-            return _draft_timeout_error(
-                draft_max_run_seconds, corrections_used, steps, last_raw
-            )
-
-        message, error = value
-
-        if error == agent_loop.AGENT_TIMEOUT:
-            return _draft_timeout_error(
-                draft_max_run_seconds, corrections_used, steps, last_raw
-            )
-
-        if error:
-            return _plan_error(
-                ERROR_LLM,
-                f"起草阶段 LLM 调用失败：{error}",
-                STOP_PLAN_LLM_ERROR,
-                corrections_used,
-                steps,
-                last_raw,
-                research.get("tool_calls", 0),
-                research.get("loop_turns", 0),
-            )
-
-        content = (message or {}).get("content") or ""
-        last_raw = content
-
-        reason = None
-
-        if message.get("tool_calls"):
-            reason = "起草阶段不允许调用工具"
-        else:
-            parsed = _extract_json(content)
-
-            if not isinstance(parsed, dict):
-                reason = "返回内容不是合法 JSON 或为空"
-            else:
-                answer = parsed.get("answer")
-                plan_raw = parsed.get("plan")
-
-                if not isinstance(answer, str) or not answer.strip():
-                    reason = "缺少非空的 answer 字段"
-                elif not isinstance(plan_raw, dict):
-                    reason = "缺少 plan 对象"
-                else:
-                    # 结构白名单：复用 plan_service.normalize_plan，不新建第二套字段定义
-                    normalized, structure_error = plan_service.normalize_plan(plan_raw)
-
-                    if structure_error:
-                        reason = structure_error
-                    else:
-                        # 规则校验：复用 validate_plan_for_save，
-                        # difficult_previous_task 由程序内部推导，Agent 不可指定
-                        validation = agent_tools.validate_plan_for_save(normalized)
-
-                        if not validation["valid"]:
-                            reason = validation["reason"]
-                        else:
-                            violations = check_grounding(
-                                [answer, normalized.get("reason")],
-                                steps,
-                                memory_result=memory_result,
-                            )
-
-                            if violations:
-                                reason = "；".join(violations)
-
-        if reason is None:
-            # 走到这里说明结构、规则、来源全部通过
-            _log(verbose, "[Draft]", f"Final Answer:\n{answer.strip()}")
-
-            return {
-                "ok": True,
-                "type": TYPE_PLAN_DRAFT,
-                "answer": answer.strip(),
-                "plan": normalized,
-                "difficult_previous_task": difficult,
-                "corrections_used": corrections_used,
-                "tool_calls": research.get("tool_calls"),
-                "loop_turns": research.get("loop_turns"),
-                "steps": steps,
-                "research_final_answer": research.get("final_answer"),
-                "stopped_reason": STOP_PLAN_DRAFT_READY,
-            }
-
-        last_reason = reason
-        _log(verbose, "[Draft]", f"校验失败：{reason}")
-
-        if attempt < max_corrections:
-            corrections_used += 1
-            messages.append({"role": "assistant", "content": content})
-            messages.append({"role": "user", "content": _correction_message(reason)})
-
-    # 5) 修正次数用尽仍未通过：稳定错误，绝不返回未校验的 plan
-    return _plan_error(
-        ERROR_VALIDATION,
-        f"计划草案经过 {corrections_used} 次修正仍未通过校验：{last_reason}",
-        STOP_PLAN_VALIDATION_FAILED,
-        corrections_used,
+    return _run_draft_loop(
+        user_message,
+        feedback_result,
+        knowledge_results,
+        search_failed,
+        difficult,
+        short_term_block,
+        memory_result,
         steps,
-        last_raw,
-        research.get("tool_calls", 0),
-        research.get("loop_turns", 0),
+        max_corrections=max_corrections,
+        draft_max_run_seconds=draft_max_run_seconds,
+        clock=clock,
+        verbose=verbose,
+        sampling=sampling,
+        tool_calls=research.get("tool_calls", 0),
+        loop_turns=research.get("loop_turns", 0),
+        research_final_answer=research.get("final_answer"),
+    )
+
+
+def run_plan_draft_from_inputs(
+    user_message,
+    feedback_result=None,
+    knowledge_results=None,
+    search_failed=False,
+    difficult=False,
+    short_term_block=None,
+    memory_result=None,
+    steps=None,
+    max_corrections=MAX_CORRECTIONS,
+    draft_max_run_seconds=DRAFT_MAX_RUN_SECONDS,
+    clock=None,
+    verbose=True,
+    sampling=None,
+    raw_sink=None,
+):
+    """用调用方给定的固定输入直接起草计划（不跑研究阶段、不调用任何工具）。
+
+    供毕业设计 A/B/C/D/B0 对照实验使用：各组要注入的反馈、短期上下文、长期记忆
+    全部由调用方固定，摆脱"从研究轨迹重新推导输入"的耦合；其余链路
+    （JSON 解析、plan_service.normalize_plan、agent_tools.validate_plan_for_save、
+    check_grounding、MAX_CORRECTIONS）与 run_plan_draft 完全一致。
+
+    steps 是合成的 evidence（形如 {"type","tool","ok","result"}），只用于
+    check_grounding 判断计划是否声称依据了本次实际注入的证据；本函数不调用工具，
+    也不触发任何检索 / Embedding 请求。
+
+    返回结构与 run_plan_draft 相同，其中 tool_calls/loop_turns 恒为 0、
+    research_final_answer 恒为 None（本次没有研究阶段）。
+    """
+
+    return _run_draft_loop(
+        user_message,
+        feedback_result,
+        knowledge_results,
+        search_failed,
+        difficult,
+        short_term_block,
+        memory_result,
+        list(steps or []),
+        max_corrections=max_corrections,
+        draft_max_run_seconds=draft_max_run_seconds,
+        clock=clock,
+        verbose=verbose,
+        sampling=sampling,
+        tool_calls=0,
+        loop_turns=0,
+        research_final_answer=None,
+        raw_sink=raw_sink,
     )

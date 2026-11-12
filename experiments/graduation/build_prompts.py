@@ -40,10 +40,13 @@ if str(HERE) not in sys.path:
 
 import seed_fixture  # noqa: E402
 
-# 设计 §2.2 的四组输入矩阵。B0 与敏感性分析不在此阶段。
+# 设计 §2.2 的输入矩阵：A/B/C/D 是主对照，B0 是"只有原始反馈行"的探索组。
 GROUP_SLOTS = {
     "A": {"feedback": False, "short_term": False, "memory": False},
     "B": {"feedback": True, "short_term": True, "memory": False},
+    # B0：原始反馈行照常注入，但 summary 固定为空 dict、difficult 固定 False，
+    # 且没有短期上下文与长期记忆（与 B 的差异只来自这三个槽位）。
+    "B0": {"feedback": True, "short_term": False, "memory": False, "summary": False},
     "C": {"feedback": False, "short_term": False, "memory": True},
     "D": {"feedback": True, "short_term": True, "memory": True},
 }
@@ -56,7 +59,7 @@ MEMORY_USAGE_NOTE = (
     "引用记忆时只能按它写的历史事实表述。"
 )
 
-DIFF_PAIRS = (("A", "B"), ("A", "C"), ("B", "D"))
+DIFF_PAIRS = (("A", "B"), ("A", "B0"), ("B", "B0"), ("A", "C"), ("B", "D"))
 
 
 # ---------------------------------------------------------------------------
@@ -188,11 +191,21 @@ def collect_inputs(sample, config, api, moment):
     memories = agent_plan_draft._memory_memories(memory_tool)
     memory_result = {"count": len(memories), "memories": memories} if memories else None
 
+    # B0 专用：保留原始反馈行，但统计槽位固定为空 dict、难度标记固定 False
+    feedback_list = feedback_result.get("feedback") or []
+    raw_feedback_result = {
+        "days": days,
+        "count": len(feedback_list),
+        "summary": {},
+        "feedback": feedback_list,
+    }
+
     return {
         "user_message": sample["current_user_request"],
         "knowledge_results": list(config.get("knowledge_results") or []),
         "search_failed": bool(config.get("knowledge_search_failed")),
         "feedback_result": feedback_result,
+        "raw_feedback_result": raw_feedback_result,
         "empty_feedback": empty_feedback_result(days),
         "difficult": bool(difficult),
         "short_term_block": short_term["text"],
@@ -208,21 +221,46 @@ def collect_inputs(sample, config, api, moment):
 # ---------------------------------------------------------------------------
 
 
+def group_inputs(group, inputs):
+    """返回该组真正注入的 (feedback_result, difficult, short_term_block, memory_result)。
+
+    这是 A/B/C/D/B0 槽位的唯一定义来源：build_group_content 与 run_experiment 共用，
+    保证实验真正发给模型的内容与 build_prompts 的基线逐字节一致。
+    """
+
+    slots = GROUP_SLOTS[group]
+
+    if slots.get("summary", True) is False:
+        # B0：只有原始反馈行；summary 为空 dict、difficult 固定 False
+        feedback_result = inputs["raw_feedback_result"]
+        difficult = False
+    else:
+        feedback_result = (
+            inputs["feedback_result"] if slots["feedback"] else inputs["empty_feedback"]
+        )
+        difficult = inputs["difficult"] if slots["feedback"] else False
+
+    return {
+        "feedback_result": feedback_result,
+        "difficult": difficult,
+        "short_term_block": inputs["short_term_block"] if slots["short_term"] else None,
+        "memory_result": inputs["memory_result"] if slots["memory"] else None,
+    }
+
+
 def build_group_content(group, inputs, api):
     """按组矩阵调用产品函数拼出该组的用户消息（不做任何后处理）。"""
 
-    slots = GROUP_SLOTS[group]
-    feedback_result = inputs["feedback_result"] if slots["feedback"] else inputs["empty_feedback"]
-    difficult = inputs["difficult"] if slots["feedback"] else False
+    slots = group_inputs(group, inputs)
 
     return api["agent_plan_draft"]._build_draft_user_content(
         inputs["user_message"],
-        feedback_result,
+        slots["feedback_result"],
         inputs["knowledge_results"],
         inputs["search_failed"],
-        difficult,
-        inputs["short_term_block"] if slots["short_term"] else None,
-        inputs["memory_result"] if slots["memory"] else None,
+        slots["difficult"],
+        slots["short_term_block"],
+        slots["memory_result"],
     )
 
 
@@ -345,9 +383,30 @@ def check_group_relations(contents, inputs, api, db_path, config):
         "有反馈组共用同一份近期反馈与难度标记",
     ))
 
-    # 知识库槽位：四组同一份（本阶段固定为空结果）
+    # B0：原始反馈行完整保留，但不带统计摘要、不带难度硬规则
+    b0_feedback = inputs["raw_feedback_result"]["feedback"]
+    b0_feedback_json = json.dumps(b0_feedback, ensure_ascii=False, indent=2)
+    checks.append((
+        "B0·原始反馈行完整注入",
+        bool(b0_feedback) and b0_feedback_json in contents["B0"],
+        f"反馈 {len(b0_feedback)} 行",
+    ))
+    checks.append((
+        "B0·无统计摘要",
+        inputs["raw_feedback_result"]["summary"] == {}
+        and '"total_count"' not in contents["B0"]
+        and '"total_count"' in contents["B"],
+        "summary 固定 {}（B 组仍保留真实统计）",
+    ))
+    checks.append((
+        "B0·无难度硬规则",
+        "最近一次反馈是 partial 且原因是任务难度太高" not in contents["B0"],
+        "difficult 固定 False",
+    ))
+
+    # 知识库槽位：各组同一份（本阶段固定为空结果；本实验不考察 RAG）
     knowledge = {knowledge_segment(contents[group]) for group in GROUP_SLOTS}
-    checks.append(("四组知识库区块逐字相同", len(knowledge) == 1, "knowledge 段一致"))
+    checks.append(("各组知识库区块逐字相同", len(knowledge) == 1, "knowledge 段一致"))
 
     # 注入公平性：进 Prompt 的记忆必须就是 status=active 的前 limit 条
     if memory:
@@ -403,6 +462,8 @@ def build_sample_prompts(sample_id, config, reuse=False):
         "plan_date": inputs["plan_date"],
         "inputs": {
             "feedback_count": inputs["feedback_result"]["count"],
+            "b0_feedback_count": inputs["raw_feedback_result"]["count"],
+            "b0_summary_empty": inputs["raw_feedback_result"]["summary"] == {},
             "feedback_latest_status": inputs["feedback_result"]["summary"].get("latest_status"),
             "empty_feedback": inputs["empty_feedback"],
             "feedback_summary": inputs["feedback_result"]["summary"],
@@ -491,12 +552,12 @@ def write_sample_output(sample_dir, build):
 
 def render_report(summaries):
     lines = []
-    lines.append("# A/B/C/D 四组 Prompt 构建报告")
+    lines.append("# A/B/B0/C/D Prompt 构建报告")
     lines.append("")
     lines.append("本报告由 `experiments/graduation/build_prompts.py` 生成；**没有调用任何模型**。")
     lines.append("")
-    lines.append("| 样本 | 反馈条数 | 难度标记 | 短期上下文字符 | 记忆条数 | A 字符 | B 字符 | C 字符 | D 字符 | 核验 |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| 样本 | 反馈条数 | 难度标记 | 短期上下文字符 | 记忆条数 | A 字符 | B 字符 | B0 字符 | C 字符 | D 字符 | 核验 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 
     for summary in summaries:
         inputs = summary["inputs"]
@@ -508,7 +569,7 @@ def render_report(summaries):
             f"| {summary['sample_id']} | {inputs['feedback_count']} | "
             f"{'是' if inputs['difficult'] else '否'} | {inputs['short_term_chars']} | "
             f"{inputs['memory_count']} | {prompts['A']['chars']} | {prompts['B']['chars']} | "
-            f"{prompts['C']['chars']} | {prompts['D']['chars']} | {verdict} |"
+            f"{prompts['B0']['chars']} | {prompts['C']['chars']} | {prompts['D']['chars']} | {verdict} |"
         )
 
     lines.append("")
@@ -516,7 +577,6 @@ def render_report(summaries):
     lines.append("")
     lines.append("| 样本 | 组 | 字符数 | system_sha256 | user_sha256 | prompt_sha256 |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
-
     for summary in summaries:
         for group in GROUP_SLOTS:
             prompt = summary["prompts"][group]
@@ -542,8 +602,10 @@ def render_report(summaries):
 
     lines.append("## 说明")
     lines.append("")
-    lines.append("- 四组共用同一份用户请求、同一份知识库结果（固定为空）与同一份模拟历史。")
-    lines.append("- 组间差异只来自设计 §2.2 允许的三个槽位：近期反馈、短期上下文、长期记忆。")
+    lines.append("- 各组共用同一份用户请求、同一份知识库结果（固定为空）与同一份模拟历史。")
+    lines.append("- 组间差异只来自设计 §2.2 允许的槽位：近期反馈、反馈统计/难度、短期上下文、长期记忆。")
+    lines.append("- B0 只保留原始反馈行（summary 固定为空、difficult 固定 False、无短期上下文与记忆）。")
+    lines.append("- 本实验不考察 RAG：全组 knowledge_results=[]、knowledge_search_failed=false，不调用 Embedding、不做向量检索。")
     lines.append("- `ref_date` 固定；`get_feedback_since()` 的时间窗由固定时钟替身提供，不读本机时钟。")
     lines.append("- 本阶段不调用模型、不接知识库；Prompt 只是待测文本，不是实验结果。")
     lines.append("")
@@ -552,7 +614,7 @@ def render_report(summaries):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="构建 A/B/C/D 四组实验 Prompt")
+    parser = argparse.ArgumentParser(description="构建 A/B/B0/C/D 实验 Prompt")
     parser.add_argument("--sample", action="append", help="只构建指定样本，可重复")
     parser.add_argument("--reuse", action="store_true", help="复用已建好的库，不重建")
     parser.add_argument("--config", help="config.json 路径")
@@ -576,8 +638,9 @@ def main(argv=None):
         print(
             f"{sample_id}: feedback={summary['inputs']['feedback_count']} "
             f"memory={summary['inputs']['memory_count']} "
-            f"chars A/B/C/D="
+            f"chars A/B/B0/C/D="
             f"{summary['prompts']['A']['chars']}/{summary['prompts']['B']['chars']}/"
+            f"{summary['prompts']['B0']['chars']}/"
             f"{summary['prompts']['C']['chars']}/{summary['prompts']['D']['chars']} "
             f"checks_failed={len(bad)}"
         )

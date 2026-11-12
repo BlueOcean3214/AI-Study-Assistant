@@ -3,15 +3,21 @@
   "design_doc": "docs/GRADUATION-EXPERIMENT-DESIGN.md",
   "ref_date": "2026-11-12T21:00:00",
   "samples": ["S1", "S2", "S3", "S4", "S5", "S6", "S7"],
-  "groups": ["A", "B", "C", "D"],
+  "groups": ["A", "B", "B0", "C", "D"],
   "memory_limit": 5,
   "recent_feedback_days": 7,
   "recent_feedback_limit": 20,
   "knowledge_results": [],
   "knowledge_search_failed": false,
+  "sampling": {
+    "temperature": 0.7,
+    "top_p": 1.0,
+    "max_tokens": 2048
+  },
   "notes": [
     "ref_date 固定，所有历史时间戳 = ref_date + offset_days，不受本机时钟影响。",
-    "groups 的顺序即设计文档 §2.2 的 A/B/C/D 四组；B0 与敏感性分析不在此阶段。",
-    "knowledge_results 固定为空列表（本阶段不接知识库），四组共用同一份，避免混淆变量。"
+    "groups 的顺序即设计文档 §2.2 的 A/B/B0/C/D；B0 只在 S5、S7 上跑探索性对照，不参与主假设。",
+    "knowledge_results 固定为空列表（本实验不考察 RAG），各组共用同一份，避免混淆变量。",
+    "sampling 为正式实验的固定采样参数；A/B/B0/C/D 必须完全一致，实际值会逐条写进结果 JSONL。"
   ]
 }
