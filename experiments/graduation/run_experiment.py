@@ -12,7 +12,10 @@
 - 用量记录：只用 llm_client.set_usage_recorder 装进程内 recorder，不落库
   （不为采样参数新增数据库字段/表）。
 - 结果只追加：results.jsonl 逐行 append，Prompt 文本按样本/组只写一次，
-  已存在且内容不同时拒绝覆盖。
+  已存在且内容不同时拒绝覆盖；同一 run-dir 里同一实验身份（experiment_id +
+  样本 + 组 + 重复序号）已存在时，在任何模型请求之前拒绝运行。
+- 样本调度按 (样本, 组) 任务对：B0 默认只跑 S5、S7，其他组跑全部样本；
+  显式 --sample 的覆盖语义逐条记进结果（sample_selection / b0_sample_override）。
 
 本模块不发起任何真实请求；是否真的调用模型由 CLI 使用者的环境配置决定。
 """
@@ -255,18 +258,41 @@ def evidence_steps(group, inputs):
     return steps
 
 
-def resolve_samples(args, config):
-    """--sample 优先；否则全量样本，B0 只取设计指定的探索样本。"""
+def resolve_plan(args, config):
+    """把 CLI 展开成 (样本, 组) 任务对，B0 的默认样本范围独立于其他组。
 
-    if args.sample:
-        return list(args.sample)
+    - 不给 --sample：A/B/C/D × 全部样本，B0 × 仅 B0_DEFAULT_SAMPLES（S5、S7）；
+    - --group B0：只有 B0 × S5、S7；
+    - --group A --group B0：A × 全部样本、B0 × S5、S7；
+    - 显式 --sample：样本范围由用户决定，所有选中组都在这些样本上跑；
+      该覆盖逐条记进结果元数据（sample_selection / b0_sample_override）。
 
-    samples = seed_fixture.sample_ids(config)
+    任务对而不是「一个全局样本列表」：否则混合组时 B0 会被扩张到全部样本。
+    """
 
-    if args.group == ["B0"]:
-        return [sample_id for sample_id in samples if sample_id in B0_DEFAULT_SAMPLES]
+    groups = list(args.group or build_prompts.GROUP_SLOTS)
+    explicit = bool(args.sample)
+    samples = list(args.sample) if explicit else seed_fixture.sample_ids(config)
 
-    return samples
+    plan = []
+
+    for sample_id in samples:
+        for group in groups:
+            if not explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES:
+                continue
+
+            plan.append(
+                {
+                    "sample_id": sample_id,
+                    "group": group,
+                    "sample_selection": "explicit" if explicit else "default",
+                    "b0_sample_override": bool(
+                        explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES
+                    ),
+                }
+            )
+
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +315,8 @@ def run_one(
     run_dir,
     recorder,
     sampling=None,
+    sample_selection="default",
+    b0_sample_override=False,
     draft_runner=None,
     now=None,
 ):
@@ -362,7 +390,12 @@ def run_one(
         "request_count": len(requests),
         "requests": requests,
         "corrections_used": result.get("corrections_used", 0),
+        # raw_output：最后一次起草尝试（保留旧语义，含 result 的兜底字段）；
+        # raw_outputs：本次 run 的全部起草尝试，按发生顺序，未起草时为 []。
         "raw_output": raw_sink[-1] if raw_sink else result.get("last_draft_raw"),
+        "raw_outputs": list(raw_sink),
+        "sample_selection": sample_selection,
+        "b0_sample_override": bool(b0_sample_override),
         "final_output": (
             {"answer": result.get("answer"), "plan": result.get("plan")}
             if success
@@ -444,16 +477,106 @@ def make_experiment_id(config, run_dir):
     return f"{name}@{ref.strftime('%Y%m%dT%H%M%S')}@{Path(run_dir).name}"
 
 
+# ---------------------------------------------------------------------------
+# 重复实验身份保护
+# ---------------------------------------------------------------------------
+
+
+class IdentityConflictError(RuntimeError):
+    """已有结果无法解析，或本次计划与已有实验身份冲突。"""
+
+
+def identity_key(experiment_id, sample_id, group, repeat_index):
+    return (str(experiment_id), str(sample_id), str(group), int(repeat_index))
+
+
+def read_existing_identities(results_path):
+    """读取已有 results.jsonl 的 (experiment_id, sample_id, group, repeat_index)。"""
+
+    path = Path(results_path)
+
+    if not path.is_file():
+        return set()
+
+    keys = set()
+
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        text = line.strip()
+
+        if not text:
+            continue
+
+        try:
+            row = json.loads(text)
+        except json.JSONDecodeError as error:
+            raise IdentityConflictError(
+                f"{path} 第 {line_number} 行不是合法 JSON，拒绝在该目录继续追加：{error}"
+            ) from error
+
+        missing = [
+            field
+            for field in ("experiment_id", "sample_id", "group", "repeat_index")
+            if row.get(field) is None
+        ]
+
+        if missing:
+            raise IdentityConflictError(
+                f"{path} 第 {line_number} 行缺少实验身份字段 {missing}，无法判断是否重复"
+            )
+
+        keys.add(
+            identity_key(
+                row["experiment_id"],
+                row["sample_id"],
+                row["group"],
+                row["repeat_index"],
+            )
+        )
+
+    return keys
+
+
+def find_identity_conflicts(plan, experiment_id, results_path, repeats):
+    """返回与已有结果冲突的 (experiment_id, sample_id, group, repeat_index)。"""
+
+    existing = read_existing_identities(results_path)
+    conflicts = []
+
+    for task in plan:
+        for repeat_index in range(repeats):
+            key = identity_key(
+                experiment_id, task["sample_id"], task["group"], repeat_index
+            )
+
+            if key in existing:
+                conflicts.append(key)
+
+    return conflicts
+
+
+def describe_plan(plan):
+    """按组汇总计划里的样本，用于运行前打印。"""
+
+    grouped = {}
+
+    for task in plan:
+        grouped.setdefault(task["group"], []).append(task["sample_id"])
+
+    return "  ".join(
+        f"{group}={','.join(samples)}" for group, samples in grouped.items()
+    )
+
+
 def main(argv=None):
     args = parse_args(argv)
-
-    groups = args.group or list(build_prompts.GROUP_SLOTS)
-
     config = seed_fixture.load_config(args.config)
-    samples = resolve_samples(args, config)
 
-    if not samples:
-        print("没有可运行的样本（B0 只在 S5、S7 上跑，请显式指定 --sample）")
+    plan = resolve_plan(args, config)
+
+    if not plan:
+        print("没有可运行的任务（B0 只在 S5、S7 上有默认样本，请显式指定 --sample）")
         return 2
 
     run_dir = (
@@ -461,12 +584,43 @@ def main(argv=None):
         if args.run_dir
         else default_run_dir(config)
     )
+    results_path = run_dir / RESULTS_NAME
+    experiment_id = make_experiment_id(config, run_dir)
+
+    # 2) 重复实验身份保护：任何模型请求、任何文件写入之前先拒绝
+    try:
+        conflicts = find_identity_conflicts(
+            plan, experiment_id, results_path, args.repeats
+        )
+    except IdentityConflictError as error:
+        print(f"拒绝运行：{error}", file=sys.stderr)
+        return 4
+
+    if conflicts:
+        print(
+            "拒绝运行：本次计划与已有结果身份重复 "
+            f"{len(conflicts)} 条（experiment_id={experiment_id}）。",
+            file=sys.stderr,
+        )
+
+        for key in conflicts[:5]:
+            print(f"  sample={key[1]} group={key[2]} repeat={key[3]}", file=sys.stderr)
+
+        if len(conflicts) > 5:
+            print(f"  … 另有 {len(conflicts) - 5} 条", file=sys.stderr)
+
+        print(
+            "同一 run-dir 里不允许重复记录同一实验身份；请改用新的 --run-dir。",
+            file=sys.stderr,
+        )
+
+        return 4
+
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    experiment_id = make_experiment_id(config, run_dir)
     sampling = dict(config.get("sampling") or DEFAULT_SAMPLING)
 
-    # 1) 模型调用之前完成数据库隔离，并把模块登记给 seed_fixture（避免二次导入）
+    # 3) 模型调用之前完成数据库隔离，并把模块登记给 seed_fixture（避免二次导入）
     database, memory_service = isolate_database(run_dir)
     seed_fixture.register_project_modules(
         seed_fixture.workspace_dir(config),
@@ -481,14 +635,23 @@ def main(argv=None):
 
     print(f"experiment_id = {experiment_id}")
     print(f"run_dir       = {run_dir}")
-    print(f"groups        = {','.join(groups)}  samples={','.join(samples)}  repeats={args.repeats}")
+    print(f"plan          = {describe_plan(plan)}  repeats={args.repeats}")
     print(f"sampling      = {sampling}")
 
-    results_path = run_dir / RESULTS_NAME
+    order = []
+    tasks_by_sample = {}
+
+    for task in plan:
+        if task["sample_id"] not in tasks_by_sample:
+            tasks_by_sample[task["sample_id"]] = []
+            order.append(task["sample_id"])
+
+        tasks_by_sample[task["sample_id"]].append(task)
+
     failures = 0
     total = 0
 
-    for sample_id in samples:
+    for sample_id in order:
         api = build_prompts.project_api(config)
         sample = seed_fixture.load_sample(sample_id, config)
         db_path, api = build_prompts.activate_sample(
@@ -497,18 +660,20 @@ def main(argv=None):
         moment = seed_fixture.ref_datetime(config)
         inputs = build_prompts.collect_inputs(sample, config, api, moment)
 
-        for group in groups:
+        for task in tasks_by_sample[sample_id]:
             for repeat_index in range(args.repeats):
                 record = run_one(
                     experiment_id=experiment_id,
                     sample_id=sample_id,
-                    group=group,
+                    group=task["group"],
                     repeat_index=repeat_index,
                     inputs=inputs,
                     api=api,
                     run_dir=run_dir,
                     recorder=recorder,
                     sampling=sampling,
+                    sample_selection=task["sample_selection"],
+                    b0_sample_override=task["b0_sample_override"],
                 )
                 append_jsonl(results_path, record)
 
@@ -516,7 +681,7 @@ def main(argv=None):
                 failures += 0 if record["success"] else 1
 
                 print(
-                    f"  {sample_id}/{group}/#{repeat_index}: "
+                    f"  {sample_id}/{task['group']}/#{repeat_index}: "
                     f"success={record['success']} "
                     f"requests={record['request_count']} "
                     f"corrections={record['corrections_used']} "

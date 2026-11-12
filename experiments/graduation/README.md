@@ -86,7 +86,20 @@ $env:PYTHONIOENCODING='utf-8'
 参数：`--sample`（可重复，默认全部样本）、`--group`（A/B/B0/C/D，可重复，默认全部）、
 `--repeats`（1–50，默认 1）、`--run-dir`（默认 `experiments/graduation/runs/<ref>-<UTC>`）、
 `--reuse`（复用已建好且通过完整性校验的样本库，否则 `%TEMP%\graduation_experiments\...` 下的库）、
-`--config`。只给 `--group B0` 且不给 `--sample` 时，按设计只跑 S5、S7。
+`--config`。
+
+样本调度按 `(样本, 组)` 任务对生成，不是「一个样本列表套所有组」：
+
+| 命令 | A/B/C/D | B0 |
+| --- | --- | --- |
+| 默认（不给 `--group`） | S1–S7 | 仅 S5、S7 |
+| `--group B0` | 不跑 | 仅 S5、S7 |
+| `--group A --group B0` | A：S1–S7 | 仅 S5、S7 |
+| `--sample S5 --group B0` | 不跑 | S5 |
+| `--sample S1 --group B0` | 不跑 | S1（显式覆盖，记录里 `b0_sample_override=true`） |
+
+显式 `--sample` 保留「按你指定的样本执行」的语义，可以超出 B0 的默认范围；这种覆盖会写进每条
+结果的 `sample_selection`（`explicit` / `default`）与 `b0_sample_override` 字段，统计时能识别出来。
 
 运行前的三道闸门：
 
@@ -97,13 +110,21 @@ $env:PYTHONIOENCODING='utf-8'
    `seed_fixture.register_project_modules()` 把已隔离的模块登记给脚手架，避免二次 import 冲突。
 2. **用量回收器**：`llm_client.set_usage_recorder()` 装的是本脚本自己的 recorder，只把记录
    追加进内存列表，**不落数据库**（不产生 `model_usage` 行）。
-3. **不覆盖**：结果按 JSONL 追加写运行目录下的 `results.jsonl`（`a` 模式 + `flush` + `fsync`），
-   重复运行同一目录只会在文件末尾追加新记录，不修改已有行；Prompt 快照
+3. **重复实验身份保护**：运行前先读运行目录里已有的 `results.jsonl`，把本次计划生成的
+   `(experiment_id, sample_id, group, repeat_index)` 与已有记录逐一比对。只要有一条重复，
+   就在建目录、隔离数据库、发任何模型请求之前退出（返回码 `4`），提示改用新的 `--run-dir`；
+   已有文件一个字节都不改，也不会追加半截结果。结果文件是坏 JSON 或缺身份字段时同样
+   fail-closed（返回码 `4`），不猜测、不跳过。
+4. **不覆盖**：结果按 JSONL 追加写运行目录下的 `results.jsonl`（`a` 模式 + `flush` + `fsync`），
+   通过身份检查后的新记录只会追加到文件末尾；Prompt 快照
    （`prompts/<样本>/<组>.txt`）若已存在且内容不同则报错拒绝覆盖。
 
 每条记录至少包含：`experiment_id`、`sample_id`、`group`、`repeat_index`、`provider`、`model`、
 `temperature`、`top_p`、`max_tokens`（优先取**本次最后一次实际请求**的值，无请求时记录意图值）、
-`prompt_sha256`、`prompt_ref`/`prompt_chars`、`raw_output`（模型原始输出）、`final_output`
+`prompt_sha256`、`prompt_ref`/`prompt_chars`、`raw_output`（最后一次起草尝试的模型原始输出）、
+`raw_outputs`（本次全部起草尝试的原始输出列表，按调用顺序；没有起草时是 `[]`）、
+`sample_selection`（`explicit` / `default`）、`b0_sample_override`（显式 `--sample` 让 B0 跑出
+S5/S7 时为 `true`）、`final_output`
 （`{answer, plan}` 或 `null`）、`request_count`、`requests`（逐次请求的用量）、`corrections_used`、
 `token_usage`（缺失记为 `{"available": false, "status": "unavailable"}`，不填 0 冒充）、
 `elapsed_seconds`、`generated_at`、`success`、`error_type`、`error_message`、`stopped_reason`。

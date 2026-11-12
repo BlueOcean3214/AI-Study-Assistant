@@ -159,6 +159,60 @@ def openai_settings():
 MESSAGES = [{"role": "user", "content": "hi"}]
 SAMPLING = {"temperature": 0.7, "top_p": 1.0, "max_tokens": 2048}
 
+# ---------------------------------------------------------------------------
+# 冻结的旧版 Prompt 哈希（来源提交 df4b93806d7520181a9b5771fa0d09802fa9a791）
+#
+# 导出方式：`git worktree add --detach <dir> df4b938`，在该基线的独立 worktree 里用
+# 它自己的 experiments/graduation/build_prompts.py 跑 build_sample_prompts(sample, config,
+# reuse=False)，只取 A/B/C/D（B0 由本 PR 新增，不属于旧版基线）。导出脚本与当前分支
+# 完全隔离，因此这些常量是真正的旧版基线，不是「当前代码和自己比」。
+# ---------------------------------------------------------------------------
+
+FROZEN_BASELINE_PROMPT_SHA256 = {
+    "S1": {
+        "A": "1cba51d1399648b3ba66621897b7a79396668e544499f622690f1a93b008e656",
+        "B": "bd1e0323575e04392aaf3f1496ffd83873bb8c2e1d9e951ec6a2e9613a6cc5da",
+        "C": "56dd4573db5ba4b07fed872e81b23865267e953ed52b74ead32b951b7e702da7",
+        "D": "cafc40c63a3edd16454fc6f97db721e16477f6ae0dfa64af559d1c775a4d223a",
+    },
+    "S2": {
+        "A": "6fab10f7cba0b0e93540151c90aa049bd967aaeffead38cb4fb408649f824070",
+        "B": "79b613aabe3c9af0375e70a805ce8417ca4f1cd779fdfe113926bd6370606718",
+        "C": "271c273071b9e7dfa59da5202aa926406001ee487613cc7671f5b4744188d9f4",
+        "D": "2791b9239ccf9f8f81125e51acc11c290dcb61ce2f3937d4fd57087617bbac14",
+    },
+    "S3": {
+        "A": "c52fadd41f75a5ff2a55388607fe204b474352f8cda729a715a0defb51e3da13",
+        "B": "292d22d3355c31e12ceab0793120913aadeaa49fc9d77b892fcbe708f3bba7c6",
+        "C": "d6ce98dfa17e123bc43b4695b12715c4f3f5d9e4d53f59de6373c7c30953b94e",
+        "D": "9847630fd371ee3edb44a30c74250823f07bf2b80e0769213ed85442aa863f91",
+    },
+    "S4": {
+        "A": "0c01afd08fd58527d265aba4b9964359220a985acae843497b00ad688149e2a9",
+        "B": "7e733e32d4cad56047d775331945423d21ab3d20b52db388b55afff3891fe618",
+        "C": "c96aa71ab1c085edc31f0e86ec9481e9c51ad8ed83240edf20b2a7d4f08ac450",
+        "D": "e36f01b51e9e39e417d4e973019c027fc3d3dd9853b824e81ddfb77b2de1c07b",
+    },
+    "S5": {
+        "A": "864c1bce13d764952e5c7538526bf467bf5d7f6ecb8a2c50acfda668aeaea059",
+        "B": "4876f3c570703297ca5fc0977e2541bbd007b30b4a40e48c60274fcec6bb1759",
+        "C": "467a59a89335cf1374ea515445497c5c9a818b0187e18f0e867b698737dcf7bc",
+        "D": "ab8d8b7750effeed830db6c0816ea9d31195b7dc02591e48cf3aa8021d29d550",
+    },
+    "S6": {
+        "A": "60ca716930fd80b7cd4edecc8d86d8fb595d0e25c33bbed04f0b8729673369ac",
+        "B": "d93b593ab992a5f94a61685fca254f7e1b653b808d5d60e284d28de58dceba01",
+        "C": "38faace385fa47c638444c7483130c6fdabf6de63c5cabcf8f9fb020e5529d62",
+        "D": "b031a726b9648e7af4b15e52cc5c15aacd3df91a51cf62cb479426f28ab334ac",
+    },
+    "S7": {
+        "A": "9ddf093dab8640368d8cb0dab745cbc5420fcf8db58164748fd55c5285aa4c3d",
+        "B": "c47ae633b8223b2ff8da765bd837de3287135212a9d3dd5f80dcc222fce2cc5d",
+        "C": "901d67901abbbdf1bff17e7eb46b93d0dccc9bf41330de47d683b0a11eff4103",
+        "D": "aa55f5caef21e71cf296dab6bd1a2d27f8a2a762fb73722992b1b11adb883803",
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -222,23 +276,169 @@ def test_positive_int_direct():
             check(f"positive_int({bad}) 拒绝", False)
 
 
-def test_resolve_samples_b0():
-    class Args:
-        sample = None
-        group = ["B0"]
+def plan_pairs(plan):
+    return [(task["sample_id"], task["group"]) for task in plan]
+
+
+def test_plan_matrix():
+    """B0 的默认样本范围必须独立于其他组（任务对，不是一个全局样本列表）。"""
 
     config = seed_fixture.load_config()
-    samples = run_experiment.resolve_samples(Args(), config)
+    samples = seed_fixture.sample_ids(config)
+    order = list(build_prompts.GROUP_SLOTS)
 
-    check("B0 默认只取 S5/S7", samples == ["S5", "S7"], samples)
+    # 1) 默认全部组：A/B/C/D × 全部样本，B0 只有 S5、S7
+    plan = run_experiment.resolve_plan(run_experiment.parse_args([]), config)
+    pairs = plan_pairs(plan)
+    expected = [
+        (sample_id, group)
+        for sample_id in samples
+        for group in order
+        if group != "B0" or sample_id in run_experiment.B0_DEFAULT_SAMPLES
+    ]
 
-    Args.group = ["A", "B0"]
-    all_samples = run_experiment.resolve_samples(Args(), config)
+    check("默认计划：任务对完全符合设计", pairs == expected, pairs)
+    check("默认计划：B0 只在 S5/S7", [p for p in pairs if p[1] == "B0"] == [("S5", "B0"), ("S7", "B0")], pairs)
+    check("默认计划：A/B/C/D 每个样本各一次", all(pair in pairs for pair in [(s, g) for s in samples for g in ("A", "B", "C", "D")]))
+    check("默认计划：30 个任务对（7×4 + 2）", len(pairs) == 30, len(pairs))
+    check(
+        "默认计划：全部标记 default 且未覆盖 B0 样本",
+        all(t["sample_selection"] == "default" and not t["b0_sample_override"] for t in plan),
+        plan[:1],
+    )
 
-    check("含其他组时不限制样本", len(all_samples) == len(seed_fixture.sample_ids(config)))
+    # 2) 只给 --group B0
+    b0_only = plan_pairs(run_experiment.resolve_plan(run_experiment.parse_args(["--group", "B0"]), config))
+    check("--group B0 默认只跑 S5/S7", b0_only == [("S5", "B0"), ("S7", "B0")], b0_only)
 
-    Args.sample = ["S1"]
-    check("--sample 优先", run_experiment.resolve_samples(Args(), config) == ["S1"])
+    # 3) 混合组：A 全样本，B0 仍然只有 S5/S7
+    mixed = plan_pairs(
+        run_experiment.resolve_plan(run_experiment.parse_args(["--group", "A", "--group", "B0"]), config)
+    )
+    check("A+B0：B0 不被扩张到全部样本", [p for p in mixed if p[1] == "B0"] == [("S5", "B0"), ("S7", "B0")], mixed)
+    check("A+B0：A 跑全部样本", [p for p in mixed if p[1] == "A"] == [(s, "A") for s in samples], mixed)
+    check("A+B0：共 9 个任务对", len(mixed) == 9, len(mixed))
+
+    # 4) 显式 --sample 保留覆盖语义，并把覆盖记进元数据
+    explicit = run_experiment.resolve_plan(
+        run_experiment.parse_args(["--sample", "S5", "--group", "B0"]), config
+    )
+    check("显式 S5/B0 只有一个任务对", plan_pairs(explicit) == [("S5", "B0")], explicit)
+    check(
+        "显式命中 B0 默认样本：selection=explicit、override=False",
+        explicit[0]["sample_selection"] == "explicit" and not explicit[0]["b0_sample_override"],
+        explicit,
+    )
+
+    override = run_experiment.resolve_plan(
+        run_experiment.parse_args(["--sample", "S1", "--group", "B0"]), config
+    )
+    check("显式 S1/B0 按覆盖语义执行", plan_pairs(override) == [("S1", "B0")], override)
+    check(
+        "显式超出 B0 默认样本：override=True 留痕",
+        override[0]["sample_selection"] == "explicit" and override[0]["b0_sample_override"],
+        override,
+    )
+
+    all_groups_explicit = run_experiment.resolve_plan(
+        run_experiment.parse_args(["--sample", "S1"]), config
+    )
+    check(
+        "显式 --sample 时五组都跑该样本（含 B0 覆盖标记）",
+        plan_pairs(all_groups_explicit) == [("S1", group) for group in order]
+        and all_groups_explicit[2]["b0_sample_override"],
+        all_groups_explicit,
+    )
+
+
+def test_main_dispatch_respects_plan(run_dir):
+    """真实 main 循环按任务对分发：默认全部组时 B0 只能出现在 S5/S7。"""
+
+    config = seed_fixture.load_config()
+    samples = seed_fixture.sample_ids(config)
+    target = Path(run_dir) / "dispatch_default"
+    dispatched = []
+
+    originals = {
+        "isolate": run_experiment.isolate_database,
+        "register": seed_fixture.register_project_modules,
+        "activate": build_prompts.activate_sample,
+        "collect": build_prompts.collect_inputs,
+        "project_api": build_prompts.project_api,
+        "run_one": run_experiment.run_one,
+    }
+
+    def fake_run_one(**kwargs):
+        dispatched.append((kwargs["sample_id"], kwargs["group"], kwargs["repeat_index"]))
+        return {
+            "experiment_id": kwargs["experiment_id"],
+            "sample_id": kwargs["sample_id"],
+            "group": kwargs["group"],
+            "repeat_index": kwargs["repeat_index"],
+            "sample_selection": kwargs["sample_selection"],
+            "b0_sample_override": kwargs["b0_sample_override"],
+            "raw_output": None,
+            "raw_outputs": [],
+            "success": True,
+            "request_count": 0,
+            "corrections_used": 0,
+            "prompt_chars": 0,
+            "error_type": None,
+            "error_message": None,
+        }
+
+    run_experiment.isolate_database = lambda path: (object(), object())
+    seed_fixture.register_project_modules = lambda *args, **kwargs: None
+    build_prompts.project_api = lambda config=None: {}
+    build_prompts.activate_sample = lambda sample_id, config, reuse=False, sample=None: (
+        Path(f"{sample_id}.db"),
+        {},
+    )
+    build_prompts.collect_inputs = lambda sample, config, api, moment: {}
+    run_experiment.run_one = fake_run_one
+
+    stdout = io.StringIO()
+
+    try:
+        with contextlib.redirect_stdout(stdout):
+            code = run_experiment.main(["--run-dir", str(target)])
+    finally:
+        run_experiment.isolate_database = originals["isolate"]
+        seed_fixture.register_project_modules = originals["register"]
+        build_prompts.activate_sample = originals["activate"]
+        build_prompts.collect_inputs = originals["collect"]
+        build_prompts.project_api = originals["project_api"]
+        run_experiment.run_one = originals["run_one"]
+
+    expected = [
+        (sample_id, group, 0)
+        for sample_id in samples
+        for group in build_prompts.GROUP_SLOTS
+        if group != "B0" or sample_id in run_experiment.B0_DEFAULT_SAMPLES
+    ]
+
+    check("默认运行 exit code 0", code == 0, code)
+    check("main 实际分发的任务对与设计一致", dispatched == expected, dispatched)
+    check(
+        "main 实际分发时 B0 只在 S5/S7",
+        [(s, g) for s, g, _ in dispatched if g == "B0"] == [("S5", "B0"), ("S7", "B0")],
+        dispatched,
+    )
+
+    lines = (target / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    check("默认运行写入 30 条结果", len(lines) == 30, len(lines))
+    check(
+        "结果文件里 B0 只出现在 S5/S7",
+        sorted(
+            {json.loads(line)["sample_id"] for line in lines if json.loads(line)["group"] == "B0"}
+        )
+        == ["S5", "S7"],
+        lines[:1],
+    )
+    check(
+        "默认运行结果是 default 选择",
+        all(json.loads(line)["sample_selection"] == "default" for line in lines),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +982,222 @@ def test_main_aborts_before_model_calls(run_dir):
     )
 
 
+def test_raw_outputs_chain(run_dir, api, inputs):
+    """首轮 + 2 次修正的全部原始输出都要留痕，且顺序稳定。"""
+
+    import agent_plan_draft
+
+    calls = []
+    original_chat = agent_plan_draft.agent_loop.chat_with_tools
+
+    def fake_chat_with_tools(messages, tools=None, deadline=None, sampling=None):
+        calls.append(1)
+        return {"role": "assistant", "content": f"尝试{len(calls)} 不是 JSON"}, None
+
+    agent_plan_draft.agent_loop.chat_with_tools = fake_chat_with_tools
+
+    try:
+        record = run_experiment.run_one(
+            experiment_id="exp-raw",
+            sample_id="S2",
+            group="A",
+            repeat_index=0,
+            inputs=inputs,
+            api=api,
+            run_dir=run_dir,
+            recorder=run_experiment.UsageRecorder(),
+            sampling=SAMPLING,
+        )
+    finally:
+        agent_plan_draft.agent_loop.chat_with_tools = original_chat
+
+    expected = [f"尝试{index} 不是 JSON" for index in (1, 2, 3)]
+
+    check("完整起草链：3 次调用", len(calls) == 3, len(calls))
+    check("raw_outputs 保留全部 3 条尝试", record.get("raw_outputs") == expected, record.get("raw_outputs"))
+    check("raw_outputs 顺序与调用顺序一致", record["raw_outputs"][0] == expected[0] and record["raw_outputs"][-1] == expected[-1])
+    check("raw_output 仍代表最后一次尝试", record.get("raw_output") == record["raw_outputs"][-1], record.get("raw_output"))
+    check("起草失败 success=False", record["success"] is False, record.get("error_type"))
+
+    def empty_runner(api=None, raw_sink=None, **kwargs):
+        return {"ok": False, "error_type": "llm_error", "message": "没有起草", "corrections_used": 0}
+
+    record = run_experiment.run_one(
+        experiment_id="exp-raw",
+        sample_id="S2",
+        group="A",
+        repeat_index=1,
+        inputs=inputs,
+        api=api,
+        run_dir=run_dir,
+        recorder=run_experiment.UsageRecorder(),
+        sampling=SAMPLING,
+        draft_runner=empty_runner,
+    )
+
+    check("未起草时 raw_outputs 是稳定空列表", record.get("raw_outputs") == [], record.get("raw_outputs"))
+    check("未起草时 raw_output 为 None", record.get("raw_output") is None, record.get("raw_output"))
+
+
+def test_duplicate_identity_guard(run_dir, config):
+    """同一 run-dir 里重复记录同一实验身份必须被拒绝，且拒绝发生在任何模型请求之前。"""
+
+    target = Path(run_dir) / "dup_guard"
+    target.mkdir(parents=True, exist_ok=True)
+    results_path = target / "results.jsonl"
+    experiment_id = run_experiment.make_experiment_id(config, target)
+
+    existing = {
+        "experiment_id": experiment_id,
+        "sample_id": "S5",
+        "group": "B0",
+        "repeat_index": 0,
+        "success": True,
+        "raw_output": None,
+        "raw_outputs": [],
+    }
+    results_path.write_text(json.dumps(existing, ensure_ascii=False) + "\n", encoding="utf-8")
+    before_bytes = results_path.read_bytes()
+
+    original = {
+        "isolate": run_experiment.isolate_database,
+        "run_one": run_experiment.run_one,
+        "chat": llm_client.chat,
+        "register": seed_fixture.register_project_modules,
+        "project_api": build_prompts.project_api,
+        "activate": build_prompts.activate_sample,
+        "collect": build_prompts.collect_inputs,
+        "load_sample": seed_fixture.load_sample,
+    }
+
+    isolate_calls = []
+    run_calls = []
+    chat_calls = []
+
+    def fake_isolate(path):
+        isolate_calls.append(path)
+        return object(), object()
+
+    def fake_run_one(**kwargs):
+        run_calls.append(kwargs)
+        return {
+            "success": True,
+            "request_count": 0,
+            "corrections_used": 0,
+            "prompt_chars": 0,
+            "error_type": None,
+            "error_message": None,
+        }
+
+    run_experiment.isolate_database = fake_isolate
+    run_experiment.run_one = fake_run_one
+    llm_client.chat = lambda *args, **kwargs: chat_calls.append(1)
+    seed_fixture.register_project_modules = lambda *args, **kwargs: None
+    build_prompts.project_api = lambda config=None: {}
+    build_prompts.activate_sample = lambda sample_id, config, reuse=False, sample=None: (Path(f"{sample_id}.db"), {})
+    build_prompts.collect_inputs = lambda sample, config, api, moment: {}
+    seed_fixture.load_sample = lambda sample_id, config: {}
+
+    stderr = io.StringIO()
+    stdout = io.StringIO()
+
+    try:
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
+            code = run_experiment.main(
+                ["--sample", "S5", "--group", "B0", "--run-dir", str(target)]
+            )
+
+        check("重复身份：exit code 4", code == 4, code)
+        check(
+            "重复身份：0 次数据库隔离、0 次模型请求",
+            isolate_calls == [] and run_calls == [] and chat_calls == [],
+            (len(isolate_calls), len(run_calls), len(chat_calls)),
+        )
+        check("重复身份：不覆盖、不追加已有结果", results_path.read_bytes() == before_bytes)
+        check("重复身份：错误信息建议换 --run-dir", "--run-dir" in stderr.getvalue(), stderr.getvalue())
+        check("重复身份：提示里点名冲突身份", "S5" in stderr.getvalue() and "B0" in stderr.getvalue(), stderr.getvalue())
+
+        # 不同 repeat_index 不算冲突，不能被误杀
+        results_path.write_text(
+            json.dumps({**existing, "repeat_index": 1}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        run_calls.clear()
+        isolate_calls.clear()
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            code = run_experiment.main(
+                ["--sample", "S5", "--group", "B0", "--repeats", "1", "--run-dir", str(target)]
+            )
+
+        lines = results_path.read_text(encoding="utf-8").splitlines()
+
+        check("不同 repeat_index 不误杀（exit 0）", code == 0, code)
+        check("不同 repeat_index 正常跑 1 个任务", len(run_calls) == 1, len(run_calls))
+        check("不同 repeat_index 追加成 2 行", len(lines) == 2, len(lines))
+
+        # 结果文件损坏时 fail-closed，同样不发请求
+        bad_dir = Path(run_dir) / "dup_guard_bad"
+        bad_dir.mkdir(parents=True, exist_ok=True)
+        bad_results = bad_dir / "results.jsonl"
+        bad_results.write_text("{这不是 JSON\n", encoding="utf-8")
+        bad_bytes = bad_results.read_bytes()
+
+        run_calls.clear()
+        isolate_calls.clear()
+        chat_calls.clear()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            code = run_experiment.main(
+                ["--sample", "S5", "--group", "B0", "--run-dir", str(bad_dir)]
+            )
+
+        check("结果文件损坏时拒绝运行（exit 4）", code == 4, code)
+        check(
+            "结果文件损坏时 0 请求、文件不变",
+            run_calls == [] and isolate_calls == [] and chat_calls == [] and bad_results.read_bytes() == bad_bytes,
+        )
+    finally:
+        run_experiment.isolate_database = original["isolate"]
+        run_experiment.run_one = original["run_one"]
+        llm_client.chat = original["chat"]
+        seed_fixture.register_project_modules = original["register"]
+        build_prompts.project_api = original["project_api"]
+        build_prompts.activate_sample = original["activate"]
+        build_prompts.collect_inputs = original["collect"]
+        seed_fixture.load_sample = original["load_sample"]
+
+
+def test_frozen_abcd_prompt_hashes(config):
+    """当前 A/B/C/D Prompt 必须与基线 df4b938 的 28 个哈希逐一相同。"""
+
+    samples = seed_fixture.sample_ids(config)
+    mismatches = []
+    compared = 0
+
+    check("冻结基线覆盖 S1–S7", sorted(FROZEN_BASELINE_PROMPT_SHA256) == sorted(samples), sorted(FROZEN_BASELINE_PROMPT_SHA256.keys()))
+
+    for sample_id in samples:
+        built = build_prompts.build_sample_prompts(sample_id, config, reuse=False)
+
+        for group in ("A", "B", "C", "D"):
+            compared += 1
+            expected = FROZEN_BASELINE_PROMPT_SHA256[sample_id][group]
+            actual = built["prompts"][group]["prompt_sha256"]
+
+            if actual != expected:
+                mismatches.append(f"{sample_id}/{group}: {actual} != {expected}")
+
+    check("A/B/C/D 共比较 28 个哈希", compared == 28, compared)
+    check("28 个旧版 Prompt 哈希全部一致", mismatches == [], mismatches)
+
+    frozen_groups = {group for entry in FROZEN_BASELINE_PROMPT_SHA256.values() for group in entry}
+
+    check("冻结基线不含 B0（B0 不属于旧版）", frozen_groups == {"A", "B", "C", "D"}, sorted(frozen_groups))
+
+
 # ---------------------------------------------------------------------------
 # 运行入口
 # ---------------------------------------------------------------------------
@@ -828,7 +1244,8 @@ def _run_all():
         test_cli_repeats_bounds()
         test_cli_group_choices()
         test_positive_int_direct()
-        test_resolve_samples_b0()
+        test_plan_matrix()
+        test_main_dispatch_respects_plan(run_dir)
         test_normalize_sampling()
         test_sampling_in_openai_payload()
         test_sampling_in_ollama_payload()
@@ -853,6 +1270,9 @@ def _run_all():
 
         test_run_one_end_to_end(run_dir, config, api, inputs, baseline)
         test_run_one_failure_and_exception(run_dir, api, inputs)
+        test_raw_outputs_chain(run_dir, api, inputs)
+        test_duplicate_identity_guard(run_dir, config)
+        test_frozen_abcd_prompt_hashes(config)
 
     after = real_db_fingerprint()
 
