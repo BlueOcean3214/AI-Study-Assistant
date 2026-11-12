@@ -1,22 +1,32 @@
 """毕业设计实验脚手架测试：直接运行 python test_graduation_experiments.py。
 
 覆盖第一阶段交付（docs/GRADUATION-EXPERIMENT-DESIGN.md 的 S1–S7 与 A/B/C/D 四组）：
-    T1 config.json 与七个样本结构完整，模拟数据标识为真
-    T2 任务名经 memory_service.normalize_subject() 得到的 subject_key 与 Gold Standard 一致
-    T3 建库隔离：写库后 DATABASE_PATH 落在临时目录，真实 feedback.db 字节与 mtime 不变
-    T4 七个样本各自建独立库，记忆条数与 Gold Standard 一致
-    T5 check_memory 对七个样本逐项核验全部通过（20 条记忆）
-    T6 四组 Prompt 构建成功，槽位核验全过，且 SHA256 可复现
-    T7 全程不调用对话模型与 Embedding（换成抛错桩后仍然全部通过）
+    T1  config.json 与七个样本结构完整，模拟数据标识为真
+    T2  任务名经 memory_service.normalize_subject() 得到的 subject_key 与 Gold Standard 一致
+    T3  建库隔离：写库后 DATABASE_PATH 落在临时目录，真实 feedback.db 字节与 mtime 不变
+    T4  七个样本各自建独立库，记忆条数与 Gold Standard 一致
+    T5  check_memory 对七个样本逐项核验全部通过（20 条记忆，逐条 8 个字段）
+    T6  七个样本各自构建 A/B/C/D 四组 Prompt：槽位矩阵、去记忆等价、SHA256 可复现
+    T7  四组 Prompt 里出现的记忆注入集合 == 真实 active 记忆检索结果
+    T8  全程不调用对话模型与 Embedding（换成抛错桩后仍然全部通过）
+    T9  核验能识别「Gold Standard 之外多一条记忆」
+    T10 核验能识别「多出一条 pending 证据」
+    T11 核验能识别「少一条 Gold Standard 记忆」与「重建失败」
+    T12 seed_fixture --keep 对已存在的库只复用、不重复写入；对不存在的库照常构建
+    T13 逐样本切换时 database.DATABASE_PATH 始终指向当前样本库；复用 S1 不动 S2.db
+    T14 --keep 遇到结构不完整的库必须报错，不得静默写入
 
 隔离：FEEDBACK_DB_PATH 在 import database 之前指向临时目录；脚手架自身还有
 DATABASE_PATH 落在工作目录内的断言，本测试额外核对真实库指纹。
-本测试不需要 Ollama 或任何 API Key。
+本测试不需要 Ollama 或任何 API Key；每个测试自己构建所需的库，可单独调用。
 """
 
+import copy
+import gc
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -62,6 +72,44 @@ def _real_db_fingerprint():
 
 def _config():
     return seed_fixture.load_config()
+
+
+def _db_counts(db_path):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return {
+            table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for table in (
+                "feedbacks",
+                "plans",
+                "learning_memories",
+                "memory_evidence",
+                "memory_pending_evidence",
+            )
+        }
+    finally:
+        conn.close()
+
+
+def _memory_block(user_content):
+    """取出 Prompt 里的长期记忆区块原文（用于「去掉记忆后应逐字相同」的核验）。"""
+
+    start = user_content.index(build_prompts.MEMORY_HEADER)
+    end = user_content.index(build_prompts.MEMORY_USAGE_NOTE, start)
+
+    return user_content[start:end].rstrip("\n")
+
+
+def _memory_entries(user_content):
+    """从 Prompt 文本里取回长期记忆 JSON（即模型实际看到的那一段）。"""
+
+    start = user_content.index(build_prompts.MEMORY_HEADER)
+    body = user_content[start:]
+    marker = "）：\n"
+    json_start = body.index(marker) + len(marker)
+    json_end = body.index("\n\n" + build_prompts.MEMORY_USAGE_NOTE, json_start)
+
+    return json.loads(body[json_start:json_end])
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +197,9 @@ def test_seed_keeps_real_database_untouched():
         f"DATABASE_PATH 未被隔离：{database.DATABASE_PATH}"
     )
 
-    with sqlite3.connect(str(db_path)) as conn:
-        feedback_count = conn.execute("SELECT COUNT(*) FROM feedbacks").fetchone()[0]
-    assert feedback_count == len(
+    assert _db_counts(db_path)["feedbacks"] == len(
         seed_fixture.load_sample("S7", config)["feedbacks"]
-    ), feedback_count
+    )
 
     assert _real_db_fingerprint() == before, "真实 feedback.db 被改动了"
 
@@ -193,62 +239,145 @@ def test_memory_matches_gold_standard():
     config = _config()
     total = 0
     failures = []
+    covered = []
 
     for sample_id in seed_fixture.sample_ids(config):
+        seed_fixture.seed_sample(sample_id, config)
         result = check_memory.check_sample(sample_id, config, reuse=True)
         total += len(result["rows"])
+
         if result["failure_count"]:
-            failures.append((sample_id, result["failure_count"]))
+            failures.append((sample_id, result["failure_count"], result["reasons"]))
+
+        # 每条 Gold Standard 记忆都要逐条比到 8 个字段，而不是只数条数
+        for row in result["rows"]:
+            assert len(row["checks"]) == 8, (sample_id, row["checks"])
+            assert all(check["ok"] for check in row["checks"]), (sample_id, row["checks"])
+            covered.append(row["key"])
+
+        sample = seed_fixture.load_sample(sample_id, config)
+        expected = {
+            (item["memory_type"], item["subject_key"])
+            for item in sample["gold_standard"]["memories"]
+        }
+        assert set(covered[-len(expected):]) == expected, sample_id
 
     assert not failures, failures
     assert total == 20, total
+    assert len(set(covered)) == 20, covered
 
 
 # ---------------------------------------------------------------------------
-# T6 Prompt 构建
+# T6 七个样本的 A/B/C/D Prompt
 # ---------------------------------------------------------------------------
 
 
-def test_prompts_build_and_slots_are_exact():
+def test_prompts_build_for_all_samples():
     config = _config()
-    build = build_prompts.build_sample_prompts("S1", config, reuse=True)
+    api = build_prompts.project_api(config)
+    seen = {}
 
-    assert sorted(build["prompts"]) == ["A", "B", "C", "D"]
+    for sample_id in seed_fixture.sample_ids(config):
+        seed_fixture.seed_sample(sample_id, config)
+        build = build_prompts.build_sample_prompts(sample_id, config, reuse=True)
 
-    failed = [check for check in build["checks"] if not check[1]]
-    assert not failed, failed
+        assert sorted(build["prompts"]) == ["A", "B", "C", "D"], sample_id
+        assert not [check for check in build["checks"] if not check[1]], (
+            sample_id,
+            [check for check in build["checks"] if not check[1]],
+        )
 
-    contents = build["contents"]
-    assert build_prompts.MEMORY_HEADER not in contents["A"]
-    assert build_prompts.MEMORY_HEADER not in contents["B"]
-    assert build_prompts.MEMORY_HEADER in contents["C"]
-    assert build_prompts.MEMORY_HEADER in contents["D"]
+        contents = build["contents"]
+        inputs = build["inputs"]
 
-    assert build_prompts.SHORT_TERM_HEADER not in contents["A"]
-    assert build_prompts.SHORT_TERM_HEADER in contents["B"]
+        # 槽位矩阵：A 全无；B 有反馈+短期上下文；C 有记忆；D 三者都有
+        assert inputs["memory_count"] >= 1, (sample_id, inputs)
+        assert inputs["feedback_count"] >= 1, (sample_id, inputs)
 
-    for group, prompt in build["prompts"].items():
-        assert prompt["chars"] == len(prompt["user"]), group
-        assert len(prompt["prompt_sha256"]) == 64, group
-        assert "用户请求：" in prompt["user"], group
+        # A/C 用空反馈（真实系统在无反馈时的形状），B/D 带真实反馈 JSON
+        for group in ("A", "C"):
+            assert "历史反馈：\n[]" in contents[group], (sample_id, group)
+        for group in ("B", "D"):
+            assert "历史反馈：\n[\n" in contents[group], (sample_id, group)
 
-    again = build_prompts.build_sample_prompts("S1", config, reuse=True)
-    for group in ("A", "B", "C", "D"):
-        assert (
-            build["prompts"][group]["prompt_sha256"]
-            == again["prompts"][group]["prompt_sha256"]
-        ), f"{group} 的 Prompt 不可复现"
+        assert build_prompts.SHORT_TERM_HEADER not in contents["A"], sample_id
+        assert build_prompts.MEMORY_HEADER not in contents["A"], sample_id
+        assert build_prompts.SHORT_TERM_HEADER in contents["B"], sample_id
+        assert build_prompts.MEMORY_HEADER not in contents["B"], sample_id
+        assert build_prompts.SHORT_TERM_HEADER not in contents["C"], sample_id
+        assert build_prompts.MEMORY_HEADER in contents["C"], sample_id
+        assert build_prompts.SHORT_TERM_HEADER in contents["D"], sample_id
+        assert build_prompts.MEMORY_HEADER in contents["D"], sample_id
+
+        # C 去掉记忆 == A；D 去掉记忆 == B（逐字）
+        block = _memory_block(contents["C"])
+        assert build_prompts.strip_memory(contents["C"], block) == contents["A"], sample_id
+        assert build_prompts.strip_memory(contents["D"], block) == contents["B"], sample_id
+
+        # 每组 SHA256 必须与内容一致，且第二次构建完全相同
+        again = build_prompts.build_sample_prompts(sample_id, config, reuse=True)
+
+        for group in ("A", "B", "C", "D"):
+            prompt = build["prompts"][group]
+            recomputed = build_prompts.prompt_sha256(prompt["system"], prompt["user"])
+            assert prompt["chars"] == len(prompt["user"]), (sample_id, group)
+            assert prompt["prompt_sha256"] == recomputed, (sample_id, group)
+            assert again["prompts"][group]["prompt_sha256"] == recomputed, (
+                sample_id,
+                group,
+            )
+            assert "用户请求：" in prompt["user"], (sample_id, group)
+
+        seen[sample_id] = build["prompts"]["A"]["prompt_sha256"]
+
+    assert len(set(seen.values())) == 7, seen
 
 
 # ---------------------------------------------------------------------------
-# T7 无模型调用
+# T7 注入集合 == 真实 active 检索结果
+# ---------------------------------------------------------------------------
+
+
+def test_memory_injection_matches_active_retrieval():
+    config = _config()
+    api = build_prompts.project_api(config)
+    moment = seed_fixture.ref_datetime(config)
+
+    for sample_id in seed_fixture.sample_ids(config):
+        seeded = seed_fixture.seed_sample(sample_id, config)
+        db_path = Path(seeded["db_path"])
+
+        with build_prompts.fixed_clock(api["database"], moment):
+            retrieved = api["agent_tools"].get_learning_memory(
+                limit=config["memory_limit"]
+            )
+
+        assert retrieved["ok"] is True, (sample_id, retrieved)
+        expected = {(item["type"], item["subject"]) for item in retrieved["memories"]}
+
+        build = build_prompts.build_sample_prompts(sample_id, config, reuse=True)
+        entries = _memory_entries(build["contents"]["C"])
+        actual = {(item["type"], item["subject"]) for item in entries}
+
+        assert actual == expected, (sample_id, actual, expected)
+        assert len(entries) == build["inputs"]["memory_count"], sample_id
+        assert build["inputs"]["memory_count"] == len(expected), sample_id
+
+        # 注入的只能是 active 记忆，不出现 weakened/resolved 文案
+        for item in retrieved["memories"]:
+            assert item["type"] in ("difficulty", "task_performance", "task_topic", "time_pattern"), item
+
+        injected_from_db = build_prompts.injected_labels(db_path, config["memory_limit"])
+        assert actual == injected_from_db, (sample_id, actual, injected_from_db)
+
+
+# ---------------------------------------------------------------------------
+# T8 无模型调用
 # ---------------------------------------------------------------------------
 
 
 def test_no_model_or_embedding_call():
     config = _config()
-    api = build_prompts.project_api(config)
-
     calls = []
 
     def _boom(name):
@@ -262,9 +391,9 @@ def test_no_model_or_embedding_call():
     import embedding_service
 
     saved = {
-        "ai_service.call_ollama": ai_service.call_ollama,
-        "embedding_service.get_embedding": embedding_service.get_embedding,
-        "embedding_service.get_embeddings": embedding_service.get_embeddings,
+        "call_ollama": ai_service.call_ollama,
+        "get_embedding": embedding_service.get_embedding,
+        "get_embeddings": embedding_service.get_embeddings,
     }
 
     try:
@@ -272,17 +401,169 @@ def test_no_model_or_embedding_call():
         embedding_service.get_embedding = _boom("embedding_service.get_embedding")
         embedding_service.get_embeddings = _boom("embedding_service.get_embeddings")
 
-        build_prompts.activate_sample("S1", config, reuse=True)
-        build = build_prompts.build_sample_prompts("S1", config, reuse=True)
+        for sample_id in seed_fixture.sample_ids(config):
+            seed_fixture.seed_sample(sample_id, config)
+            build = build_prompts.build_sample_prompts(sample_id, config, reuse=True)
+            assert not [check for check in build["checks"] if not check[1]], sample_id
+            assert build["inputs"]["knowledge_count"] == 0, sample_id
+            assert build["inputs"]["knowledge_search_failed"] is False, sample_id
 
         assert not calls, calls
-        assert not [check for check in build["checks"] if not check[1]]
-        assert build["inputs"]["knowledge_count"] == 0, build["inputs"]
-        assert build["inputs"]["knowledge_search_failed"] is False
     finally:
-        ai_service.call_ollama = saved["ai_service.call_ollama"]
-        embedding_service.get_embedding = saved["embedding_service.get_embedding"]
-        embedding_service.get_embeddings = saved["embedding_service.get_embeddings"]
+        ai_service.call_ollama = saved["call_ollama"]
+        embedding_service.get_embedding = saved["get_embedding"]
+        embedding_service.get_embeddings = saved["get_embeddings"]
+
+
+# ---------------------------------------------------------------------------
+# T9 / T10 / T11 核验必须会失败（变异副本，不改数据库）
+# ---------------------------------------------------------------------------
+
+
+def _verify_variant(sample_id, mutate):
+    config = _config()
+    seeded = seed_fixture.seed_sample(sample_id, config)
+    sample = seed_fixture.load_sample(sample_id, config)
+    dump = copy.deepcopy(seeded["memories"])
+    rebuild = {"ok": True}
+
+    mutate(dump, sample)
+
+    return check_memory.verify_sample(
+        sample, dump, Path(seeded["db_path"]), config, rebuild
+    )
+
+
+def test_check_detects_unexpected_memory():
+    def mutate(dump, sample):
+        dump["memories"].append(
+            {
+                "memory_type": "task_topic",
+                "subject_key": "gold-standard-extra",
+                "subject_label": "Gold Standard 之外的任务",
+                "content": "人为插入的多余记忆",
+                "status": "active",
+                "strength": 0.5,
+                "value": {},
+                "evidence_relations": {"supports": 1, "contradicts": 0},
+            }
+        )
+
+    result = _verify_variant("S7", mutate)
+
+    assert result["failure_count"] > 0, result
+    assert result["unexpected"], result
+    assert any("多出 Gold Standard 之外的记忆" in reason for reason in result["reasons"]), (
+        result["reasons"]
+    )
+
+
+def test_check_detects_pending_evidence():
+    def mutate(dump, sample):
+        dump["pendings"] = 1
+
+    result = _verify_variant("S7", mutate)
+
+    assert result["failure_count"] > 0, result
+    assert any("待定证据" in reason for reason in result["reasons"]), result["reasons"]
+
+
+def test_check_detects_missing_memory_and_failed_rebuild():
+    def drop_one(dump, sample):
+        dump["memories"] = dump["memories"][:-1]
+
+    result = _verify_variant("S5", drop_one)
+    assert result["failure_count"] > 0, result
+    assert any("缺少记忆" in reason for reason in result["reasons"]), result["reasons"]
+
+    config = _config()
+    seeded = seed_fixture.seed_sample("S7", config)
+    sample = seed_fixture.load_sample("S7", config)
+    failed = check_memory.verify_sample(
+        sample,
+        copy.deepcopy(seeded["memories"]),
+        Path(seeded["db_path"]),
+        config,
+        {"ok": False},
+    )
+    assert failed["failure_count"] > 0, failed
+    assert any("重建未成功" in reason for reason in failed["reasons"]), failed["reasons"]
+
+
+# ---------------------------------------------------------------------------
+# T12 / T13 / T14 seed_fixture --keep 语义
+# ---------------------------------------------------------------------------
+
+
+def test_keep_reuses_existing_database_without_writing():
+    config = _config()
+
+    first = seed_fixture.seed_sample("S1", config)
+    before = _db_counts(Path(first["db_path"]))
+
+    second = seed_fixture.seed_sample("S1", config, keep=True)
+    third = seed_fixture.seed_sample("S1", config, keep=True)
+
+    assert second["reused"] is True and third["reused"] is True, (second, third)
+    assert Path(second["db_path"]) == Path(first["db_path"])
+
+    after = _db_counts(Path(first["db_path"]))
+    assert before == after, (before, after)
+
+    # 库不存在时 --keep 应照常创建
+    db_path = Path(first["db_path"])
+    gc.collect()  # 产品里 `with sqlite3.connect(...)` 不关闭连接，Windows 上先回收句柄
+    db_path.unlink()
+    rebuilt = seed_fixture.seed_sample("S1", config, keep=True)
+
+    assert rebuilt["reused"] is False, rebuilt
+    assert rebuilt["rebuild"]["ok"] is True, rebuilt
+    assert _db_counts(db_path) == before, (before, _db_counts(db_path))
+
+
+def test_database_path_switch_between_samples():
+    config = _config()
+    database = seed_fixture.project_modules(config)[0]
+
+    s1 = seed_fixture.seed_sample("S1", config)
+    s2 = seed_fixture.seed_sample("S2", config)
+
+    assert Path(database.DATABASE_PATH) == Path(s2["db_path"]), database.DATABASE_PATH
+
+    s2_before = _db_counts(Path(s2["db_path"]))
+    s2_bytes_before = Path(s2["db_path"]).read_bytes()
+
+    reused = seed_fixture.seed_sample("S1", config, keep=True)
+
+    assert reused["reused"] is True
+    assert Path(database.DATABASE_PATH) == Path(s1["db_path"]), database.DATABASE_PATH
+    assert _db_counts(Path(s2["db_path"])) == s2_before, "复用 S1 时改动了 S2.db"
+    assert Path(s2["db_path"]).read_bytes() == s2_bytes_before, "复用 S1 时改动了 S2.db 字节"
+
+
+def test_keep_rejects_incomplete_database():
+    config = _config()
+    work_dir = seed_fixture.workspace_dir(config)
+
+    broken = work_dir / "_broken_for_test.db"
+    if broken.exists():
+        broken.unlink()
+
+    conn = sqlite3.connect(str(broken))
+    try:
+        conn.execute("CREATE TABLE feedbacks (id INTEGER PRIMARY KEY)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    try:
+        seed_fixture.inspect_sample_db(broken, seed_fixture.load_sample("S1", config))
+    except RuntimeError as exc:
+        assert "结构不完整" in str(exc), exc
+    else:
+        raise AssertionError("不完整的库必须报错，不得静默通过")
+    finally:
+        shutil.rmtree(broken, ignore_errors=True) if broken.is_dir() else broken.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +572,7 @@ def test_no_model_or_embedding_call():
 
 
 def _run_all():
-    seed_fixture.seed_all(_config())
+    before = _real_db_fingerprint()
 
     tests = [
         test_config_and_samples,
@@ -299,13 +580,22 @@ def _run_all():
         test_seed_keeps_real_database_untouched,
         test_each_sample_builds_its_own_database,
         test_memory_matches_gold_standard,
-        test_prompts_build_and_slots_are_exact,
+        test_prompts_build_for_all_samples,
+        test_memory_injection_matches_active_retrieval,
         test_no_model_or_embedding_call,
+        test_check_detects_unexpected_memory,
+        test_check_detects_pending_evidence,
+        test_check_detects_missing_memory_and_failed_rebuild,
+        test_keep_reuses_existing_database_without_writing,
+        test_database_path_switch_between_samples,
+        test_keep_rejects_incomplete_database,
     ]
 
     for test in tests:
         print(f"\n=== {test.__name__} ===")
         test()
+
+    assert _real_db_fingerprint() == before, "真实 feedback.db 在测试过程中被改动"
 
     print(f"\nALL {len(tests)} TESTS COMPLETED")
 

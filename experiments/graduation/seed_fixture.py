@@ -15,7 +15,7 @@
 
     python experiments/graduation/seed_fixture.py            # 建 7 个库并重建
     python experiments/graduation/seed_fixture.py --sample S3
-    python experiments/graduation/seed_fixture.py --keep     # 保留已存在的库（不删除重建）
+    python experiments/graduation/seed_fixture.py --keep     # 复用已存在的库（只复用、不再写入）
 """
 
 import argparse
@@ -172,26 +172,133 @@ def _plan_payload(plan):
     }
 
 
+REQUIRED_TABLES = (
+    "feedbacks",
+    "plans",
+    "learning_memories",
+    "memory_evidence",
+    "memory_events",
+    "memory_pending_evidence",
+)
+
+
+def _db_counts(db_path):
+    """读出现有库的表名与关键行数；文件损坏或不是 SQLite 时抛 RuntimeError（fail-closed）。"""
+
+    try:
+        conn = sqlite3.connect(str(db_path))
+
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
+            missing = [name for name in REQUIRED_TABLES if name not in tables]
+
+            if missing:
+                raise RuntimeError(
+                    f"数据库结构不完整：{db_path.name} 缺少表 {missing}"
+                )
+
+            counts = {
+                name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+                for name in REQUIRED_TABLES
+            }
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(f"{db_path.name} 不是可用的样本库：{exc}") from exc
+
+    return counts
+
+
+def inspect_sample_db(db_path, sample):
+    """校验已有库是不是该样本的**完整**库；不完整直接报错，绝不静默写入别的库。"""
+
+    db_path = Path(db_path)
+
+    if not db_path.is_file():
+        raise FileNotFoundError(f"样本库不存在：{db_path}")
+
+    if db_path.stat().st_size == 0:
+        raise RuntimeError(f"样本库为空文件：{db_path}")
+
+    counts = _db_counts(db_path)
+    expected_feedbacks = len(sample["feedbacks"])
+    expected_plans = 1 if sample.get("plan") else 0
+    expected_memories = len(sample["gold_standard"]["memories"])
+
+    problems = []
+
+    if counts["feedbacks"] != expected_feedbacks:
+        problems.append(
+            f"反馈数 {counts['feedbacks']}，样本要求 {expected_feedbacks}"
+        )
+
+    if counts["plans"] != expected_plans:
+        problems.append(f"计划数 {counts['plans']}，样本要求 {expected_plans}")
+
+    if counts["learning_memories"] != expected_memories:
+        problems.append(
+            f"记忆数 {counts['learning_memories']}，Gold Standard 要求 {expected_memories}"
+        )
+
+    if counts["memory_evidence"] == 0:
+        problems.append("没有任何记忆证据行（未执行重建？）")
+
+    if problems:
+        raise RuntimeError(
+            f"{Path(db_path).name} 已有但结构不完整（{'；'.join(problems)}）；"
+            "请删除该库后重跑，或去掉 --keep"
+        )
+
+    return counts
+
+
 def seed_sample(sample_id, config=None, rebuild=True, keep=False):
-    """为单个样本建库并（默认）重建记忆，返回构建结果字典。"""
+    """为单个样本建库并（默认）重建记忆，返回构建结果字典。
+
+    --keep 的语义是「只复用、不写入」：库已存在且完整时直接返回，不插入计划/反馈，
+    也不重复重建；库不存在时照常创建。无论哪条分支，动手前都先把
+    `database.DATABASE_PATH` 指向本样本的库，避免读到上一次留下的别的样本库。
+    """
 
     config = config or load_config()
     sample = load_sample(sample_id, config)
     database, memory_service = project_modules(config)
     ref = ref_datetime(config)
 
-    db_path = workspace_dir(config) / f"{sample_id}.db"
+    work_dir = workspace_dir(config).resolve()
+    db_path = work_dir / f"{sample_id}.db"
+
+    if db_path.resolve().parent != work_dir:
+        raise RuntimeError(f"样本库路径越界，拒绝继续：{db_path}")
+
+    # 任何数据库操作之前先绑定路径（keep 分支同样需要）
+    database.DATABASE_PATH = db_path
 
     if keep and db_path.exists():
-        pass
-    else:
-        if db_path.exists():
-            # 产品里的 `with sqlite3.connect(...)` 只提交事务、不关闭连接；
-            # 同一进程重复建库前先让 CPython 回收这些句柄，否则 Windows 上 unlink 会报 WinError 32。
-            gc.collect()
-            db_path.unlink()
-        database.DATABASE_PATH = db_path
-        database.init_db()
+        counts = inspect_sample_db(db_path, sample)
+        return {
+            "sample_id": sample_id,
+            "db_path": str(db_path),
+            "feedback_ids": [],
+            "plan_id": None,
+            "rebuild": None,
+            "reused": True,
+            "counts": counts,
+            "memories": dump_memories(db_path),
+        }
+
+    if db_path.exists():
+        # 产品里的 `with sqlite3.connect(...)` 只提交事务、不关闭连接；
+        # 同一进程重复建库前先让 CPython 回收这些句柄，否则 Windows 上 unlink 会报 WinError 32。
+        gc.collect()
+        db_path.unlink()
+
+    database.init_db()
 
     plan_id = None
     plan = sample.get("plan")
@@ -239,6 +346,7 @@ def seed_sample(sample_id, config=None, rebuild=True, keep=False):
         "feedback_ids": feedback_ids,
         "plan_id": plan_id,
         "rebuild": rebuild_result,
+        "reused": False,
         "memories": dump_memories(db_path),
     }
 
@@ -305,6 +413,16 @@ def main(argv=None):
     for sample_id in targets:
         result = seed_sample(sample_id, config, keep=args.keep)
         rebuild = result["rebuild"] or {}
+
+        if result.get("reused"):
+            counts = result["counts"]
+            print(
+                f"{sample_id}: db={result['db_path']} reused=True "
+                f"feedbacks={counts['feedbacks']} memories={counts['learning_memories']} "
+                f"evidences={counts['memory_evidence']}"
+            )
+            continue
+
         print(
             f"{sample_id}: db={result['db_path']} ok={rebuild.get('ok')} "
             f"memories={rebuild.get('memories')} evidences={rebuild.get('evidences')} "

@@ -42,9 +42,14 @@ $env:PYTHONIOENCODING='utf-8'
 ```
 
 `--reuse` 表示复用已建好的库（不重跑 rebuild）；不加则每次重新建库并重建记忆。
+`seed_fixture.py --keep` 的语义是**只复用、不写入**：库已存在且结构完整时直接返回，不插入计划/反馈、
+也不重复重建；库不存在时照常创建；库存在但结构不完整（缺表、反馈/计划/记忆条数与样本不符、
+没有证据行）直接报错，不会静默写到别的库。
+
 三个脚本都支持 `--sample S3` 只跑单个样本，`--config <path>` 换配置文件。
 
-自测：`.\.venv\Scripts\python.exe test_graduation_experiments.py`
+自测：`.\.venv\Scripts\python.exe test_graduation_experiments.py`（14 项，覆盖七个样本的四组构建、
+核验的负向用例与 `--keep` 语义）。
 
 ## 产物位置
 
@@ -122,6 +127,15 @@ S3、S6 的冲突/改善类记忆（resolved / weakened）因此不出现在任�
 
 `check_memory.py` 对每条记忆逐项核对 **status / strength / supports / contradicts / unit / 前缀 / injected / content**，
 并单独核对 `must_not_exist`（不该出现的记忆确实没出现）。当前 7 个样本共 20 条记忆，全部通过。
+
+核验是 **fail-closed** 的，任何一条不一致都计入 `failure_count` 并让脚本以非零码退出：
+
+- 记忆集合必须与 Gold Standard **完全一致**——少一条、多一条都算失败（多余的在报告里单独列表）；
+- 注入集合必须与 Gold Standard 的预期注入集合一致（双向差集都查）；
+- 同一 `(memory_type, subject_key)` 出现重复行算失败；
+- `pendings != 0`（还有未处理证据）算失败；
+- 重建本身 `rebuild.ok != True` 算失败，不把部分结果当通过；
+- 报告逐样本列「失败原因」，不留"存在不一致"这种模糊结论。
 
 单位口径来自 `memory_service._stable_unit()`：difficulty 取 `supports`，
 task_performance 与 time_pattern 取 `fields["samples"]`，task_topic 取 `fields["appearances"]`。

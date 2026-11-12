@@ -7,7 +7,8 @@
 
     status / strength / supports / contradicts / unit / 前缀 / injected / content
 
-另外检查「不应生成的记忆」确实不存在，以及每个库没有多出来的记忆。
+另外检查：记忆集合与 Gold Standard 完全一致（多一条也算失败）、注入集合一致、
+「不应生成的记忆」确实不存在、待定证据为 0、重建本身成功（ok=True）。
 
 命令行：
 
@@ -99,6 +100,8 @@ def compare_memory(expected, memory, injected, memory_service):
 
 
 def check_sample(sample_id, config, reuse=False):
+    """构建/复用样本库后核验；任何一条不一致（含多余记忆、pending、重建失败）都计入失败。"""
+
     sample = seed_fixture.load_sample(sample_id, config)
 
     if reuse:
@@ -113,20 +116,45 @@ def check_sample(sample_id, config, reuse=False):
         dump = seeded["memories"]
         rebuild = seeded["rebuild"] or {}
 
+    return verify_sample(sample, dump, db_path, config, rebuild)
+
+
+def verify_sample(sample, dump, db_path, config, rebuild):
+    """对一份已读出的 dump 做核验（数据库只用于计算注入集合）。
+
+    把读库与核验拆开，测试才能在不改数据库的前提下注入「多一条记忆 / 多一条 pending」
+    这类变异副本，验证核验本身真的会失败。
+    """
+
+    sample_id = sample["sample_id"]
+
     _, memory_service = seed_fixture.project_modules(config)
 
     limit = int(config["memory_limit"])
     injected = injected_keys(db_path, limit)
 
-    by_key = {
-        (memory["memory_type"], memory["subject_key"]): memory
-        for memory in dump["memories"]
-    }
+    memories = dump["memories"]
+    by_key = {(memory["memory_type"], memory["subject_key"]): memory for memory in memories}
 
     rows = []
     failures = 0
+    reasons = []
 
-    for expected in sample["gold_standard"]["memories"]:
+    # 0）重建本身没成功时，后面读到的只是部分结果，整份核验不得算通过
+    if rebuild.get("ok") is not True:
+        failures += 1
+        reasons.append(f"记忆重建未成功：{rebuild!r}")
+
+    # 1）同一 (type, subject_key) 出现多行，说明重建留下了重复记忆
+    duplicates = len(memories) - len(by_key)
+    if duplicates:
+        failures += duplicates
+        reasons.append(f"同一 (memory_type, subject_key) 出现重复记忆 {duplicates} 行")
+
+    # 2）逐条比对 Gold Standard
+    expected_items = sample["gold_standard"]["memories"]
+
+    for expected in expected_items:
         key = (expected["memory_type"], expected["subject_key"])
         memory = by_key.get(key)
 
@@ -138,20 +166,49 @@ def check_sample(sample_id, config, reuse=False):
                 "checks": [_check("exists", True, False, False)],
             })
             failures += 1
+            reasons.append(f"缺少记忆：{key[0]}/{key[1]}")
             continue
 
         checks = compare_memory(expected, memory, key in injected, memory_service)
-        failures += sum(0 if item["ok"] else 1 for item in checks)
+        failed = [check for check in checks if not check["ok"]]
+        failures += len(failed)
+
+        for check in failed:
+            reasons.append(
+                f"{key[0]}/{key[1]} 的 {check['field']} 期望 {check['expected']!r} "
+                f"实得 {check['actual']!r}"
+            )
+
         rows.append({"key": key, "expected": expected, "memory": memory, "checks": checks})
 
-    # 多余的记忆 = 设计里没有的 (type, key)
-    expected_keys = {
-        (item["memory_type"], item["subject_key"])
-        for item in sample["gold_standard"]["memories"]
-    }
-    unexpected = [key for key in by_key if key not in expected_keys]
+    # 3）记忆集合必须与 Gold Standard 完全一致：多一条也算失败
+    expected_keys = {(item["memory_type"], item["subject_key"]) for item in expected_items}
+    unexpected = sorted(key for key in by_key if key not in expected_keys)
 
-    # 不应生成的记忆
+    for key in unexpected:
+        memory = by_key[key]
+        failures += 1
+        reasons.append(
+            f"多出 Gold Standard 之外的记忆：{key[0]}/{key[1]}"
+            f"（content={memory['content']!r}, strength={memory['strength']}）"
+        )
+
+    # 4）注入集合必须与 Gold Standard 的预期注入集合一致
+    expected_injected = {
+        (item["memory_type"], item["subject_key"]) for item in expected_items if item["injected"]
+    }
+    injected_only_actual = sorted(injected - expected_injected)
+    injected_only_expected = sorted(expected_injected - injected)
+
+    for key in injected_only_actual:
+        failures += 1
+        reasons.append(f"实际注入了 Gold Standard 未预期注入的记忆：{key[0]}/{key[1]}")
+
+    for key in injected_only_expected:
+        failures += 1
+        reasons.append(f"Gold Standard 预期注入但实际未注入：{key[0]}/{key[1]}")
+
+    # 5）不应生成的记忆
     missing_checked = []
 
     for item in sample["gold_standard"].get("must_not_exist", []):
@@ -164,8 +221,17 @@ def check_sample(sample_id, config, reuse=False):
             found = [key for key in by_key if key == (mtype, mkey)]
 
         ok = not found
-        failures += 0 if ok else 1
+
+        if not ok:
+            failures += 1
+            reasons.append(f"生成了不应存在的记忆：{mtype}/{mkey} → 实际 {found}")
+
         missing_checked.append({"item": item, "found": found, "ok": ok})
+
+    # 6）待定证据必须清空
+    if dump["pendings"] != 0:
+        failures += 1
+        reasons.append(f"存在未处理的待定证据 {dump['pendings']} 条")
 
     return {
         "sample_id": sample_id,
@@ -173,10 +239,20 @@ def check_sample(sample_id, config, reuse=False):
         "rebuild": rebuild,
         "rows": rows,
         "unexpected": unexpected,
+        "unexpected_detail": [
+            {
+                "key": key,
+                "status": by_key[key]["status"],
+                "strength": by_key[key]["strength"],
+                "content": by_key[key]["content"],
+            }
+            for key in unexpected
+        ],
         "must_not_exist": missing_checked,
         "injected": sorted(injected),
         "pendings": dump["pendings"],
         "failure_count": failures,
+        "reasons": reasons,
     }
 
 
@@ -199,17 +275,18 @@ def render_report(results, config):
 
     lines.append("## 总览")
     lines.append("")
-    lines.append("| 样本 | 记忆条数 | 注入条数 | 核验失败项 | 结果 |")
-    lines.append("| --- | --- | --- | --- | --- |")
+    lines.append("| 样本 | 记忆条数 | 注入条数 | 多余记忆 | 核验失败项 | 结果 |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
     for item in results:
         verdict = "通过" if item["failure_count"] == 0 else "失败"
         lines.append(
             f"| {item['sample_id']} | {len(item['rows'])} | {len(item['injected'])} | "
-            f"{item['failure_count']} | {verdict} |"
+            f"{len(item['unexpected'])} | {item['failure_count']} | {verdict} |"
         )
     lines.append("")
     lines.append(
-        f"合计 {total_memories} 条记忆，失败项 {total_failures} 项；"
+        f"合计 {total_memories} 条记忆，失败项 {total_failures} 项，"
+        f"多余记忆 {sum(len(item['unexpected']) for item in results)} 条；"
         f"结论：{'全部通过' if total_failures == 0 else '存在不一致'}"
     )
     lines.append("")
@@ -219,7 +296,18 @@ def render_report(results, config):
         lines.append("")
         lines.append(f"- 数据库：`{item['db_path']}`")
         lines.append(f"- 待定证据（pendings）：{item['pendings']}")
+        lines.append(f"- 核验失败项：{item['failure_count']}")
         lines.append("")
+
+        if item["failure_count"] == 0:
+            lines.append("**失败原因**：无，记忆集合与 Gold Standard 完全一致。")
+        else:
+            lines.append("**失败原因**")
+            lines.append("")
+            for reason in item["reasons"]:
+                lines.append(f"- {reason}")
+        lines.append("")
+
         lines.append("| 类型 | subject_key | 状态 | strength | sup | con | unit | 前缀 | 注入 | 结论 |")
         lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 
@@ -253,9 +341,19 @@ def render_report(results, config):
         lines.append("")
 
         if item["unexpected"]:
-            lines.append("**多余记忆（设计里没有）**：" + "，".join(
-                f"{mtype}/{mkey}" for mtype, mkey in item["unexpected"]
-            ))
+            lines.append("**多余记忆（Gold Standard 之外，每条计 1 项失败）**")
+            lines.append("")
+            lines.append("| 类型 | subject_key | 状态 | strength | content |")
+            lines.append("| --- | --- | --- | --- | --- |")
+            for entry in item["unexpected_detail"]:
+                mtype, mkey = entry["key"]
+                lines.append(
+                    f"| {mtype} | {mkey} | {entry['status']} | {entry['strength']} | "
+                    f"{entry['content']} |"
+                )
+            lines.append("")
+        else:
+            lines.append("**多余记忆**：无。")
             lines.append("")
 
         lines.append("**不应生成的记忆**")
