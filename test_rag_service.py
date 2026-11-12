@@ -21,7 +21,12 @@ from pathlib import Path
 import embedding_service
 import main
 import rag_service
+import stub_embedding
 import vector_cache
+
+# 测试夹具：确定性 Embedding 打桩——不连 Ollama、不连云端 API，也不去取权重 digest。
+# 打桩只覆盖「通路/缓存/降级」，语义召回质量必须走真实 Embedding 后端（见文末说明）。
+stub_embedding.install()
 
 # 测试隔离：向量缓存写到临时目录，避免污染真实 .rag_cache/
 CACHE_FIXTURE = Path(__file__).resolve().parent / "_test_cache_rag"
@@ -39,7 +44,7 @@ def check(name, condition, detail=""):
 try:
     probe_vector = embedding_service.get_embedding("前置检查")
 except embedding_service.EmbeddingError as error:
-    raise SystemExit(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+    raise SystemExit(f"Embedding 通路不可用（打桩失效）：{error}")
 
 # 1. embedding_service 契约
 check("get_embedding 返回向量", len(probe_vector) == 1024, f"dim={len(probe_vector)}")
@@ -66,9 +71,10 @@ context = rag_service.retrieve_context("定积分怎么学")
 check("中文无空格查询可召回", len(context) > 0, f"len={len(context)}")
 check("召回内容包含关键词", "定积分" in context)
 
-# 2b. 语义能力：这句与知识库没有相同的关键词片段，关键词检索会漏掉，embedding 能召回
-semantic_chunks = rag_service.retrieve_chunks("数学怎么学")
-check("语义相关查询可召回", len(semantic_chunks) > 0, f"n={len(semantic_chunks)}")
+# 2b. 语义能力用例（"数学怎么学" 与知识库没有相同的关键词片段，只能靠真实 Embedding
+# 的语义能力召回）已迁移到 test_embedding_api_integration.py：本文件用的是词面打桩向量，
+# 在打桩环境下断言语义召回等于自欺，必须在真实 Embedding 后端上验证。
+print("[SKIP] 语义相关查询可召回（需真实 Embedding 后端，见 test_real_api_smoke.py）")
 
 # 3. retrieve_chunks 返回契约
 chunks = rag_service.retrieve_chunks("定积分怎么学")
@@ -229,15 +235,22 @@ finally:
 check("测试夹具已清理", not fixture_root.exists())
 
 # 10. embedding 不可用时优雅降级：/ask 仍要能回答，只是没有资料
-original_embed_url = embedding_service.OLLAMA_EMBED_URL
-embedding_service.OLLAMA_EMBED_URL = "http://127.0.0.1:1/api/embed"
+def failing_embedding(*args, **kwargs):
+    raise embedding_service.EmbeddingError("测试注入：Embedding 服务不可用")
+
+
+original_get_embedding = rag_service.get_embedding
+original_get_embeddings = rag_service.get_embeddings
+rag_service.get_embedding = failing_embedding
+rag_service.get_embeddings = failing_embedding
 captured.clear()
 main.call_ollama = fake_call_ollama
 try:
     check("embedding 不可用时检索返回空列表", rag_service.retrieve_chunks("定积分怎么学") == [])
     degraded_response = main.ask("定积分怎么学")
 finally:
-    embedding_service.OLLAMA_EMBED_URL = original_embed_url
+    rag_service.get_embedding = original_get_embedding
+    rag_service.get_embeddings = original_get_embeddings
     main.call_ollama = original_call_ollama
 
 check("降级时 /ask 仍返回答案", degraded_response["answer"] == "stub answer")

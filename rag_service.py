@@ -1,4 +1,8 @@
-"""Mini-RAG v2.1（Embedding RAG + 向量持久化）：切片后用 bge-m3 向量检索。
+"""Mini-RAG v2.1（Embedding RAG + 向量持久化）：切片后用 Embedding 模型向量检索。
+
+Embedding 后端由 embedding_service 读取配置决定（默认云端 OpenAI 兼容 API，
+`EMBEDDING_PROVIDER=ollama` 时为本地 bge-m3）；文档切片与查询向量始终同一模型，
+缓存身份含 provider:model@dimensions，换模型自动判废重建。
 
 流程：
 knowledge/**/*.txt

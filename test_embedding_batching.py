@@ -29,7 +29,11 @@ from pathlib import Path
 
 import embedding_service
 import rag_service
+import stub_embedding
 import vector_cache
+
+# 测试夹具：确定性 Embedding 打桩——不连 Ollama / 云端 API，也不需要 API Key
+stub_embedding.install()
 
 # 测试隔离：向量缓存写到临时目录，避免污染真实 .rag_cache/
 CACHE_FIXTURE = Path(__file__).resolve().parent / "_test_cache_batching"
@@ -102,7 +106,7 @@ def fake_embedding(text):
 try:
     embedding_service.get_embedding("前置检查")
 except embedding_service.EmbeddingError as error:
-    raise SystemExit(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+    raise SystemExit(f"Embedding 通路不可用（打桩失效）：{error}")
 
 # 1. 分批工具本身
 check(

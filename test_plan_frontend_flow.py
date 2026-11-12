@@ -30,6 +30,11 @@ from pathlib import Path
 
 import embedding_service
 import requests
+import real_backend
+import stub_embedding
+
+# 测试夹具：确定性 Embedding 打桩——不连 Ollama / 云端 API，也不需要 API Key
+stub_embedding.install()
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -345,10 +350,13 @@ try:
         # 3. 真实模型端到端：POST /plan/draft（Agent 生成草案，不保存）
         # ==========================
 
+        # 真实模型需要可用的真实对话后端（迁移后不再隐式回退本地 Ollama）
+        real_backend.require_chat("真实模型端到端 /plan/draft")
+
         try:
             embedding_service.get_embedding("前置检查")
         except embedding_service.EmbeddingError as error:
-            raise SystemExit(f"embedding 服务不可用，请先启动 Ollama 并 ollama pull bge-m3：{error}")
+            raise SystemExit(f"Embedding 通路不可用（打桩失效）：{error}")
 
         info("真实模型草案生成", "开始（可能需要 1-3 分钟）")
         draft = requests.post(f"{base_url}/plan/draft", timeout=420)

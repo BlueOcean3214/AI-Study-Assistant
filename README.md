@@ -79,7 +79,7 @@ flowchart TD
 
 - 多文件 TXT 知识库（`knowledge/**/*.txt`），支持上传
 - 规则切片（400 字上限，按空行/标题/句末切分）
-- bge-m3 Embedding（1024 维），Cosine Similarity
+- Embedding 走云端 OpenAI 兼容 API（默认 `text-embedding-v4`，1024 维），不依赖本地 Ollama；`EMBEDDING_PROVIDER=ollama` 时仍可用本地 bge-m3，Cosine Similarity
 - Top-K + 相似度阈值过滤，返回带 `source` 的引用
 - 向量持久化缓存，重启后无需重新 Embedding
 
@@ -196,9 +196,9 @@ flowchart TD
 | 参数 | 值 |
 | --- | --- |
 | Chunk 上限 | 400 字符（按空行/标题/句末切分） |
-| Embedding 模型 | bge-m3（本地 Ollama） |
+| Embedding 模型 | 云端：`text-embedding-v4`（OpenAI 兼容 API，可换）；本地：bge-m3 |
 | 向量维度 | 1024 |
-| 批大小 | 32 条/请求 |
+| 批大小 | 云端 10 条/请求；本地 Ollama 32 条/请求 |
 | Top-K | 3 |
 | 相似度阈值 | MIN_SCORE = 0.5 |
 | 当前知识库 | 2 个 TXT 文件 |
