@@ -179,43 +179,90 @@ REQUIRED_TABLES = (
     "memory_evidence",
     "memory_events",
     "memory_pending_evidence",
+    "memory_apply_cursor",
 )
 
+CURSOR_COLUMNS = ("id", "last_applied_feedback_id", "updated_at")
 
-def _db_counts(db_path):
-    """读出现有库的表名与关键行数；文件损坏或不是 SQLite 时抛 RuntimeError（fail-closed）。"""
+
+def _db_state(db_path):
+    """读出现有库的结构、行数与关键内容；缺表或不是 SQLite 时抛 RuntimeError（fail-closed）。"""
+
+    db_path = Path(db_path)
 
     try:
         conn = sqlite3.connect(str(db_path))
-
-        try:
-            tables = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'"
-                ).fetchall()
-            }
-            missing = [name for name in REQUIRED_TABLES if name not in tables]
-
-            if missing:
-                raise RuntimeError(
-                    f"数据库结构不完整：{db_path.name} 缺少表 {missing}"
-                )
-
-            counts = {
-                name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
-                for name in REQUIRED_TABLES
-            }
-        finally:
-            conn.close()
     except sqlite3.DatabaseError as exc:
         raise RuntimeError(f"{db_path.name} 不是可用的样本库：{exc}") from exc
 
-    return counts
+    try:
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        missing = [name for name in REQUIRED_TABLES if name not in tables]
+
+        if missing:
+            raise RuntimeError(
+                f"数据库结构不完整：{db_path.name} 缺少表 {missing}"
+            )
+
+        return {
+            "counts": {
+                name: conn.execute(f"SELECT COUNT(*) FROM {name}").fetchone()[0]
+                for name in REQUIRED_TABLES
+            },
+            "cursor_columns": tuple(
+                row[1]
+                for row in conn.execute("PRAGMA table_info(memory_apply_cursor)")
+            ),
+            "cursor_rows": conn.execute(
+                "SELECT id, last_applied_feedback_id, updated_at FROM memory_apply_cursor"
+            ).fetchall(),
+            "max_feedback_id": conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM feedbacks"
+            ).fetchone()[0],
+            "memories": conn.execute(
+                "SELECT memory_type, subject_key FROM learning_memories"
+            ).fetchall(),
+            "evidence": conn.execute(
+                "SELECT m.memory_type, m.subject_key, e.relation, COUNT(*) "
+                "FROM memory_evidence e "
+                "JOIN learning_memories m ON m.id = e.memory_id "
+                "GROUP BY m.memory_type, m.subject_key, e.relation"
+            ).fetchall(),
+        }
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(f"{db_path.name} 不是可用的样本库：{exc}") from exc
+    finally:
+        conn.close()
+
+
+def _evidence_totals(rows):
+    """把 (type, key, relation, count) 聚成 {(type, key): {supports, contradicts}}。"""
+
+    totals = {}
+
+    for memory_type, subject_key, relation, count in rows:
+        bucket = totals.setdefault(
+            (memory_type, subject_key), {"supports": 0, "contradicts": 0}
+        )
+
+        if relation in bucket:
+            bucket[relation] += count
+
+    return totals
 
 
 def inspect_sample_db(db_path, sample):
-    """校验已有库是不是该样本的**完整**库；不完整直接报错，绝不静默写入别的库。"""
+    """校验已有库是不是该样本的**完整**库；不完整直接报错，绝不静默写入别的库。
+
+    逐项比对 Gold Standard，而不是只看总行数：
+    记忆集合（少一条 / 多一条 / 重复一条）、每条记忆的 supports 与 contradicts 证据行数、
+    pending 缓冲区、游标表记录与反馈高水位。任何一项不符都判定为不可复用。
+    """
 
     db_path = Path(db_path)
 
@@ -225,28 +272,89 @@ def inspect_sample_db(db_path, sample):
     if db_path.stat().st_size == 0:
         raise RuntimeError(f"样本库为空文件：{db_path}")
 
-    counts = _db_counts(db_path)
-    expected_feedbacks = len(sample["feedbacks"])
-    expected_plans = 1 if sample.get("plan") else 0
-    expected_memories = len(sample["gold_standard"]["memories"])
+    state = _db_state(db_path)
+    counts = state["counts"]
+    gold = sample["gold_standard"]["memories"]
 
     problems = []
 
+    # 1) 基础行数
+    expected_feedbacks = len(sample["feedbacks"])
+    expected_plans = 1 if sample.get("plan") else 0
+
     if counts["feedbacks"] != expected_feedbacks:
-        problems.append(
-            f"反馈数 {counts['feedbacks']}，样本要求 {expected_feedbacks}"
-        )
+        problems.append(f"反馈数 {counts['feedbacks']}，样本要求 {expected_feedbacks}")
 
     if counts["plans"] != expected_plans:
         problems.append(f"计划数 {counts['plans']}，样本要求 {expected_plans}")
 
-    if counts["learning_memories"] != expected_memories:
+    # 2) 记忆集合：按 (memory_type, subject_key) 逐个比对，总数相同但键不同也要报错
+    expected_keys = [(item["memory_type"], item["subject_key"]) for item in gold]
+    actual_keys = [(row[0], row[1]) for row in state["memories"]]
+
+    if len(actual_keys) != len(set(actual_keys)):
+        problems.append("记忆表存在重复的 (memory_type, subject_key) 记录")
+
+    missing_keys = [key for key in expected_keys if key not in set(actual_keys)]
+    extra_keys = [key for key in actual_keys if key not in set(expected_keys)]
+
+    if missing_keys:
+        problems.append(f"缺少 Gold Standard 记忆 {missing_keys}")
+
+    if extra_keys:
+        problems.append(f"多出 Gold Standard 之外的记忆 {extra_keys}")
+
+    # 3) 证据：每条记忆的 supports / contradicts 必须与 Gold Standard 逐条一致
+    totals = _evidence_totals(state["evidence"])
+
+    for item in gold:
+        key = (item["memory_type"], item["subject_key"])
+        got = totals.get(key, {"supports": 0, "contradicts": 0})
+        want = {
+            "supports": int(item["supports"]),
+            "contradicts": int(item["contradicts"]),
+        }
+
+        if got != want:
+            problems.append(
+                f"记忆 {key} 证据 supports/contradicts={got}，"
+                f"Gold Standard 要求 {want}"
+            )
+
+    # 4) pending 缓冲区必须为空
+    if counts["memory_pending_evidence"] != 0:
         problems.append(
-            f"记忆数 {counts['learning_memories']}，Gold Standard 要求 {expected_memories}"
+            f"pending 证据 {counts['memory_pending_evidence']} 条，应为 0"
         )
 
-    if counts["memory_evidence"] == 0:
-        problems.append("没有任何记忆证据行（未执行重建？）")
+    # 5) 游标表：结构完整、有且仅有 id=1 的记录、游标值与反馈高水位一致
+    missing_columns = [
+        name for name in CURSOR_COLUMNS if name not in state["cursor_columns"]
+    ]
+
+    if missing_columns:
+        problems.append(f"游标表 memory_apply_cursor 缺少列 {missing_columns}")
+
+    cursor_rows = state["cursor_rows"]
+
+    if len(cursor_rows) != 1:
+        problems.append(
+            f"游标表记录数 {len(cursor_rows)}，应当且只能有 1 条（id=1）"
+        )
+    else:
+        cursor_id, applied, updated_at = cursor_rows[0]
+
+        if cursor_id != 1:
+            problems.append(f"游标主键 id={cursor_id}，必须是 1")
+
+        if not (updated_at or "").strip():
+            problems.append("游标 updated_at 为空")
+
+        if applied != state["max_feedback_id"]:
+            problems.append(
+                f"游标 last_applied_feedback_id={applied}，"
+                f"反馈高水位={state['max_feedback_id']}"
+            )
 
     if problems:
         raise RuntimeError(

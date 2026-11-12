@@ -42,14 +42,18 @@ $env:PYTHONIOENCODING='utf-8'
 ```
 
 `--reuse` 表示复用已建好的库（不重跑 rebuild）；不加则每次重新建库并重建记忆。
-`seed_fixture.py --keep` 的语义是**只复用、不写入**：库已存在且结构完整时直接返回，不插入计划/反馈、
-也不重复重建；库不存在时照常创建；库存在但结构不完整（缺表、反馈/计划/记忆条数与样本不符、
-没有证据行）直接报错，不会静默写到别的库。
+`seed_fixture.py --keep` 的语义是**只复用、不写入**：库已存在且**完整校验通过**时直接返回，不插入计划/反馈、
+也不重复重建；库不存在时照常创建。完整性校验逐项比对 Gold Standard 而不是只数行数——
+7 张业务表必须齐全（含 `memory_apply_cursor`）、反馈与计划条数一致、
+`learning_memories` 的 `(memory_type, subject_key)` 集合不多不少不重复、
+每条记忆的 `supports`/`contradicts` 证据行数逐条相符、`memory_pending_evidence` 为 0、
+游标表有且仅有 `id=1` 一行且 `last_applied_feedback_id` 等于反馈高水位。
+任何一项不符直接报错，不会静默写到别的库。
 
 三个脚本都支持 `--sample S3` 只跑单个样本，`--config <path>` 换配置文件。
 
-自测：`.\.venv\Scripts\python.exe test_graduation_experiments.py`（14 项，覆盖七个样本的四组构建、
-核验的负向用例与 `--keep` 语义）。
+自测：`.\.venv\Scripts\python.exe test_graduation_experiments.py`（23 项，覆盖七个样本的四组构建、
+A/C 空反馈摘要与 B/D 真实摘要、核验的负向用例、`--keep` 的七种残缺库拒绝路径与正常复用）。
 
 ## 产物位置
 

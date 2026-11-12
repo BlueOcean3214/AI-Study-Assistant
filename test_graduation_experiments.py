@@ -15,6 +15,15 @@
     T12 seed_fixture --keep 对已存在的库只复用、不重复写入；对不存在的库照常构建
     T13 逐样本切换时 database.DATABASE_PATH 始终指向当前样本库；复用 S1 不动 S2.db
     T14 --keep 遇到结构不完整的库必须报错，不得静默写入
+    T15 A/C 的历史反馈为空数组、统计摘要为空 dict；B/D 的摘要等于真实反馈计算结果
+    T16 --keep 拒绝缺少 memory_apply_cursor 表的库
+    T17 --keep 拒绝没有游标记录的库
+    T18 --keep 拒绝游标落后于反馈高水位的库
+    T19 --keep 拒绝被删掉一条 memory_evidence 的库
+    T20 --keep 拒绝多出一条 memory_evidence 的库
+    T21 --keep 拒绝记忆键错误但总数相同的库
+    T22 --keep 拒绝 pending 缓冲不为零的库
+    T23 修复后 S1–S7 的正常库仍能被 --keep 复用（不重写）
 
 隔离：FEEDBACK_DB_PATH 在 import database 之前指向临时目录；脚手架自身还有
 DATABASE_PATH 落在工作目录内的断言，本测试额外核对真实库指纹。
@@ -567,6 +576,229 @@ def test_keep_rejects_incomplete_database():
 
 
 # ---------------------------------------------------------------------------
+# T15 A/C 的空反馈摘要必须是 {}，B/D 的摘要必须来自真实反馈
+# ---------------------------------------------------------------------------
+
+
+def _prompt_feedback_and_summary(user_content):
+    """从渲染好的 Prompt 里取出「历史反馈」与「统计结果」两个 JSON。"""
+
+    feedback_marker = "历史反馈：\n"
+    summary_marker = "统计结果：\n"
+    stop_marker = "\n\n只能根据数据判断"
+
+    start = user_content.index(feedback_marker) + len(feedback_marker)
+    summary_at = user_content.index(summary_marker, start)
+    end = user_content.index(stop_marker, summary_at)
+
+    feedback = json.loads(user_content[start:summary_at])
+    summary = json.loads(user_content[summary_at + len(summary_marker): end])
+
+    return feedback, summary
+
+
+def test_empty_and_real_feedback_summaries():
+    config = _config()
+    days = int(config["recent_feedback_days"])
+    api = build_prompts.project_api(config)
+    calculate_summary = api["feedback_service"].calculate_summary
+
+    expected_empty = {"days": days, "count": 0, "summary": {}, "feedback": []}
+
+    for sample_id in seed_fixture.sample_ids(config):
+        build = build_prompts.build_sample_prompts(sample_id, config)
+
+        # 条件输入本身就是空 dict，而不是渲染时才把统计藏起来
+        assert build["inputs"]["empty_feedback"] == expected_empty, (
+            sample_id,
+            build["inputs"]["empty_feedback"],
+        )
+
+        contents = build["contents"]
+
+        for group in ("A", "C"):
+            feedback, summary = _prompt_feedback_and_summary(contents[group])
+
+            assert feedback == [], (sample_id, group, feedback)
+            assert summary == {}, (sample_id, group, summary)
+
+        # C 与 A 的反馈及摘要完全一致
+        assert _prompt_feedback_and_summary(contents["C"]) == _prompt_feedback_and_summary(
+            contents["A"]
+        ), sample_id
+
+        for group in ("B", "D"):
+            feedback, summary = _prompt_feedback_and_summary(contents[group])
+
+            assert feedback, (sample_id, group, "B/D 必须带真实反馈")
+
+            # 条件输入里的摘要就是真实反馈的计算结果，且与 Prompt 文本一致
+            assert build["inputs"]["feedback_summary"] == summary, (sample_id, group)
+
+            expected = calculate_summary(feedback)
+
+            for field, value in expected.items():
+                assert summary.get(field) == value, (sample_id, group, field, value)
+
+            # 产品在「有反馈」分支才补的两个字段必须来自真实第一条反馈
+            assert summary["latest_status"] == feedback[0]["status"], (sample_id, group)
+            assert summary["latest_reason"] == feedback[0].get("reason"), (
+                sample_id,
+                group,
+            )
+
+            extra = sorted(
+                set(summary) - set(expected) - {"latest_status", "latest_reason"}
+            )
+            assert not extra, (sample_id, group, extra)
+
+        # 去掉记忆后 C ≡ A、D ≡ B（逐字）
+        block = _memory_block(contents["C"])
+
+        assert build_prompts.strip_memory(contents["C"], block) == contents["A"], sample_id
+        assert build_prompts.strip_memory(contents["D"], block) == contents["B"], sample_id
+
+
+# ---------------------------------------------------------------------------
+# T16–T22 --keep 必须拒绝七种残缺库
+# ---------------------------------------------------------------------------
+
+
+def _sql(db_path, *statements):
+    conn = sqlite3.connect(str(db_path))
+    try:
+        for statement in statements:
+            conn.execute(statement)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _expect_keep_failure(mutate, expected_substring):
+    """把 S1 的库改坏 → --keep 必须报错 → 还原字节 → 必须又能正常复用。"""
+
+    config = _config()
+    seeded = seed_fixture.seed_sample("S1", config)
+    db_path = Path(seeded["db_path"])
+    healthy = db_path.read_bytes()
+
+    gc.collect()  # 产品里的连接不显式关闭，Windows 上先回收句柄再改写
+
+    try:
+        mutate(db_path)
+        gc.collect()
+
+        try:
+            seed_fixture.seed_sample("S1", config, keep=True)
+        except RuntimeError as exc:
+            assert expected_substring in str(exc), (expected_substring, str(exc))
+        else:
+            raise AssertionError(
+                f"残缺库必须被 --keep 拒绝（期望包含「{expected_substring}」）"
+            )
+    finally:
+        gc.collect()
+        db_path.write_bytes(healthy)
+        gc.collect()
+
+    # 还原后必须仍可复用：证明上面的失败确实来自被改坏的库，而不是路径问题
+    restored = seed_fixture.seed_sample("S1", config, keep=True)
+
+    assert restored["reused"] is True and restored["rebuild"] is None, restored
+    assert restored["counts"]["memory_apply_cursor"] == 1, restored["counts"]
+
+
+def test_keep_rejects_missing_cursor_table():
+    def drop_cursor(db_path):
+        _sql(db_path, "DROP TABLE memory_apply_cursor")
+
+    _expect_keep_failure(drop_cursor, "缺少表")
+
+
+def test_keep_rejects_missing_cursor_row():
+    def drop_row(db_path):
+        _sql(db_path, "DELETE FROM memory_apply_cursor")
+
+    _expect_keep_failure(drop_row, "游标表记录数")
+
+
+def test_keep_rejects_cursor_behind_high_watermark():
+    def stale_cursor(db_path):
+        _sql(db_path, "UPDATE memory_apply_cursor SET last_applied_feedback_id = 0")
+
+    _expect_keep_failure(stale_cursor, "反馈高水位")
+
+
+def test_keep_rejects_deleted_evidence():
+    def drop_evidence(db_path):
+        _sql(
+            db_path,
+            "DELETE FROM memory_evidence WHERE id = "
+            "(SELECT MIN(id) FROM memory_evidence)",
+        )
+
+    _expect_keep_failure(drop_evidence, "supports/contradicts")
+
+
+def test_keep_rejects_extra_evidence():
+    def add_evidence(db_path):
+        _sql(
+            db_path,
+            "INSERT INTO memory_evidence "
+            "(memory_id, feedback_id, plan_id, episode, relation, weight, created_at) "
+            "SELECT id, 9999, NULL, 1, 'supports', 1.0, '2026-11-12T21:00:00' "
+            "FROM learning_memories ORDER BY id LIMIT 1",
+        )
+
+    _expect_keep_failure(add_evidence, "supports/contradicts")
+
+
+def test_keep_rejects_wrong_memory_key_with_same_count():
+    def rename_key(db_path):
+        _sql(
+            db_path,
+            "UPDATE learning_memories SET subject_key = '__wrong_subject_key__' "
+            "WHERE id = (SELECT MIN(id) FROM learning_memories)",
+        )
+
+    _expect_keep_failure(rename_key, "缺少 Gold Standard 记忆")
+
+
+def test_keep_rejects_pending_evidence():
+    def add_pending(db_path):
+        _sql(
+            db_path,
+            "INSERT INTO memory_pending_evidence "
+            "(memory_id, feedback_id, plan_id, episode, created_at, recorded_at) "
+            "SELECT MIN(id), 9999, NULL, 1, '2026-11-12T21:00:00', "
+            "'2026-11-12T21:00:00' FROM learning_memories",
+        )
+
+    _expect_keep_failure(add_pending, "pending 证据")
+
+
+# ---------------------------------------------------------------------------
+# T23 修复后 S1–S7 的正常库仍能被 --keep 复用
+# ---------------------------------------------------------------------------
+
+
+def test_keep_reuses_all_seven_healthy_databases():
+    config = _config()
+
+    for sample_id in seed_fixture.sample_ids(config):
+        built = seed_fixture.seed_sample(sample_id, config)
+        db_path = Path(built["db_path"])
+        before = _db_counts(db_path)
+
+        again = seed_fixture.seed_sample(sample_id, config, keep=True)
+
+        assert again["reused"] is True, (sample_id, again)
+        assert again["rebuild"] is None, (sample_id, again)
+        assert again["counts"]["memory_apply_cursor"] == 1, (sample_id, again["counts"])
+        assert _db_counts(db_path) == before, (sample_id, before, _db_counts(db_path))
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -589,6 +821,15 @@ def _run_all():
         test_keep_reuses_existing_database_without_writing,
         test_database_path_switch_between_samples,
         test_keep_rejects_incomplete_database,
+        test_empty_and_real_feedback_summaries,
+        test_keep_rejects_missing_cursor_table,
+        test_keep_rejects_missing_cursor_row,
+        test_keep_rejects_cursor_behind_high_watermark,
+        test_keep_rejects_deleted_evidence,
+        test_keep_rejects_extra_evidence,
+        test_keep_rejects_wrong_memory_key_with_same_count,
+        test_keep_rejects_pending_evidence,
+        test_keep_reuses_all_seven_healthy_databases,
     ]
 
     for test in tests:

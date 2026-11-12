@@ -142,14 +142,16 @@ def activate_sample(sample_id, config, reuse=False):
     return db_path, api
 
 
-def empty_feedback_result(days, feedback_service):
-    """与 agent_tools.get_recent_feedback() 在"没有任何反馈"时的输出结构一致。"""
+def empty_feedback_result(days):
+    """A/C 组的空反馈对象。
 
-    summary = feedback_service.calculate_summary([])
-    summary["latest_status"] = None
-    summary["latest_reason"] = None
+    预登记口径见 docs/GRADUATION-EXPERIMENT-DESIGN.md §2.2：空反馈组的
+    `feedback_result["summary"]` 必须是空 dict，而不是 calculate_summary([]) 的全零统计。
+    这里刻意不附加 latest_status / latest_reason 之类由产品在"有反馈"分支才补的字段，
+    让 A/C 看到的统计槽位就是"没有统计"，与 B/D 的真实摘要形成干净对照。
+    """
 
-    return {"days": days, "count": 0, "summary": summary, "feedback": []}
+    return {"days": days, "count": 0, "summary": {}, "feedback": []}
 
 
 def collect_inputs(sample, config, api, moment):
@@ -182,7 +184,7 @@ def collect_inputs(sample, config, api, moment):
         "knowledge_results": list(config.get("knowledge_results") or []),
         "search_failed": bool(config.get("knowledge_search_failed")),
         "feedback_result": feedback_result,
-        "empty_feedback": empty_feedback_result(days, api["feedback_service"]),
+        "empty_feedback": empty_feedback_result(days),
         "difficult": bool(difficult),
         "short_term_block": short_term["text"],
         "short_term_info": short_term["info"],
@@ -393,6 +395,8 @@ def build_sample_prompts(sample_id, config, reuse=False):
         "inputs": {
             "feedback_count": inputs["feedback_result"]["count"],
             "feedback_latest_status": inputs["feedback_result"]["summary"].get("latest_status"),
+            "empty_feedback": inputs["empty_feedback"],
+            "feedback_summary": inputs["feedback_result"]["summary"],
             "difficult": inputs["difficult"],
             "short_term_chars": inputs["short_term_info"]["length"],
             "short_term_dropped": inputs["short_term_info"]["dropped"],
