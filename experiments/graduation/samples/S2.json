@@ -1,0 +1,129 @@
+{
+  "sample_id": "S2",
+  "title": "耗时长期超标，中途有一次完成",
+  "scenario": "30 天内 6 次「英语定语从句练习」，5 次没做完（原因都是任务时间太长），只有一次做完；提交前状态被削弱过一次，随后又被拉回。",
+  "feedbacks": [
+    {
+      "offset_days": -21,
+      "task": "英语定语从句练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 75,
+      "status": "not_completed",
+      "reason": "任务时间太长",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 6,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -17,
+      "task": "英语定语从句练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 70,
+      "status": "not_completed",
+      "reason": "任务时间太长",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 5,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -13,
+      "task": "英语定语从句练习",
+      "estimated_minutes": 40,
+      "actual_minutes": 68,
+      "status": "not_completed",
+      "reason": "任务时间太长",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 6,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -9,
+      "task": "英语定语从句练习",
+      "estimated_minutes": 35,
+      "actual_minutes": 62,
+      "status": "partial",
+      "reason": "任务时间太长",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 5,
+      "total_questions": 10
+    },
+    {
+      "offset_days": -5,
+      "task": "英语定语从句练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 45,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 8,
+      "total_questions": 8
+    },
+    {
+      "offset_days": -2,
+      "task": "英语定语从句练习",
+      "estimated_minutes": 35,
+      "actual_minutes": 58,
+      "status": "partial",
+      "reason": "任务时间太长",
+      "completed_subtasks": 1,
+      "total_subtasks": 2,
+      "completed_questions": 5,
+      "total_questions": 8
+    }
+  ],
+  "plan": null,
+  "current_user_request": "明天有 90 分钟，想把定语从句再练一轮。",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "任务名、时间戳与反馈数值均为构造数据，不代表真实用户"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [
+      {
+        "memory_type": "task_performance",
+        "subject_key": "英语定语从句",
+        "subject_label": "英语定语从句练习",
+        "status": "active",
+        "strength": 0.6,
+        "supports": 5,
+        "contradicts": 1,
+        "unit": 6,
+        "has_prefix": false,
+        "injected": true,
+        "content": "「英语定语从句练习」近期 6 次任务完成率 17%"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "英语定语从句",
+        "subject_label": "英语定语从句练习",
+        "status": "active",
+        "strength": 0.9,
+        "supports": 6,
+        "contradicts": 0,
+        "unit": 6,
+        "has_prefix": false,
+        "injected": true,
+        "content": "「英语定语从句练习」近期反馈中 6 次出现"
+      }
+    ],
+    "must_not_exist": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "英语定语从句",
+        "why": "失败原因是「任务时间太长」而不是难度，difficulty 记忆不应生成"
+      },
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "*",
+        "why": "没有计划行，缺少 estimated_minutes 基准"
+      }
+    ]
+  }
+}

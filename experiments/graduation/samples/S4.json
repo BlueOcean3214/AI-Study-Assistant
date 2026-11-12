@@ -1,0 +1,136 @@
+{
+  "sample_id": "S4",
+  "title": "用时长期超预估，完成率偏低",
+  "scenario": "30 天内 5 次「英语阅读练习」，4 次超过预估用时（中位约 2.2 倍），3 次没做完；有一次计划行把难度标为 medium。任务完成率记忆被削弱（weakened）后不再注入。",
+  "feedbacks": [
+    {
+      "offset_days": -20,
+      "task": "英语阅读练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 62,
+      "status": "partial",
+      "reason": "任务时间太长",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 1,
+      "total_questions": 2
+    },
+    {
+      "offset_days": -15,
+      "task": "英语阅读练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 68,
+      "status": "partial",
+      "reason": "任务时间太长",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 1,
+      "total_questions": 2
+    },
+    {
+      "offset_days": -10,
+      "task": "英语阅读练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 71,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 2,
+      "total_questions": 2
+    },
+    {
+      "offset_days": -6,
+      "task": "英语阅读练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 65,
+      "status": "partial",
+      "reason": "任务时间太长",
+      "completed_subtasks": 0,
+      "total_subtasks": 2,
+      "completed_questions": 1,
+      "total_questions": 2
+    },
+    {
+      "offset_days": -2,
+      "task": "英语阅读练习",
+      "estimated_minutes": 30,
+      "actual_minutes": 66,
+      "status": "completed",
+      "reason": null,
+      "completed_subtasks": 2,
+      "total_subtasks": 2,
+      "completed_questions": 2,
+      "total_questions": 2
+    }
+  ],
+  "plan": {
+    "offset_days": -20,
+    "task": "英语阅读练习",
+    "estimated_minutes": 30,
+    "difficulty": "medium",
+    "question_count": 8,
+    "subtasks": [
+      "精读一篇",
+      "整理生词"
+    ],
+    "status": "completed"
+  },
+  "current_user_request": "明天晚上有 1 小时，帮我排英语阅读。",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "任务名、时间戳与反馈数值均为构造数据，不代表真实用户"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "medium",
+        "subject_label": "medium",
+        "status": "active",
+        "strength": 0.6,
+        "supports": 5,
+        "contradicts": 0,
+        "unit": 5,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：中等 任务近期 5 次实际用时约为预估的 2.2 倍"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "英语阅读",
+        "subject_label": "英语阅读练习",
+        "status": "weakened",
+        "strength": 0.273517,
+        "supports": 3,
+        "contradicts": 2,
+        "unit": 5,
+        "has_prefix": true,
+        "injected": false,
+        "content": "初步观察：「英语阅读练习」近期 5 次任务完成率 40%"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "英语阅读",
+        "subject_label": "英语阅读练习",
+        "status": "active",
+        "strength": 0.6,
+        "supports": 5,
+        "contradicts": 0,
+        "unit": 5,
+        "has_prefix": true,
+        "injected": true,
+        "content": "初步观察：「英语阅读练习」近期反馈中 5 次出现"
+      }
+    ],
+    "must_not_exist": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "英语阅读",
+        "why": "失败原因是「任务时间太长」，不是难度，difficulty 记忆不应生成"
+      }
+    ]
+  }
+}
