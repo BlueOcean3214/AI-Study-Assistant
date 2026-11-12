@@ -43,10 +43,12 @@ class DraftState(TypedDict, total=False):
     feedback_result: Any
     knowledge_results: Any
     search_failed: bool
+    memory_result: Any
     messages: list
     corrections_used: int
     last_reason: str | None
     last_raw: str | None
+    short_term_block: str
     result: dict
 
 
@@ -58,12 +60,22 @@ class DraftState(TypedDict, total=False):
 def node_research(state: DraftState) -> DraftState:
     """只读研究节点：复用 agent_loop.run_agent（工具白名单/预算/超时全部继承）。"""
 
-    research_message = (
-        f"{state['user_message']}\n\n"
+    # 短期上下文先收集、先渲染，研究阶段就能看到（v16 §2.2）；
+    # 全流程只算一次，同一份 block 写进 state 供 node_prepare 复用
+    short_term_block = agent_plan_draft._short_term_block()
+
+    task_hint = (
         "（系统任务：用户需要一份学习计划草案。请先调用 get_recent_feedback 获取最近学习反馈；"
         "如需学习方法参考，再调用 search_knowledge 查询知识库；"
         "然后用几句话总结你获得的关键事实。）"
     )
+
+    if short_term_block:
+        research_message = (
+            f"{state['user_message']}\n\n{short_term_block}\n\n{task_hint}"
+        )
+    else:
+        research_message = f"{state['user_message']}\n\n{task_hint}"
 
     research = agent_loop.run_agent(
         research_message,
@@ -71,7 +83,11 @@ def node_research(state: DraftState) -> DraftState:
         verbose=False,
     )
 
-    return {"research": research, "steps": research.get("steps") or []}
+    return {
+        "research": research,
+        "steps": research.get("steps") or [],
+        "short_term_block": short_term_block,
+    }
 
 
 def node_prepare(state: DraftState) -> DraftState:
@@ -88,14 +104,25 @@ def node_prepare(state: DraftState) -> DraftState:
     if history_error:
         return {"history_error": history_error}
 
-    feedback_result, knowledge_results, search_failed = agent_plan_draft._collect_tool_data(steps)
+    (
+        feedback_result,
+        knowledge_results,
+        search_failed,
+        memory_result,
+    ) = agent_plan_draft._collect_tool_data(steps)
 
     messages = [
         {"role": "system", "content": agent_plan_draft.DRAFT_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": agent_plan_draft._build_draft_user_content(
-                state["user_message"], feedback_result, knowledge_results, search_failed, difficult
+                state["user_message"],
+                feedback_result,
+                knowledge_results,
+                search_failed,
+                difficult,
+                short_term_block=state.get("short_term_block"),
+                memory_result=memory_result,
             ),
         },
     ]
@@ -105,6 +132,7 @@ def node_prepare(state: DraftState) -> DraftState:
         "feedback_result": feedback_result,
         "knowledge_results": knowledge_results,
         "search_failed": search_failed,
+        "memory_result": memory_result,
         "messages": messages,
         "corrections_used": state.get("corrections_used", 0),
         "last_reason": None,
@@ -172,7 +200,9 @@ def node_validate(state: DraftState) -> DraftState:
         return {"last_reason": validation["reason"]}
 
     violations = agent_plan_draft.check_grounding(
-        [answer, normalized.get("reason")], state["steps"]
+        [answer, normalized.get("reason")],
+        state["steps"],
+        memory_result=state.get("memory_result"),
     )
 
     if violations:

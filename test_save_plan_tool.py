@@ -314,8 +314,10 @@ try:
           set(agent_dispatcher.TOOLS) == set(agent_schema.TOOL_NAMES))
 
     schema_names = {item["function"]["name"] for item in agent_schema.TOOL_SCHEMAS}
-    check("Schema 工具面为两个只读 + save_plan",
-          schema_names == {"get_recent_feedback", "search_knowledge", "save_plan"})
+    # v16 §6.2：三个只读（get_recent_feedback / get_learning_memory / search_knowledge）+ save_plan
+    check("Schema 工具面为三个只读 + save_plan",
+          schema_names == {"get_recent_feedback", "get_learning_memory",
+                           "search_knowledge", "save_plan"})
 
     schema_text = json.dumps(agent_schema.TOOL_SCHEMAS, ensure_ascii=False)
     check("Schema 中不存在 confirmed_by_user", "confirmed_by_user" not in schema_text)

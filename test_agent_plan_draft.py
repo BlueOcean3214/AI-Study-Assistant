@@ -615,8 +615,10 @@ try:
     # 4. Safety：草案流程只读（第三阶段 C1 后 save_plan 已注册但仍受确认保护）
     # ==========================
 
-    check("save_plan 已注册但工具面仅三个",
-          set(agent_dispatcher.TOOLS) == {"get_recent_feedback", "search_knowledge", "save_plan"})
+    # v16 §6.2：Batch C 只新增一个只读 Tool get_learning_memory，工具面仍然精确固定
+    check("工具面精确等于 v16 §6.2 的四个 Tool",
+          set(agent_dispatcher.TOOLS) == {"get_recent_feedback", "get_learning_memory",
+                                          "search_knowledge", "save_plan"})
     check("save_plan 的 Tool 面没有 confirmed_by_user",
           "confirmed_by_user" not in json.dumps(agent_schema.TOOL_SCHEMAS, ensure_ascii=False))
     check("破坏性工具仍然不存在",

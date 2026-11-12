@@ -372,8 +372,13 @@ def _evaluate_plan_draft(case, run_result, side_effects=None, duration_seconds=N
                         f"困难任务收紧规则未满足：{tightened['reason']}"
                     )
 
+        # 与生产两条路径一致：起草用的 memory_result 就是从这里同一份 steps 提取的
+        _, _, _, memory_result = agent_plan_draft._collect_tool_data(steps)
+
         for violation in agent_plan_draft.check_grounding(
-            [answer or "", (plan or {}).get("reason") or ""], steps
+            [answer or "", (plan or {}).get("reason") or ""],
+            steps,
+            memory_result=memory_result,
         ):
             hard_failures.append(f"来源不诚实：{violation}")
 

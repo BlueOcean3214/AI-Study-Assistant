@@ -21,10 +21,11 @@ schemas = agent_schema.get_tool_schemas()
 by_name = {schema["function"]["name"]: schema for schema in schemas}
 
 # 1. 工具名称正确
-check("Schema 数量为 3", len(schemas) == 3, f"n={len(schemas)}")
+check("Schema 数量为 4", len(schemas) == 4, f"n={len(schemas)}")
 check(
     "工具名称正确",
-    set(by_name) == {"get_recent_feedback", "search_knowledge", "save_plan"},
+    set(by_name)
+    == {"get_recent_feedback", "get_learning_memory", "search_knowledge", "save_plan"},
     f"names={sorted(by_name)}",
 )
 check("TOOL_NAMES 与 Schema 一致", set(agent_schema.TOOL_NAMES) == set(by_name))
@@ -70,7 +71,31 @@ check("validate_plan_for_save 未作为 LLM Tool", "validate_plan_for_save" not 
 check("save_plan 已作为受确认保护的 Tool", "save_plan" in by_name)
 check(
     "没有多余工具",
-    set(agent_schema.TOOL_NAMES) == {"get_recent_feedback", "search_knowledge", "save_plan"},
+    set(agent_schema.TOOL_NAMES)
+    == {"get_recent_feedback", "get_learning_memory", "search_knowledge", "save_plan"},
+)
+
+# 4.0 get_learning_memory：只读记忆 Tool（v16 §6.2）
+memory_params = by_name["get_learning_memory"]["function"]["parameters"]
+
+check(
+    "get_learning_memory 只暴露 memory_type/subject/limit",
+    set(memory_params["properties"]) == {"memory_type", "subject", "limit"},
+    f"properties={sorted(memory_params['properties'])}",
+)
+check(
+    "memory_type 枚举与实现一致",
+    tuple(memory_params["properties"]["memory_type"]["enum"])
+    == ("difficulty", "task_performance", "time_pattern", "task_topic"),
+    memory_params["properties"]["memory_type"]["enum"],
+)
+check(
+    "get_learning_memory 没有 preference 类型",
+    "preference" not in memory_params["properties"]["memory_type"]["enum"],
+)
+check(
+    "get_learning_memory 没有必填参数",
+    "required" not in memory_params or memory_params["required"] == [],
 )
 
 # 4.1 save_plan 的参数面：只有 plan/plan_date/confirmation_id，绝不出现 confirmed_by_user
