@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import json
+import logging
 
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -14,7 +15,10 @@ import agent_plan_draft
 import confirmation_service
 import context_builder
 import document_service
+import memory_service
 import plan_service
+
+logger = logging.getLogger(__name__)
 
 from rag_service import retrieve_chunks
 
@@ -386,6 +390,56 @@ def _normalize_plan_task(value):
     return " ".join(str(value or "").split())
 
 
+def _memory_descriptor_public(row):
+    """GET /memory 与 /feedback.memory 的公开投影：不暴露内部 id / value_json / 事件。"""
+
+    return {
+        "type": row.get("memory_type"),
+        "subject": row.get("subject_label") or row.get("subject_key"),
+        "content": row.get("content"),
+        "strength": row.get("strength"),
+        "evidence_count": row.get("evidence_count"),
+        "episode": row.get("episode"),
+        "evidence_feedback_ids": row.get("evidence_feedback_ids") or [],
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def _update_memory_after_feedback(feedback_id):
+    """反馈已提交后再更新记忆（独立事务，失败不 500）。"""
+
+    if not isinstance(feedback_id, int) or isinstance(feedback_id, bool):
+        logger.warning("反馈已保存但没有拿到 feedback_id，跳过记忆更新")
+        return {"ok": False, "error_type": "memory_update_failed"}
+
+    try:
+        result = memory_service.update_from_feedback(feedback_id)
+    except Exception as error:  # noqa: BLE001 - 记忆失败不能影响反馈保存结果
+        logger.warning(
+            "记忆更新异常（反馈 %s 已保存）：%s: %s",
+            feedback_id,
+            type(error).__name__,
+            error,
+        )
+        return {"ok": False, "error_type": "memory_update_failed"}
+
+    if not result.get("ok"):
+        error_type = result.get("error_type") or "memory_update_failed"
+        logger.warning("记忆更新失败（反馈 %s 已保存）：%s", feedback_id, error_type)
+        return {"ok": False, "error_type": error_type}
+
+    created = [
+        {"type": item.get("type"), "subject": item.get("subject")}
+        for item in result.get("created_memories") or []
+    ]
+    updated = [
+        {"type": item.get("type"), "subject": item.get("subject")}
+        for item in result.get("updated_memories") or []
+    ]
+
+    return {"ok": True, "created": created, "updated": updated}
+
+
 @app.post("/feedback")
 def feedback(data: Feedback):
     # 提供了 plan_id 就必须先验证，绝不把未经验证的 ID 写进数据库
@@ -425,17 +479,22 @@ def feedback(data: Feedback):
 
     created_at = datetime.now().isoformat()
 
-    insert_feedback(
+    feedback_id = insert_feedback(
         data.model_dump(),
         created_at
     )
+
+    # 反馈事务已经提交（insert_feedback 返回即落库），记忆更新另起独立事务：
+    # 失败只记日志 + 降级字段，绝不回滚已保存的反馈、也不把请求变成 5xx（§6.4）。
+    memory_info = _update_memory_after_feedback(feedback_id)
 
     return {
         "message": "反馈保存成功",
         "feedback": {
             **data.model_dump(),
             "created_at": created_at
-        }
+        },
+        "memory": memory_info,
     }
 
 
@@ -443,6 +502,50 @@ def feedback(data: Feedback):
 def get_feedback():
     return {
         "feedback": get_feedback_list()
+    }
+
+
+@app.get("/memory")
+def get_memory(
+    memory_type: str | None = None,
+    subject: str | None = None,
+    status: str = "active",
+    limit: int = 5,
+):
+    """只读查询学习记忆（§4.2/§6.2）：底层只走 memory_service.retrieve()。
+
+    不返回 memory_id / value_json / 事件 / pending；空结果是正常响应；
+    参数非法按 invalid_argument 映射成 400，不复制第二套检索逻辑。
+    """
+
+    result = memory_service.retrieve(
+        memory_type=memory_type,
+        subject=subject,
+        status=status,
+        limit=limit,
+    )
+
+    if not result.get("ok"):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "count": 0,
+                "memories": [],
+                "error_type": result.get("error_type") or "invalid_argument",
+                "message": result.get("message"),
+            },
+        )
+
+    memories = [
+        _memory_descriptor_public(row) for row in result.get("memories") or []
+    ]
+
+    return {
+        "ok": True,
+        "count": len(memories),
+        "memories": memories,
+        "error_type": None,
     }
 
 

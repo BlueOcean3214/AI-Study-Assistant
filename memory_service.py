@@ -769,12 +769,18 @@ def _new_info():
         "memories_created": 0,
         "memories_updated": 0,
         "memory_ids": [],
+        "created_ids": [],
     }
 
 
 def _note_memory_id(info, memory_id):
     if memory_id not in info["memory_ids"]:
         info["memory_ids"].append(memory_id)
+
+
+def _note_created_id(info, memory_id):
+    if memory_id not in info["created_ids"]:
+        info["created_ids"].append(memory_id)
 
 
 def _episode_counts(memory_id, episode, conn):
@@ -1515,6 +1521,7 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
 
         info["memories_created"] += 1
         _note_memory_id(info, memory["id"])
+        _note_created_id(info, memory["id"])
 
         detail = _event_detail(as_of, 1, evidence_ids)
         _write_event(memory["id"], EVENT_CREATED, detail, as_of, conn, info)
@@ -1844,6 +1851,17 @@ def apply_feedback(trigger, as_of=None, conn=None):
     return {"ok": True, "info": info}
 
 
+def _memory_descriptor(memory):
+    """对外只回业务键与展示名：不带 memory_id / value_json / 事件（§6.2）。"""
+
+    if not isinstance(memory, dict):
+        return None
+
+    subject = memory.get("subject_label") or memory.get("subject_key") or ""
+
+    return {"type": memory.get("memory_type"), "subject": subject}
+
+
 def update_from_feedback(feedback_id):
     """兼容包装：内部走在线入口与同一游标，不绕过批量循环（§5.3.6）。"""
 
@@ -1855,16 +1873,35 @@ def update_from_feedback(feedback_id):
             "memory_ids": [],
             "created": 0,
             "updated": 0,
+            "created_memories": [],
+            "updated_memories": [],
             "error_type": result.get("error_type", ERROR_DB),
         }
 
     info = result.get("info", {})
+    created_ids = list(info.get("created_ids", []))
+    updated_ids = [mid for mid in info.get("memory_ids", []) if mid not in created_ids]
+
+    created_memories = []
+    updated_memories = []
+
+    for memory_id in created_ids:
+        descriptor = _memory_descriptor(database.get_memory(memory_id))
+        if descriptor:
+            created_memories.append(descriptor)
+
+    for memory_id in updated_ids:
+        descriptor = _memory_descriptor(database.get_memory(memory_id))
+        if descriptor:
+            updated_memories.append(descriptor)
 
     return {
         "ok": True,
         "memory_ids": list(info.get("memory_ids", [])),
         "created": info.get("memories_created", 0),
         "updated": info.get("memories_updated", 0),
+        "created_memories": created_memories,
+        "updated_memories": updated_memories,
         "error_type": None,
     }
 
