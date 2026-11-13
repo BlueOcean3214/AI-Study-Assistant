@@ -1,0 +1,9 @@
+﻿batch,batch_desc,relative_path,file,size_bytes,sha256,records
+smoke,API 冒烟（S1×A，1 份）,experiments/graduation/runs/internal-api-smoke-20261113T061019Z/plan.json,plan.json,851,10248c9f2b2f6b8982d0da9d2e8c2fa59775eeea4d6614af6dfe20ccdea2d06e,1
+smoke,API 冒烟（S1×A，1 份）,experiments/graduation/runs/internal-api-smoke-20261113T061019Z/results.jsonl,results.jsonl,6617,7502e4681389f8736e12573fb45f7388b8f4e8924e18af9aa04833d194643b14,1
+main,主实验（S1–S7 × A/B/C/D，140 份）,experiments/graduation/runs/main-20261113T061051Z/plan.json,plan.json,33686,877e955e9f2db8a7e7ceba8d2aaff5f8a6f8296b59d7c530d06e2b51013ec53d,140
+main,主实验（S1–S7 × A/B/C/D，140 份）,experiments/graduation/runs/main-20261113T061051Z/results.jsonl,results.jsonl,982080,bbab693f72b459206035e06b26fee99fab86584d98627f74a77d9cc6df1f6383,140
+suppl-subj,补充 C-subj/D-subj（S5，10 份）,experiments/graduation/runs/suppl-subj-20261113T062711Z/plan.json,plan.json,3080,01f23fbc88efedf0d0317215815a23946ebe67cdde448fc4384ba60049b36e36,10
+suppl-subj,补充 C-subj/D-subj（S5，10 份）,experiments/graduation/runs/suppl-subj-20261113T062711Z/results.jsonl,results.jsonl,65100,5f718df8850f8a1cd1e5ddc3fe89d55aa0a0d7f10cb800c51cb92e76a889eac3,10
+suppl-s7empty,补充 S7-empty×D（5 份）,experiments/graduation/runs/suppl-s7empty-20261113T062822Z/plan.json,plan.json,1835,161c476630b65ce159735309abae99da536412e0664bd4027370de9068f38d2f,5
+suppl-s7empty,补充 S7-empty×D（5 份）,experiments/graduation/runs/suppl-s7empty-20261113T062822Z/results.jsonl,results.jsonl,34020,f0577f4f4bacaec04f97bf12a7d3f27f14f0bd5272a81a5cdd3828313dfcb2df,5
