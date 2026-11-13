@@ -1073,6 +1073,77 @@ def test_duplicate_identities(root, base_run):
         )
 
 
+def test_identity_field_types(root, base_run):
+    # ㉚ JSONL 原始身份字段严格类型校验：非法类型不得被 int()/str() 静默归一化
+    cases = (
+        ("repeat_bool", "repeat_index", True, False, "类型不正确"),
+        ("repeat_str", "repeat_index", "1", False, "类型不正确"),
+        ("experiment_id_int", "experiment_id", 12345, False, "类型不正确"),
+        ("sample_id_int", "sample_id", 12345, False, "类型不正确"),
+        ("group_bool", "group", True, False, "类型不正确"),
+        ("missing_repeat", "repeat_index", None, True, "缺少实验身份字段"),
+    )
+
+    for name, field, value, drop, message in cases:
+        run_dir = shutil.copytree(
+            base_run, Path(root) / f"identity_type_{name}" / base_run.name
+        )
+        results_path = run_dir / run_experiment.RESULTS_NAME
+        rows = read_rows(results_path)
+
+        if drop:
+            del rows[0][field]
+        else:
+            rows[0][field] = value
+
+        write_rows(results_path, rows)
+        before = results_path.read_bytes()
+
+        runner = FakeRunner()
+        code, out, err, fakes = call_main(
+            ["--sample", "S1", "--group", "A", "--run-dir", str(run_dir)], runner
+        )
+
+        check(f"㉚ {name} → exit code 4", code == 4, (code, out[-200:], err[-300:]))
+        check(f"㉚ {name} → 0 次 run_one", runner.calls == [], len(runner.calls))
+        check(
+            f"㉚ {name} → 0 次 isolate_database",
+            fakes.isolate_calls == [],
+            fakes.isolate_calls,
+        )
+        check(
+            f"㉚ {name} → results.jsonl 字节不变",
+            results_path.read_bytes() == before,
+        )
+        check(
+            f"㉚ {name} → stderr 指出字段与拒绝原因",
+            field in err and message in err and "拒绝续跑" in err,
+            err[-400:],
+        )
+
+
+def test_identity_key_strict_types():
+    # ㉛ identity_key 自身不做归一化：int(True) == 1、int("1") == 1 都不得被接受
+    cases = (
+        ("experiment_id 为 int", (1, "S1", "A", 0), "experiment_id"),
+        ("sample_id 为 int", ("exp", 1, "A", 0), "sample_id"),
+        ("group 为 None", ("exp", "S1", None, 0), "group"),
+        ("repeat_index 为 True", ("exp", "S1", "A", True), "repeat_index"),
+        ("repeat_index 为 '1'", ("exp", "S1", "A", "1"), "repeat_index"),
+    )
+
+    for label, args, field in cases:
+        try:
+            run_experiment.identity_key(*args)
+        except run_experiment.IdentityConflictError as error:
+            check(f"㉛ {label} → 拒绝", field in str(error), str(error))
+        else:
+            check(f"㉛ {label} → 拒绝", False, "未抛出 IdentityConflictError")
+
+    good = run_experiment.identity_key("exp", "S1", "A", 3)
+    check("㉛ 合法身份仍为四元组", good == ("exp", "S1", "A", 3), good)
+
+
 # ---------------------------------------------------------------------------
 # E. 补充实验与 legacy B0
 # ---------------------------------------------------------------------------
@@ -1215,6 +1286,8 @@ def _run_all():
         test_foreign_and_broken_results(root, base_run)
         test_resume_audit_fields(root, base_run)
         test_duplicate_identities(root, base_run)
+        test_identity_field_types(root, base_run)
+        test_identity_key_strict_types()
         test_supplementary_runs(root)
         test_b0_rejected_before_run_dir(root)
     finally:

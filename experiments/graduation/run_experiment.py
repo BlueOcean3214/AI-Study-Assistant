@@ -759,10 +759,75 @@ class IdentityConflictError(RuntimeError):
     """已有结果无法解析，或与当前计划不一致（计划外身份、重复成功等）。"""
 
 
-def identity_key(experiment_id, sample_id, group, repeat_index):
-    """实验身份仍是四元组；plan_seq / round_index 只作顺序审计。"""
+IDENTITY_FIELD_TYPES = (
+    ("experiment_id", str),
+    ("sample_id", str),
+    ("group", str),
+    ("repeat_index", int),
+)
 
-    return (str(experiment_id), str(sample_id), str(group), int(repeat_index))
+
+def identity_key(experiment_id, sample_id, group, repeat_index):
+    """实验身份仍是四元组；plan_seq / round_index 只作顺序审计。
+
+    这里不做 str()/int() 归一化：`int(True) == 1`、`int("1") == 1` 这类自动
+    转换会把非法的 JSON 类型静默变成合法身份，因此只接受严格类型的值。
+    """
+
+    for field, value in (
+        ("experiment_id", experiment_id),
+        ("sample_id", sample_id),
+        ("group", group),
+    ):
+        if not isinstance(value, str):
+            raise IdentityConflictError(
+                f"实验身份字段 {field} 必须是字符串：{value!r}"
+                f"（{type(value).__name__}）"
+            )
+
+    if isinstance(repeat_index, bool) or not isinstance(repeat_index, int):
+        raise IdentityConflictError(
+            "实验身份字段 repeat_index 必须是整数（且不能是 bool）："
+            f"{repeat_index!r}（{type(repeat_index).__name__}）"
+        )
+
+    return (experiment_id, sample_id, group, repeat_index)
+
+
+def validate_identity_fields(row, path, line_number):
+    """对 results.jsonl 的原始身份字段做严格类型校验，返回实验身份键。
+
+    - experiment_id / sample_id / group：必须是字符串。
+    - repeat_index：必须是整数，bool 不算（`True` 不能当成 1）。
+    任何字段缺失或类型不符都抛出 IdentityConflictError，绝不自动转换。
+    """
+
+    for field, field_type in IDENTITY_FIELD_TYPES:
+        if field not in row:
+            raise IdentityConflictError(
+                f"{path} 第 {line_number} 行缺少实验身份字段 {field}，"
+                "无法判断是否重复身份，拒绝续跑。"
+            )
+
+        value = row[field]
+
+        if field_type is int:
+            valid = isinstance(value, int) and not isinstance(value, bool)
+            expected = "整数（且不能是 bool）"
+        else:
+            valid = isinstance(value, field_type)
+            expected = "字符串"
+
+        if not valid:
+            raise IdentityConflictError(
+                f"{path} 第 {line_number} 行的实验身份字段 {field} 类型不正确："
+                f"{value!r}（{type(value).__name__}），必须为{expected}；"
+                "拒绝自动类型转换，拒绝续跑。"
+            )
+
+    return identity_key(
+        row["experiment_id"], row["sample_id"], row["group"], row["repeat_index"]
+    )
 
 
 def scheduled_tasks(plan):
@@ -782,7 +847,7 @@ def task_key(plan, sample_id, task):
 
 
 def read_result_rows(results_path):
-    """读取已有 results.jsonl，返回 [(行号, row)]；任何非法行都 fail-closed。"""
+    """读取已有 results.jsonl，返回 [(行号, row, 身份键)]；任何非法行都 fail-closed。"""
 
     path = Path(results_path)
 
@@ -809,23 +874,14 @@ def read_result_rows(results_path):
         if not isinstance(row, dict):
             raise IdentityConflictError(f"{path} 第 {line_number} 行不是 JSON 对象")
 
-        missing = [
-            field
-            for field in ("experiment_id", "sample_id", "group", "repeat_index")
-            if row.get(field) is None
-        ]
-
-        if missing:
-            raise IdentityConflictError(
-                f"{path} 第 {line_number} 行缺少实验身份字段 {missing}，无法判断是否重复"
-            )
+        key = validate_identity_fields(row, path, line_number)
 
         if not isinstance(row.get("success"), bool):
             raise IdentityConflictError(
                 f"{path} 第 {line_number} 行缺少布尔 success 字段，无法判断是否已完成"
             )
 
-        rows.append((line_number, row))
+        rows.append((line_number, row, key))
 
     return rows
 
@@ -858,10 +914,7 @@ def resume_state(plan, results_path):
     failures = {}
     seen = {}
 
-    for line_number, row in read_result_rows(results_path):
-        key = identity_key(
-            row["experiment_id"], row["sample_id"], row["group"], row["repeat_index"]
-        )
+    for line_number, row, key in read_result_rows(results_path):
         label = (
             f"sample={row['sample_id']} group={row['group']} "
             f"repeat={row['repeat_index']}"
