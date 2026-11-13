@@ -1179,6 +1179,18 @@ def test_plan_field_types(root, base_run):
             lambda plan: plan["sample_order"].__setitem__(0, 1),
             "sample_order",
         ),
+        # SCHEMA_VERSION = 1，而 True == 1、1.0 == 1；若不先做类型校验，
+        # 这两个篡改会通过 _expect("schema_version", 1) 的等值比较。
+        (
+            "schema_version_true",
+            lambda plan: plan.__setitem__("schema_version", True),
+            "schema_version",
+        ),
+        (
+            "schema_version_float",
+            lambda plan: plan.__setitem__("schema_version", 1.0),
+            "schema_version",
+        ),
     )
 
     for name, mutate, needle in cases:

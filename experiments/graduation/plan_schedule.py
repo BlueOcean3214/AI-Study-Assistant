@@ -300,6 +300,18 @@ def _require_str(where, field, value):
     return value
 
 
+def _check_plan_scalar_types(plan):
+    """顶层标量字段的严格类型校验，必须早于任何 _expect() 等值比较。
+
+    SCHEMA_VERSION 是整数 1，而 True == 1、1.0 == 1，若先做等值比较，
+    篡改后重算 plan_sha256 的 plan.json 就能绕过完整性要求。
+    """
+
+    _require_int("顶层字段", "schema_version", plan.get("schema_version"))
+    _require_int("顶层字段", "seed", plan.get("seed"))
+    _require_int("顶层字段", "round_count", plan.get("round_count"))
+
+
 def _check_plan_types(plan, sample_order, blocks):
     """整份计划的严格类型校验；在任何范围/顺序/身份比较之前执行。
 
@@ -308,8 +320,7 @@ def _check_plan_types(plan, sample_order, blocks):
     group / sample_id / sample_order 必须先确认是字符串。
     """
 
-    _require_int("顶层字段", "seed", plan.get("seed"))
-    _require_int("顶层字段", "round_count", plan.get("round_count"))
+    _check_plan_scalar_types(plan)
 
     for index, sample_id in enumerate(sample_order):
         _require_str(f"sample_order 第 {index} 项", "sample_order", sample_id)
@@ -363,6 +374,8 @@ def validate_plan(
         raise PlanIntegrityError(
             "plan.json 的 plan_sha256 校验失败：计划已被修改，拒绝继续"
         )
+
+    _check_plan_scalar_types(plan)
 
     _expect(plan, "schema_version", SCHEMA_VERSION)
     _expect(plan, "algorithm_version", str(algorithm_version))
