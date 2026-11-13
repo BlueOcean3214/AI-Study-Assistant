@@ -526,8 +526,11 @@ def resolve_plan(args, config):
             }
         )
 
-    # 旧版结果的任务对顺序：先 A/B/C/D 逐样本，再 B0 逐样本（B0 排在最后），
-    # 这样新增补充组不会改变已有记录的顺序，旧结果仍可逐条对照。
+    # 当前默认顺序：A/B/C/D 逐样本排完，再把 B0 排在最后
+    # （DEFAULT_GROUPS = A/B/C/D/B0，即新版默认顺序）。
+    # 注意这与 main 基线 2d9b3be 的 GROUP_SLOTS（A/B/B0/C/D）不同：
+    # 旧版把 B0 夹在 B 与 C 之间，所以结果文件里的任务对顺序已经变化，
+    # 旧结果只能按 (sample, group, repeat) 身份逐条对照，不能依赖行序。
     for sample_id in samples:
         for group in groups:
             if group != "B0":

@@ -68,8 +68,10 @@ GROUP_SLOTS = {
 
 # 默认执行矩阵仍是五个主组；补充组必须显式 --group 才进入计划。
 CORE_GROUPS = ("A", "B", "B0", "C", "D")
-# 默认矩阵的任务对顺序沿用设计文档（A→B→C→D，B0 排在每组末尾），
-# 保证结果文件里的记录顺序与旧版运行一致、可逐条对照。
+# 默认矩阵的当前顺序：A/B/C/D 逐样本，B0 排在最后（DEFAULT_GROUPS = A/B/C/D/B0）。
+# 注意：main 基线 2d9b3be 的 GROUP_SLOTS 顺序是 A/B/B0/C/D，本版与它不同
+# （B0 从 B 与 C 之间移到最后），结果文件的记录顺序也随之变化；
+# 旧结果只能按 (sample, group, repeat) 身份对照，不能依赖行序。
 DEFAULT_GROUPS = ("A", "B", "C", "D", "B0")
 SUBJECT_GROUPS = ("C-subj", "D-subj")
 SUBJECT_GROUP_SAMPLES = {"C-subj": ("S5",), "D-subj": ("S5",)}
