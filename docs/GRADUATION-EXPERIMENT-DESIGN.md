@@ -1,9 +1,10 @@
 # 毕业设计实验方案设计：长期学习记忆对学习状态评估与个性化计划生成的影响
 
 - 文档状态：**设计稿（Design Only）**，尚未执行任何实验
-- 版本：v4（2026-11-12；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
+- 版本：v4.1（2026-11-12；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
   v3 按第二轮意见修订双人盲评与统计细节口径，并按**实跑**校准 §3.2 的记忆 Gold Standard；
-  v4 按执行层落地固定 RAG 口径、B0 槽位与采样参数，见下节"版本与修改说明"）
+  v4 按执行层落地固定 RAG 口径、B0 槽位与采样参数；v4.1（2026-11-13）把 S5×C-subj / S5×D-subj /
+  S7-empty×D 补充组落到执行层，口径不变。均见下节"版本与修改说明"）
 - 基线：`main` = `53a18b3985ed9e964ca197e22b167fbb7225d878`
 - 适用系统：AI-Study-Assistant（FastAPI + SQLite + LangGraph + 可切换模型后端）
 - 撰写日期：2026-11-12
@@ -39,6 +40,32 @@
    （`tool_calls = 0`、`loop_turns = 0`、`research_final_answer = None`）。`check_grounding`
    所需的证据由合成 evidence steps 提供：注入反馈的组才有 `get_recent_feedback`，C/D 才有
    `get_learning_memory`，知识库一律不合成。
+
+### v4.1（2026-11-13，补充组落到执行层）
+
+本版只把 v4 已在 §2.4 / §4.1 登记的补充组（S5×C-subj、S5×D-subj、S7-empty×D）落到实验
+脚手架，**不改假设、统计口径与 140 / 165 / 84 / 107 等总量**，也不改 A/B/C/D/B0 的任何 Prompt：
+
+1. **主题过滤用产品真实归一化**：`build_prompts.resolve_request_subject()` 对每条历史反馈的
+   `task` 调 `memory_service.normalize_subject()`，只保留归一化键出现在当前请求文本里的主题；
+   必须恰好命中一个，否则抛 `SubjectResolutionError` 在构建 Prompt 前拒绝。过滤值就是归一化
+   输出（S5 为「概率论」），不做字符串截取、不手写相似词。
+2. **检索复用真实 Tool**：C-subj / D-subj 的长期记忆槽位改由
+   `agent_tools.get_learning_memory(subject=..., limit=5)` 取，与产品注入同一入口；
+   `check_grounding` 的 evidence 用同一份结果。S5 实际注入 2 条（按 type + subject_key 去重），
+   `limit=5` 只是上限，断言写 `== min(limit, 该主题 active 条数)`。
+3. **S7-empty 夹具**：新增 `samples/S7-empty.json`（0 条反馈、0 条计划、无长期记忆），
+   复用 `seed_fixture.seed_sample()` + `memory_service.rebuild_all()` 建库，不手写空库；
+   只允许 D 组，且必须显式 `--sample S7-empty --group D`（默认矩阵永不包含它）。
+4. **默认矩阵成员不变、顺序为新版**：默认仍是 A/B/C/D 逐样本、B0 排在最后
+   （`DEFAULT_GROUPS` = A/B/C/D/B0）；但 main 基线 `2d9b3be` 的 `GROUP_SLOTS` 是
+   A/B/B0/C/D，B0 从 B 与 C 之间移到了最后，**结果文件的行序已经变化**，
+   旧结果只能按 (sample, group, repeat) 身份逐条对照，不能依赖行序。
+   补充组只有显式 `--group`（配合 `--sample S5`）才进入计划。`GROUP_SLOTS` 新增组不会扩张
+   默认矩阵，`CORE_GROUPS` 单独给出主对照集合。
+5. **冻结基线不变**：A/B/C/D 的 28 个 Prompt SHA256 与 B0 的 S5/S7 SHA256 全部保持一致
+   （`test_graduation_experiment_runner.py` 的 `FROZEN_BASELINE_PROMPT_SHA256`，来源提交
+   `df4b938`），自审时逐条比对通过。
 
 ---
 
@@ -182,6 +209,8 @@
   （`temperature=0.7`、`top_p=1.0`、`max_tokens=2048`，五组一致，见 v4 版本说明；实际生效值
   逐请求记入 `results.jsonl`）、同一系统提示 `plan_draft_system`。
 - 生成顺序**按样本分块随机化**（同一趟实验内打乱条件顺序，用固定随机种子记录）。
+  **实现状态：待后续核实**——当前 `run_experiment.py` 按 `DEFAULT_GROUPS` 的固定顺序执行，
+  未实现块内随机化；本节只记录设计意图，未在 v4.1 增加随机化功能。
 - 每次生成记录 `prompt_sha256`（对最终 `messages` 列表做哈希），并断言：同一 (样本, 条件)
   的重跑哈希一致；不同条件之间只在设计槽位上有差异（人工抽查 1 个样本的 diff）。
 - 温度不为 0 时，重跑哈希相同但输出会不同，这是重复实验要测的部分。
@@ -644,7 +673,8 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 - **5 次重复的用途**：估计同一格的生成噪声（格内 SD / ICC），并给盲评抽样提供候选；**它不是
   5 个独立学习者**。进入检验前先聚合为该格的样本均值（连续评分）或比例（0/1 判定）。
 - 生成顺序：按样本分块，块内条件顺序随机（固定随机种子，记录在 `config.json`）；补充运行单独
-  分批，不与主实验混在一批里，避免中途改配置。
+  分批，不与主实验混在一批里，避免中途改配置。**实现状态见 §2.3：当前执行器为固定顺序，
+  块内随机化待后续核实，v4.1 未实现。**
 - **人工盲评**：从主实验每 (样本, 条件) 的 5 份中随机抽 **3** 份，共 7×4×3 = **84** 份，两位评分者
   独立评；抽签种子固定。补充运行的 23 份（S7-empty 3、B0 10、敏感性 10）只做 flag 复核。
 
@@ -805,10 +835,13 @@ m=7 才可能过线。** 具体地：
    不一致时先修夹具或报实现问题，**不许改预期来迁就**。本轮实跑的基准见 GOLD-CHECK。
 4. **构建条件**：对每个 (样本, 条件) 调 `_build_draft_user_content()` 生成 `messages`，
    计算 `prompt_sha256`，存 `prompts/<sample>/<condition>.json`（含完整 messages，便于复核）。
-5. **生成（主实验）**：按随机顺序跑 140 次，落 `runs/<run_id>.jsonl`（一行一份输出，含原始文本、
+5. **生成（主实验）**：按 §2.3 的顺序跑 140 次（当前实现为固定顺序，块内随机化待后续核实），
+   落 `runs/<run_id>.jsonl`（一行一份输出，含原始文本、
    解析后的 `answer/plan`、usage、latency、错误类型）。
 6. **生成（补充批次）**：在同一配置下另跑 25 次（S7-empty 5、B0 10、C-subj/D-subj 10），写入
-   独立的 `runs/supplement-*.jsonl`，文件名与字段带 `supplement: true`，避免与主实验混淆。
+   独立的 `--run-dir`（如 `runs/supplement-*/results.jsonl`）；每条记录带 `sample_id`、`group`
+   与 `sample_selection=explicit`，`B0` 另有 `b0_sample_override`，据此可与主实验区分，
+   不混入主实验的结果文件。
 7. **自动判定**：跑 M1–M4、Y1–Y5 与 `check_grounding`，输出 `auto_metrics.csv` 与失败清单；
    补充批次单独出一份表，不并入主表。
 8. **盲评**：生成 84 份主实验盲评包 → 两位评分者独立打分（P1/P2/P4/S2 四项；P3 仅 S1–S6；S3_flag
@@ -950,9 +983,11 @@ experiments/graduation/
   config.json                # 模型、温度、种子、阈值、REF_DATE
   samples/S1..S7.json        # 样本与 gold
   seed_fixture.py            # 建临时库、插计划/反馈
-  build_prompts.py           # 调 _build_draft_user_content 生成 messages + 哈希
-  run_generation.py          # 主实验 140 次生成、记录 JSONL
-  run_supplement.py          # 补充批次 25 次（S7-empty / B0 / C-subj / D-subj）
+  build_prompts.py           # 调 _build_draft_user_content 生成 messages + 哈希；
+                             # 自身 CLI 用 --supplementary 追加 C-subj/D-subj 与 S7-empty
+  run_experiment.py          # 统一执行器：主实验 140 次 + 补充批次 25 次；
+                             # CLI 参数为 --sample / --group / --repeats / --run-dir / --reuse / --config
+                             # （没有 --supplementary，补充组靠 --sample/--group 显式进入计划）
   check_memory.py            # M1–M4
   check_auto.py              # Y1–Y5 + check_grounding
   make_blind_pack.py         # 盲评包（主实验 84 份 + 补充 flag 23 份）

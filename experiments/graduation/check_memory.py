@@ -239,6 +239,40 @@ def verify_sample(sample, dump, db_path, config, rebuild):
         failures += 1
         reasons.append(f"存在未处理的待定证据 {dump['pendings']} 条")
 
+    # 7）Gold Standard 为空记忆集合的样本：实际记忆集合必须严格为空。
+    # 不能只判断"记录数为 0"——键集合、注入集合、pending 缓冲区与事件表都要为空，
+    # 任何残留都说明空样本被历史数据污染了。
+    empty_check = None
+
+    if not expected_items:
+        detail = {
+            "memories": len(memories),
+            "distinct_keys": len(by_key),
+            "injected": len(injected),
+            "pendings": dump["pendings"],
+            "events": len(dump.get("events") or []),
+        }
+        empty_ok = (
+            detail["memories"] == 0
+            and detail["distinct_keys"] == 0
+            and detail["injected"] == 0
+            and detail["pendings"] == 0
+            and detail["events"] == 0
+        )
+        empty_check = {"ok": empty_ok, "detail": detail}
+
+        if not empty_ok:
+            failures += 1
+            reasons.append(
+                "空 Gold Standard 样本的记忆集合非空："
+                + "、".join(f"{name}={value}" for name, value in detail.items())
+                + (
+                    "（事件表残留表明空样本曾被历史数据污染）"
+                    if detail["events"] != 0
+                    else ""
+                )
+            )
+
     return {
         "sample_id": sample_id,
         "db_path": str(db_path),
@@ -257,6 +291,7 @@ def verify_sample(sample, dump, db_path, config, rebuild):
         "must_not_exist": missing_checked,
         "injected": sorted(injected),
         "pendings": dump["pendings"],
+        "empty_check": empty_check,
         "failure_count": failures,
         "reasons": reasons,
     }
@@ -303,6 +338,18 @@ def render_report(results, config):
         lines.append(f"- 数据库：`{item['db_path']}`")
         lines.append(f"- 待定证据（pendings）：{item['pendings']}")
         lines.append(f"- 核验失败项：{item['failure_count']}")
+
+        if item.get("empty_check") is not None:
+            check = item["empty_check"]
+            detail = check["detail"]
+            lines.append(
+                "- 空记忆集合严格性："
+                + ("通过" if check["ok"] else "失败")
+                + "（"
+                + "、".join(f"{name}={value}" for name, value in detail.items())
+                + "）"
+            )
+
         lines.append("")
 
         if item["failure_count"] == 0:

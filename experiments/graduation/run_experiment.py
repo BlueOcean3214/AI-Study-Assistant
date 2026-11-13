@@ -244,53 +244,302 @@ def evidence_steps(group, inputs):
         )
 
     if slots["memory"]:
+        if slots.get("memory_scope") == "subject":
+            # 补充组：evidence 必须与真正注入 Prompt 的是同一次主题过滤调用，
+            # 并把 subject / limit 原样记进 arguments，便于事后复算。
+            tool_result = inputs["subject_memory_tool"]
+            arguments = {
+                "subject": inputs["subject_filter"],
+                "limit": int(inputs["memory_limit"]),
+            }
+        else:
+            tool_result = inputs["memory_tool"]
+            arguments = {}
+
         steps.append(
             {
                 "type": "tool_call",
                 "tool": "get_learning_memory",
-                "arguments": {},
-                "ok": True,
-                "error_type": None,
-                "result": inputs["memory_tool"],
+                "arguments": arguments,
+                "ok": bool(tool_result.get("ok")),
+                "error_type": tool_result.get("error_type"),
+                "result": tool_result,
             }
         )
 
     return steps
 
 
+class PreflightError(RuntimeError):
+    """输入预检失败；必须在任何模型请求之前抛出（fail-closed）。"""
+
+
+def preflight_sample(
+    sample_id,
+    groups,
+    inputs,
+    api,
+    db_path,
+    config,
+    subject_count=None,
+):
+    """当前样本所有待执行组在第一次模型调用之前的输入预检（fail-closed）。
+
+    只对补充组加硬性规则，不改 A/B/C/D 的既有语义：
+
+    - C-subj / D-subj：主题过滤值非空、主题记忆 Tool 成功、条数自洽且非空、
+      每条记忆都属于当前主题、与库内 active 行数一致、Prompt 真的带记忆区块、
+      evidence 用的是同一次调用与同一组参数；
+    - S7-empty 的 D：记忆 Tool 成功但严格 0 条、Prompt 不得出现记忆区块、
+      evidence 记录这次成功的空结果。
+
+    任何一项失败抛 PreflightError；调用方必须据此停止生成，
+    不得把无记忆结果记作 C-subj/D-subj。
+    """
+
+    groups = list(groups)
+    checks = []
+    problems = []
+
+    def record(name, ok, detail=""):
+        checks.append((name, bool(ok), detail))
+
+        if not ok:
+            problems.append(f"{name}（{detail}）")
+
+    def memory_step(group):
+        steps = [
+            step
+            for step in evidence_steps(group, inputs)
+            if step["tool"] == "get_learning_memory"
+        ]
+
+        return steps[0] if len(steps) == 1 else None
+
+    contents = {
+        group: build_prompts.build_group_content(group, inputs, api) for group in groups
+    }
+
+    memory_service = api.get("memory_service")
+
+    def normalized_subject_of(memory):
+        """记忆里存的是原始任务文本；用产品真实 normalize_subject() 归一再比对。"""
+
+        subject_text = memory.get("subject") if isinstance(memory, dict) else None
+
+        if memory_service is None:
+            return subject_text
+
+        key, _label = memory_service.normalize_subject(subject_text or "")
+
+        return key
+
+    for group in groups:
+        slots = build_prompts.GROUP_SLOTS[group]
+        content = contents[group]
+        has_block = build_prompts.MEMORY_HEADER in content
+        step = memory_step(group)
+
+        if slots.get("memory_scope") == "subject":
+            tool = inputs.get("subject_memory_tool")
+            result = inputs.get("subject_memory_result") or {}
+            subject_key = inputs.get("subject_filter")
+            memories = list(result.get("memories") or [])
+            count = result.get("count")
+            expected = (
+                subject_count(subject_key)
+                if subject_count is not None
+                else build_prompts.active_subject_count(db_path, subject_key)
+            )
+
+            record(
+                f"{group}·主题过滤值非空",
+                bool(subject_key),
+                f"subject={subject_key!r}",
+            )
+            record(
+                f"{group}·主题记忆 Tool 成功",
+                isinstance(tool, dict) and tool.get("ok") is True,
+                f"tool={type(tool).__name__} ok={tool.get('ok') if isinstance(tool, dict) else None}",
+            )
+            record(
+                f"{group}·Tool 条数自洽",
+                isinstance(tool, dict)
+                and tool.get("count") == len(tool.get("memories") or []),
+                f"count={tool.get('count') if isinstance(tool, dict) else None} "
+                f"memories={len(tool.get('memories') or []) if isinstance(tool, dict) else 0}",
+            )
+            record(
+                f"{group}·记忆结果与 Tool 一致",
+                isinstance(tool, dict)
+                and tool.get("count") == count
+                and count == len(memories),
+                f"tool={tool.get('count') if isinstance(tool, dict) else None} "
+                f"result={count} memories={len(memories)}",
+            )
+            record(
+                f"{group}·主题记忆非空",
+                isinstance(count, int) and count > 0 and bool(memories),
+                f"count={count}",
+            )
+            record(
+                f"{group}·每条记忆都属于当前主题",
+                bool(memories)
+                and subject_key is not None
+                and all(
+                    normalized_subject_of(item) == subject_key for item in memories
+                ),
+                f"subjects={sorted({str(normalized_subject_of(item)) for item in memories})}",
+            )
+            record(
+                f"{group}·记忆条数与库内 active 一致",
+                isinstance(count, int) and count == expected and count > 0,
+                f"tool={count} db={expected}",
+            )
+            record(
+                f"{group}·Prompt 含主题记忆区块",
+                has_block and content.count(build_prompts.MEMORY_HEADER) == 1,
+                f"blocks={content.count(build_prompts.MEMORY_HEADER)}",
+            )
+            record(
+                f"{group}·evidence 用同一次主题 Tool",
+                step is not None and step.get("result") is tool and step.get("ok") is True,
+                f"step={'有' if step is not None else '缺失'}",
+            )
+            record(
+                f"{group}·evidence 参数一致",
+                step is not None
+                and step.get("arguments")
+                == {"subject": subject_key, "limit": int(inputs["memory_limit"])},
+                f"arguments={step.get('arguments') if step is not None else None}",
+            )
+
+        elif sample_id == build_prompts.EMPTY_SAMPLE_ID:
+            # S7-empty：记忆槽位启用，但可注入记忆必须严格为 0（不是 Tool 失败）。
+            tool = inputs.get("memory_tool")
+            count = tool.get("count") if isinstance(tool, dict) else None
+            memories = list(tool.get("memories") or []) if isinstance(tool, dict) else None
+
+            record(
+                f"{group}·空样本记忆 Tool 成功",
+                isinstance(tool, dict) and tool.get("ok") is True,
+                f"tool={type(tool).__name__} ok={tool.get('ok') if isinstance(tool, dict) else None}",
+            )
+            record(
+                f"{group}·空样本记忆条数为 0",
+                count == 0,
+                f"count={count}",
+            )
+            record(
+                f"{group}·空样本 memories 为空",
+                memories == [],
+                f"memories={memories}",
+            )
+            record(
+                f"{group}·空样本 Prompt 无记忆区块",
+                not has_block,
+                f"blocks={content.count(build_prompts.MEMORY_HEADER)}",
+            )
+            record(
+                f"{group}·空样本 evidence 记录成功空结果",
+                step is not None
+                and step.get("ok") is True
+                and step.get("result") is tool
+                and (step.get("result") or {}).get("count") == 0,
+                f"step={'有' if step is not None else '缺失'}",
+            )
+
+    if problems:
+        raise PreflightError(
+            f"{sample_id} 输入预检失败，未发起任何模型请求：\n  - "
+            + "\n  - ".join(problems)
+        )
+
+    return checks
+
+
+class PlanError(RuntimeError):
+    """非法的 (样本, 组) 组合；必须在创建目录与调用模型之前拒绝。"""
+
+
 def resolve_plan(args, config):
     """把 CLI 展开成 (样本, 组) 任务对，B0 的默认样本范围独立于其他组。
 
-    - 不给 --sample：A/B/C/D × 全部样本，B0 × 仅 B0_DEFAULT_SAMPLES（S5、S7）；
+    - 不给 --sample：A/B/B0/C/D × 全部样本，B0 × 仅 B0_DEFAULT_SAMPLES（S5、S7）；
+      补充组 C-subj/D-subj 与 S7-empty 默认绝不进入计划。
     - --group B0：只有 B0 × S5、S7；
     - --group A --group B0：A × 全部样本、B0 × S5、S7；
+    - --group C-subj --group D-subj：只允许 S5（--sample S5 或默认样本里的 S5）；
+    - --sample S7-empty --group D：只允许 D，且必须显式同时给出样本与组；
     - 显式 --sample：样本范围由用户决定，所有选中组都在这些样本上跑；
       该覆盖逐条记进结果元数据（sample_selection / b0_sample_override）。
 
     任务对而不是「一个全局样本列表」：否则混合组时 B0 会被扩张到全部样本。
     """
 
-    groups = list(args.group or build_prompts.GROUP_SLOTS)
+    groups = list(args.group or build_prompts.DEFAULT_GROUPS)
     explicit = bool(args.sample)
     samples = list(args.sample) if explicit else seed_fixture.sample_ids(config)
 
+    for sample_id in samples:
+        try:
+            seed_fixture.load_sample(sample_id, config)
+        except FileNotFoundError as error:
+            raise PlanError(f"样本文件不存在：{sample_id}") from error
+
     plan = []
+
+    def add(sample_id, group):
+        if group not in build_prompts.GROUP_SLOTS:
+            raise PlanError(f"未知的组：{group}")
+
+        if group in build_prompts.SUBJECT_GROUPS:
+            allowed = build_prompts.SUBJECT_GROUP_SAMPLES[group]
+            if sample_id not in allowed:
+                raise PlanError(
+                    f"{group} 只允许在 {'/'.join(allowed)} 上执行，收到 {sample_id}"
+                )
+
+        if sample_id == build_prompts.EMPTY_SAMPLE_ID:
+            if group not in build_prompts.EMPTY_SAMPLE_GROUPS:
+                raise PlanError(
+                    f"{sample_id} 只允许 {'/'.join(build_prompts.EMPTY_SAMPLE_GROUPS)} 组，"
+                    f"收到 {group}；请使用 --sample {sample_id} "
+                    f"--group {' --group '.join(build_prompts.EMPTY_SAMPLE_GROUPS)}"
+                )
+
+            if not explicit:
+                # 默认矩阵永远不包含 S7-empty，避免它混进主实验
+                return
+
+        if not explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES:
+            return
+
+        plan.append(
+            {
+                "sample_id": sample_id,
+                "group": group,
+                "sample_selection": "explicit" if explicit else "default",
+                "b0_sample_override": bool(
+                    explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES
+                ),
+            }
+        )
+
+    # 当前默认顺序：A/B/C/D 逐样本排完，再把 B0 排在最后
+    # （DEFAULT_GROUPS = A/B/C/D/B0，即新版默认顺序）。
+    # 注意这与 main 基线 2d9b3be 的 GROUP_SLOTS（A/B/B0/C/D）不同：
+    # 旧版把 B0 夹在 B 与 C 之间，所以结果文件里的任务对顺序已经变化，
+    # 旧结果只能按 (sample, group, repeat) 身份逐条对照，不能依赖行序。
+    for sample_id in samples:
+        for group in groups:
+            if group != "B0":
+                add(sample_id, group)
 
     for sample_id in samples:
         for group in groups:
-            if not explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES:
-                continue
-
-            plan.append(
-                {
-                    "sample_id": sample_id,
-                    "group": group,
-                    "sample_selection": "explicit" if explicit else "default",
-                    "b0_sample_override": bool(
-                        explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES
-                    ),
-                }
-            )
+            if group == "B0":
+                add(sample_id, group)
 
     return plan
 
@@ -573,7 +822,11 @@ def main(argv=None):
     args = parse_args(argv)
     config = seed_fixture.load_config(args.config)
 
-    plan = resolve_plan(args, config)
+    try:
+        plan = resolve_plan(args, config)
+    except PlanError as error:
+        print(f"拒绝运行：{error}", file=sys.stderr)
+        return 2
 
     if not plan:
         print("没有可运行的任务（B0 只在 S5、S7 上有默认样本，请显式指定 --sample）")
@@ -659,6 +912,26 @@ def main(argv=None):
         )
         moment = seed_fixture.ref_datetime(config)
         inputs = build_prompts.collect_inputs(sample, config, api, moment)
+        groups = [task["group"] for task in tasks_by_sample[sample_id]]
+
+        # 运行前预检：当前样本所有待执行组必须在第一次模型调用之前通过，
+        # 失败即 fail-closed 停止，绝不把无记忆结果记作 C-subj/D-subj。
+        try:
+            preflight_sample(
+                sample_id,
+                groups,
+                inputs,
+                api,
+                Path(db_path),
+                config,
+            )
+        except PreflightError as error:
+            print(f"拒绝运行：{error}", file=sys.stderr)
+            print(
+                "已按 fail-closed 停止本次运行；该样本没有发起任何模型请求。",
+                file=sys.stderr,
+            )
+            return 3
 
         for task in tasks_by_sample[sample_id]:
             for repeat_index in range(args.repeats):

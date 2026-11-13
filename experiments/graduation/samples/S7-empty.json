@@ -1,0 +1,39 @@
+{
+  "sample_id": "S7-empty",
+  "title": "零历史冷启动（零反馈、零计划、零记忆）",
+  "scenario": "30 天内没有任何反馈，也没有已建立的学习计划：users/feedbacks/plans 里没有可重建的样本，rebuild_all() 之后长期记忆集合为空。当前请求与 S7 完全相同，用于观察 D 组在「记忆槽位启用但可注入记忆为 0 条」时是否仍按真实规则产出计划，而不是编造历史（探索性旁证，只跑 D 组）。",
+  "feedbacks": [],
+  "plan": null,
+  "current_user_request": "刚开始准备数据结构，明天 30 分钟，先带我入门。",
+  "simulation": {
+    "is_simulated": true,
+    "source": "docs/GRADUATION-EXPERIMENT-DESIGN.md 构造样本",
+    "note": "零反馈、零计划为构造的空样本；不是真实用户数据，也不代表任何真实用户的历史"
+  },
+  "gold_standard": {
+    "simulation": true,
+    "memories": [],
+    "must_not_exist": [
+      {
+        "memory_type": "difficulty",
+        "subject_key": "*",
+        "why": "没有任何反馈行，不可能生成难度记忆"
+      },
+      {
+        "memory_type": "task_topic",
+        "subject_key": "*",
+        "why": "没有任何反馈行，不可能生成主题记忆"
+      },
+      {
+        "memory_type": "task_performance",
+        "subject_key": "*",
+        "why": "没有任何反馈行，不可能生成表现记忆"
+      },
+      {
+        "memory_type": "time_pattern",
+        "subject_key": "*",
+        "why": "没有计划行也没有反馈，缺少时间估计基准"
+      }
+    ]
+  }
+}
