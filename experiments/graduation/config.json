@@ -14,10 +14,18 @@
     "top_p": 1.0,
     "max_tokens": 2048
   },
+  "randomization": {
+    "seed": 20261113,
+    "scheme": "five_round_randomized_block_v1",
+    "algorithm_version": "sha256-block-order-v1",
+    "block_unit": "sample",
+    "round_count": 5
+  },
   "notes": [
     "ref_date 固定，所有历史时间戳 = ref_date + offset_days，不受本机时钟影响。",
-    "groups 的顺序即设计文档 §2.2 的 A/B/B0/C/D；B0 只在 S5、S7 上跑探索性对照，不参与主假设。",
+    "groups 仅描述性列出五组（A/B/B0/C/D），执行器实际读 build_prompts.DEFAULT_GROUPS（A/B/C/D/B0）；B0 是 legacy 探索组，已有 10 份结果，不进入五轮计划、不重跑。",
     "knowledge_results 固定为空列表（本实验不考察 RAG），各组共用同一份，避免混淆变量。",
-    "sampling 为正式实验的固定采样参数；A/B/B0/C/D 必须完全一致，实际值会逐条写进结果 JSONL。"
+    "sampling 为正式实验的固定采样参数；A/B/C/D 必须完全一致，实际值会逐条写进结果 JSONL。",
+    "randomization 是五轮随机区组调度参数：seed 必须在正式实验开跑前人工确认并冻结，一旦有结果就不许再改（改了 plan.json 校验会失败，续跑会被拒绝）。"
   ]
 }

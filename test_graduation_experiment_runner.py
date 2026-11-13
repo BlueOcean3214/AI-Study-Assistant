@@ -32,6 +32,7 @@ for path in (str(HERE), str(GRADUATION_DIR)):
 import llm_client  # noqa: E402
 import seed_fixture  # noqa: E402
 import build_prompts  # noqa: E402
+import plan_schedule  # noqa: E402
 import run_experiment  # noqa: E402
 
 PASSED = 0
@@ -221,8 +222,15 @@ FROZEN_BASELINE_PROMPT_SHA256 = {
 
 def test_cli_defaults():
     args = run_experiment.parse_args([])
+    config = seed_fixture.load_config()
+    settings = run_experiment.randomization_settings(config)
 
-    check("CLI 默认 repeats=1", args.repeats == 1, args.repeats)
+    check("CLI 默认 repeats 为 None（轮次取 config）", args.repeats is None, args.repeats)
+    check(
+        "config.randomization.round_count 默认 5",
+        settings["round_count"] == 5,
+        settings,
+    )
     check("CLI 默认 sample/group 为 None", args.sample is None and args.group is None)
     check("CLI 默认不 reuse", args.reuse is False)
 
@@ -399,6 +407,12 @@ def test_main_dispatch_respects_plan(run_dir):
             "repeat_index": kwargs["repeat_index"],
             "sample_selection": kwargs["sample_selection"],
             "b0_sample_override": kwargs["b0_sample_override"],
+            "plan_seq": kwargs.get("plan_seq"),
+            "round_index": kwargs.get("round_index"),
+            "seed": kwargs.get("seed"),
+            "scheme": kwargs.get("scheme"),
+            "algorithm_version": kwargs.get("algorithm_version"),
+            "plan_sha256": kwargs.get("plan_sha256"),
             "raw_output": None,
             "raw_outputs": [],
             "success": True,
@@ -434,36 +448,61 @@ def test_main_dispatch_respects_plan(run_dir):
         run_experiment.run_one = originals["run_one"]
         run_experiment.preflight_sample = originals["preflight"]
 
-    # main 按样本分块执行（同一实验库只隔离/建一次），所以 B0 跟随所属样本，
-    # 与 resolve_plan 返回的"B0 排最后"顺序不同，但任务对集合相同。
+    # 执行顺序完全由 plan.json 决定：sample 区块 → 轮次 → 组（plan_seq 升序）。
+    plan = plan_schedule.load_plan(target / plan_schedule.PLAN_NAME)
     expected = [
-        (sample_id, group, 0)
-        for sample_id in samples
-        for group in default_group_order()
-        if group != "B0" or sample_id in run_experiment.B0_DEFAULT_SAMPLES
+        (block["sample_id"], task["group"], task["repeat_index"])
+        for block in plan["blocks"]
+        for task in block["tasks"]
     ]
 
     check("默认运行 exit code 0", code == 0, code)
-    check("main 实际分发的任务对与设计一致", dispatched == expected, dispatched)
+    check("执行顺序 == plan.json 的 plan_seq 顺序", dispatched == expected, dispatched[:5])
+    check("默认计划共 140 个任务（7 样本 × 20）", len(expected) == 140, len(expected))
     check(
-        "main 实际分发时 B0 只在 S5/S7",
-        [(s, g) for s, g, _ in dispatched if g == "B0"] == [("S5", "B0"), ("S7", "B0")],
-        dispatched,
+        "每个样本恰好 20 个任务",
+        all(len(block["tasks"]) == 20 for block in plan["blocks"]),
+        [len(block["tasks"]) for block in plan["blocks"]],
+    )
+    check(
+        "每个样本每轮 A/B/C/D 各一次",
+        all(
+            sorted(
+                task["group"]
+                for task in block["tasks"]
+                if task["round_index"] == round_index
+            )
+            == ["A", "B", "C", "D"]
+            for block in plan["blocks"]
+            for round_index in range(5)
+        ),
+    )
+    check(
+        "repeat_index == round_index",
+        all(task["repeat_index"] == task["round_index"] for block in plan["blocks"] for task in block["tasks"]),
+    )
+    check(
+        "B0 不进入五轮计划（legacy 不重跑）",
+        all(task["group"] != "B0" for block in plan["blocks"] for task in block["tasks"]),
+        [block["sample_id"] for block in plan["blocks"]],
+    )
+    check(
+        "同一计划里每个样本的任务连续执行完再进下一个样本",
+        [sample_id for sample_id, _, _ in dispatched]
+        == [block["sample_id"] for block in plan["blocks"] for _ in block["tasks"]],
     )
 
     expected_preflight = [
-        (
-            sample_id,
-            [
-                group
-                for group in default_group_order()
-                if group != "B0" or sample_id in run_experiment.B0_DEFAULT_SAMPLES
-            ],
-        )
-        for sample_id in samples
+        (block["sample_id"], sorted({task["group"] for task in block["tasks"]}))
+        for block in plan["blocks"]
     ]
 
-    check("每个样本在模型调用前都做了预检", preflighted == expected_preflight, preflighted)
+    check(
+        "每个样本在模型调用前都做了预检（只含待执行组）",
+        [(sample_id, sorted(groups)) for sample_id, groups in preflighted]
+        == expected_preflight,
+        preflighted,
+    )
 
     first_run = {}
 
@@ -481,18 +520,24 @@ def test_main_dispatch_respects_plan(run_dir):
     )
 
     lines = (target / "results.jsonl").read_text(encoding="utf-8").splitlines()
-    check("默认运行写入 30 条结果", len(lines) == 30, len(lines))
+    rows = [json.loads(line) for line in lines]
+
+    check("默认运行写入 140 条结果", len(lines) == 140, len(lines))
+    expected_seq = [task["plan_seq"] for block in plan["blocks"] for task in block["tasks"]]
+
     check(
-        "结果文件里 B0 只出现在 S5/S7",
-        sorted(
-            {json.loads(line)["sample_id"] for line in lines if json.loads(line)["group"] == "B0"}
-        )
-        == ["S5", "S7"],
-        lines[:1],
+        "结果 plan_seq 与计划一致",
+        [row.get("plan_seq") for row in rows] == expected_seq,
+        ([row.get("plan_seq") for row in rows][:6], expected_seq[:6]),
+    )
+    check(
+        "结果文件里没有 B0 记录",
+        all(row["group"] != "B0" for row in rows),
+        sorted({row["group"] for row in rows}),
     )
     check(
         "默认运行结果是 default 选择",
-        all(json.loads(line)["sample_selection"] == "default" for line in lines),
+        all(row["sample_selection"] == "default" for row in rows),
     )
 
 
@@ -1040,7 +1085,7 @@ def test_main_aborts_before_model_calls(run_dir):
     try:
         try:
             run_experiment.main(
-                ["--sample", "S2", "--group", "B0", "--run-dir", str(target)]
+                ["--sample", "S2", "--group", "A", "--run-dir", str(target)]
             )
         except RuntimeError as error:
             raised = error
@@ -1129,7 +1174,7 @@ def test_duplicate_identity_guard(run_dir, config):
     existing = {
         "experiment_id": experiment_id,
         "sample_id": "S5",
-        "group": "B0",
+        "group": "A",
         "repeat_index": 0,
         "success": True,
         "raw_output": None,
@@ -1161,6 +1206,13 @@ def test_duplicate_identity_guard(run_dir, config):
     def fake_run_one(**kwargs):
         run_calls.append(kwargs)
         return {
+            "experiment_id": kwargs["experiment_id"],
+            "sample_id": kwargs["sample_id"],
+            "group": kwargs["group"],
+            "repeat_index": kwargs["repeat_index"],
+            "plan_seq": kwargs.get("plan_seq"),
+            "round_index": kwargs.get("round_index"),
+            "plan_sha256": kwargs.get("plan_sha256"),
             "success": True,
             "request_count": 0,
             "corrections_used": 0,
@@ -1186,7 +1238,7 @@ def test_duplicate_identity_guard(run_dir, config):
     try:
         with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(stdout):
             code = run_experiment.main(
-                ["--sample", "S5", "--group", "B0", "--run-dir", str(target)]
+                ["--sample", "S5", "--group", "A", "--run-dir", str(target)]
             )
 
         check("重复身份：exit code 4", code == 4, code)
@@ -1195,29 +1247,73 @@ def test_duplicate_identity_guard(run_dir, config):
             isolate_calls == [] and run_calls == [] and chat_calls == [],
             (len(isolate_calls), len(run_calls), len(chat_calls)),
         )
-        check("重复身份：不覆盖、不追加已有结果", results_path.read_bytes() == before_bytes)
-        check("重复身份：错误信息建议换 --run-dir", "--run-dir" in stderr.getvalue(), stderr.getvalue())
-        check("重复身份：提示里点名冲突身份", "S5" in stderr.getvalue() and "B0" in stderr.getvalue(), stderr.getvalue())
-
-        # 不同 repeat_index 不算冲突，不能被误杀
-        results_path.write_text(
-            json.dumps({**existing, "repeat_index": 1}, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        check("legacy：不覆盖、不追加已有结果", results_path.read_bytes() == before_bytes)
+        check("legacy：错误信息建议换 --run-dir", "--run-dir" in stderr.getvalue(), stderr.getvalue())
+        check(
+            "legacy：提示说明缺 plan.json",
+            "plan.json" in stderr.getvalue() and "legacy" in stderr.getvalue(),
+            stderr.getvalue(),
         )
+
+        # 续跑：已完成任务跳过，不重复追加、不再发请求
+        resume_dir = Path(run_dir) / "resume_skip"
+        resume_args = [
+            "--sample", "S1", "--group", "A", "--repeats", "1",
+            "--run-dir", str(resume_dir),
+        ]
         run_calls.clear()
         isolate_calls.clear()
-        stdout = io.StringIO()
+        chat_calls.clear()
 
-        with contextlib.redirect_stdout(stdout):
-            code = run_experiment.main(
-                ["--sample", "S5", "--group", "B0", "--repeats", "1", "--run-dir", str(target)]
-            )
+        with contextlib.redirect_stdout(io.StringIO()):
+            first = run_experiment.main(resume_args)
 
-        lines = results_path.read_text(encoding="utf-8").splitlines()
+        resume_results = resume_dir / "results.jsonl"
 
-        check("不同 repeat_index 不误杀（exit 0）", code == 0, code)
-        check("不同 repeat_index 正常跑 1 个任务", len(run_calls) == 1, len(run_calls))
-        check("不同 repeat_index 追加成 2 行", len(lines) == 2, len(lines))
+        check("续跑：首跑 exit 0", first == 0, first)
+        check("续跑：首跑写入 1 条结果", len(resume_results.read_text(encoding="utf-8").splitlines()) == 1)
+        check("续跑：首跑生成 plan.json", (resume_dir / plan_schedule.PLAN_NAME).is_file())
+
+        run_calls.clear()
+        isolate_calls.clear()
+        chat_calls.clear()
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            second = run_experiment.main(resume_args)
+
+        check(
+            "续跑：已完成任务全部跳过（exit 0、0 请求）",
+            second == 0 and run_calls == [] and isolate_calls == [] and chat_calls == [],
+            (second, len(run_calls), len(isolate_calls), len(chat_calls)),
+        )
+        check(
+            "续跑：不重复追加结果",
+            len(resume_results.read_text(encoding="utf-8").splitlines()) == 1,
+        )
+
+        # 计划被篡改（seed 变）→ fail-closed，0 请求
+        plan_path = resume_dir / plan_schedule.PLAN_NAME
+        tampered = json.loads(plan_path.read_text(encoding="utf-8"))
+        tampered["seed"] = int(tampered["seed"]) + 1
+        plan_path.write_text(
+            json.dumps(tampered, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        run_calls.clear()
+        isolate_calls.clear()
+        chat_calls.clear()
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr), contextlib.redirect_stdout(io.StringIO()):
+            code = run_experiment.main(resume_args)
+
+        check("计划被篡改：exit code 4", code == 4, code)
+        check(
+            "计划被篡改：0 请求、0 隔离",
+            run_calls == [] and isolate_calls == [] and chat_calls == [],
+            (len(run_calls), len(isolate_calls), len(chat_calls)),
+        )
 
         # 结果文件损坏时 fail-closed，同样不发请求
         bad_dir = Path(run_dir) / "dup_guard_bad"
@@ -1233,7 +1329,7 @@ def test_duplicate_identity_guard(run_dir, config):
 
         with contextlib.redirect_stderr(stderr):
             code = run_experiment.main(
-                ["--sample", "S5", "--group", "B0", "--run-dir", str(bad_dir)]
+                ["--sample", "S5", "--group", "A", "--run-dir", str(bad_dir)]
             )
 
         check("结果文件损坏时拒绝运行（exit 4）", code == 4, code)
