@@ -41,3 +41,6 @@ jieba.cache
 
 # 毕业设计实验执行层的运行产物（本地生成，不入库）
 experiments/graduation/runs/
+
+# 盲评私有映射目录：blind_id 与样本身份的对应关系只能本地留存，绝不入库
+experiments/graduation/blind_private/
