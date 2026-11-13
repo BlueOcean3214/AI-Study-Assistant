@@ -254,7 +254,7 @@ def plan_identities(plan):
             plan["experiment_id"],
             block["sample_id"],
             task["group"],
-            int(task["repeat_index"]),
+            task["repeat_index"],
         )
         for block in plan["blocks"]
         for task in block["tasks"]
@@ -274,6 +274,73 @@ def _expect(plan, field, expected):
             f"plan.json 的 {field} 与当前运行不一致：计划内 {actual!r}，当前 {expected!r}；"
             "拒绝重洗或覆盖已有计划，请换新的 --run-dir。"
         )
+
+
+def _require_int(where, field, value):
+    """整数类型校验：bool 是 int 的子类，必须单独拒绝，不能用 == 顶替。"""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise PlanIntegrityError(
+            f"plan.json 的 {where} 的 {field} 类型不正确：{value!r}"
+            f"（{type(value).__name__}），必须是整数（且不能是 bool）；"
+            "拒绝自动类型转换，请换新的 --run-dir。"
+        )
+
+    return value
+
+
+def _require_str(where, field, value):
+    if not isinstance(value, str):
+        raise PlanIntegrityError(
+            f"plan.json 的 {where} 的 {field} 类型不正确：{value!r}"
+            f"（{type(value).__name__}），必须是字符串；"
+            "拒绝自动类型转换，请换新的 --run-dir。"
+        )
+
+    return value
+
+
+def _check_plan_types(plan, sample_order, blocks):
+    """整份计划的严格类型校验；在任何范围/顺序/身份比较之前执行。
+
+    Python 里 True == 1、False == 0，单纯的值比较无法识别 bool 冒充整数，
+    因此 plan_seq / round_index / repeat_index 必须先确认是 int 且不是 bool，
+    group / sample_id / sample_order 必须先确认是字符串。
+    """
+
+    _require_int("顶层字段", "seed", plan.get("seed"))
+    _require_int("顶层字段", "round_count", plan.get("round_count"))
+
+    for index, sample_id in enumerate(sample_order):
+        _require_str(f"sample_order 第 {index} 项", "sample_order", sample_id)
+
+    for block_index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            raise PlanIntegrityError(
+                f"plan.json 的 blocks 第 {block_index} 项必须是 JSON 对象，"
+                f"收到 {type(block).__name__}"
+            )
+
+        _require_str(f"blocks 第 {block_index} 项", "sample_id", block.get("sample_id"))
+        tasks = block.get("tasks")
+
+        if not isinstance(tasks, list):
+            raise PlanIntegrityError(
+                f"plan.json 的 {block.get('sample_id')} 区块缺少 tasks"
+            )
+
+        for task_index, task in enumerate(tasks):
+            where = f"{block.get('sample_id')} 第 {task_index} 个任务"
+
+            if not isinstance(task, dict):
+                raise PlanIntegrityError(
+                    f"plan.json 的 {where} 必须是 JSON 对象，收到 {type(task).__name__}"
+                )
+
+            _require_int(where, "plan_seq", task.get("plan_seq"))
+            _require_int(where, "round_index", task.get("round_index"))
+            _require_int(where, "repeat_index", task.get("repeat_index"))
+            _require_str(where, "group", task.get("group"))
 
 
 def validate_plan(
@@ -315,6 +382,10 @@ def validate_plan(
 
     if not isinstance(sample_order, list) or not isinstance(blocks, list):
         raise PlanIntegrityError("plan.json 缺少 sample_order / blocks")
+
+    # 先做严格类型校验，再做任何范围、顺序、身份比较：True == 1 会让
+    # 普通 == 比较漏掉 bool 冒充整数，sorted() 混类型还会直接 TypeError。
+    _check_plan_types(plan, sample_order, blocks)
 
     if sorted(sample_order) != sorted(expected_samples):
         raise PlanIntegrityError(
@@ -378,7 +449,7 @@ def validate_plan(
                     f"plan.json 的 kind 与组不匹配：{sample_id}/{task.get('group')}"
                 )
 
-            identity = (sample_id, task.get("group"), int(task["repeat_index"]))
+            identity = (sample_id, task["group"], task["repeat_index"])
 
             if identity in seen:
                 raise PlanIntegrityError(f"plan.json 出现重复身份：{identity}")

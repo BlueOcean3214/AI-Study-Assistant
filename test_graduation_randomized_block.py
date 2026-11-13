@@ -1144,6 +1144,82 @@ def test_identity_key_strict_types():
     check("㉛ 合法身份仍为四元组", good == ("exp", "S1", "A", 3), good)
 
 
+def test_plan_field_types(root, base_run):
+    # ㉜ plan.json 字段严格类型：篡改后重算 plan_sha256（哈希自洽），仍必须拒绝。
+    # True == 1、False == 0 会让普通 == 比较漏掉 bool 冒充整数，所以这里专测类型。
+    base_plan = plan_schedule.load_plan(base_run / plan_schedule.PLAN_NAME)
+    identities = plan_schedule.plan_identities(base_plan)
+
+    check(
+        "㉜ plan_identities 保持原样四元组（无 int() 归一化）",
+        len(identities) == 5
+        and all(
+            isinstance(item[3], int) and not isinstance(item[3], bool)
+            for item in identities
+        ),
+        identities,
+    )
+
+    def set_task(plan, index, field, value):
+        plan["blocks"][0]["tasks"][index][field] = value
+
+    cases = (
+        ("plan_seq_true", lambda plan: set_task(plan, 1, "plan_seq", True), "plan_seq"),
+        ("plan_seq_false", lambda plan: set_task(plan, 0, "plan_seq", False), "plan_seq"),
+        ("round_index_true", lambda plan: set_task(plan, 1, "round_index", True), "round_index"),
+        ("repeat_index_true", lambda plan: set_task(plan, 1, "repeat_index", True), "repeat_index"),
+        ("group_int", lambda plan: set_task(plan, 0, "group", 1), "group"),
+        (
+            "sample_id_int",
+            lambda plan: plan["blocks"][0].__setitem__("sample_id", 1),
+            "sample_id",
+        ),
+        (
+            "sample_order_int",
+            lambda plan: plan["sample_order"].__setitem__(0, 1),
+            "sample_order",
+        ),
+    )
+
+    for name, mutate, needle in cases:
+        run_dir = shutil.copytree(base_run, Path(root) / f"plan_type_{name}" / base_run.name)
+        plan_path = run_dir / plan_schedule.PLAN_NAME
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        mutate(plan)
+        plan["plan_sha256"] = plan_schedule.plan_digest(plan)
+        plan_path.write_text(
+            json.dumps(plan, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+        reloaded = plan_schedule.load_plan(plan_path)
+        check(
+            f"㉜ {name} → 篡改后 plan_sha256 自洽（load_plan 通过）",
+            reloaded["plan_sha256"] == plan["plan_sha256"],
+        )
+
+        results_path = run_dir / run_experiment.RESULTS_NAME
+        before = results_path.read_bytes()
+        runner = FakeRunner()
+        code, out, err, fakes = call_main(
+            ["--sample", "S1", "--group", "A", "--run-dir", str(run_dir)], runner
+        )
+
+        check(f"㉜ {name} → exit code 4", code == 4, (code, out[-200:], err[-300:]))
+        check(f"㉜ {name} → 0 次 run_one", runner.calls == [], len(runner.calls))
+        check(
+            f"㉜ {name} → 0 次 isolate_database",
+            fakes.isolate_calls == [],
+            fakes.isolate_calls,
+        )
+        check(f"㉜ {name} → results.jsonl 字节不变", results_path.read_bytes() == before)
+        check(
+            f"㉜ {name} → stderr 指出该字段类型不正确",
+            needle in err and "类型不正确" in err,
+            err[-400:],
+        )
+
+
 # ---------------------------------------------------------------------------
 # E. 补充实验与 legacy B0
 # ---------------------------------------------------------------------------
@@ -1288,6 +1364,7 @@ def _run_all():
         test_duplicate_identities(root, base_run)
         test_identity_field_types(root, base_run)
         test_identity_key_strict_types()
+        test_plan_field_types(root, base_run)
         test_supplementary_runs(root)
         test_b0_rejected_before_run_dir(root)
     finally:
