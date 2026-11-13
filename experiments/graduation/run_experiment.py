@@ -833,53 +833,102 @@ def read_result_rows(results_path):
 def resume_state(plan, results_path):
     """按 plan.json 校验已有结果，返回 (successes, failures)。
 
-    - 计划外身份、plan_sha256 不一致、同一身份重复成功、同一身份既有成功又有
-      失败：一律抛 IdentityConflictError（调用方在任何模型请求之前拒绝）。
+    - 计划外身份；同一身份出现第二条记录（重复成功 / 成功后失败 / 失败后成功 /
+      重复失败一律拒绝，不区分先后）；plan_seq / round_index / seed / scheme /
+      algorithm_version / plan_sha256 任一缺失、类型错误或与计划不一致：
+      一律抛 IdentityConflictError（调用方在任何模型请求之前拒绝）。
     - 失败记录原样保留在 failures，不自动重试。
     """
 
     planned = {
-        task_key(plan, sample_id, task) for sample_id, task in scheduled_tasks(plan)
+        task_key(plan, sample_id, task): (sample_id, task)
+        for sample_id, task in scheduled_tasks(plan)
     }
     digest = plan["plan_sha256"]
+    seed = plan["seed"]
+    scheme = plan["scheme"]
+    algorithm_version = plan["algorithm_version"]
+    expected_fields = (
+        ("seed", seed, int),
+        ("scheme", scheme, str),
+        ("algorithm_version", algorithm_version, str),
+        ("plan_sha256", digest, str),
+    )
     successes = set()
     failures = {}
+    seen = {}
 
     for line_number, row in read_result_rows(results_path):
         key = identity_key(
             row["experiment_id"], row["sample_id"], row["group"], row["repeat_index"]
         )
+        label = (
+            f"sample={row['sample_id']} group={row['group']} "
+            f"repeat={row['repeat_index']}"
+        )
 
         if key not in planned:
             raise IdentityConflictError(
                 f"{results_path} 第 {line_number} 行是计划外身份 "
-                f"sample={row['sample_id']} group={row['group']} "
-                f"repeat={row['repeat_index']} experiment_id={row['experiment_id']}；"
+                f"{label} experiment_id={row['experiment_id']}；"
                 "拒绝在同一 run-dir 里混入别的实验或别的计划。"
             )
 
-        if row.get("plan_sha256") != digest:
+        task = planned[key][1]
+        task_fields = (
+            ("plan_seq", task["plan_seq"], int),
+            ("round_index", task["round_index"], int),
+        ) + expected_fields
+
+        for field, expected, field_type in task_fields:
+            actual = row.get(field)
+
+            if actual is None:
+                raise IdentityConflictError(
+                    f"{results_path} 第 {line_number} 行缺少审计字段 {field}（{label}），"
+                    "无法证明该结果属于当前 plan.json，拒绝续跑。"
+                )
+
+            if field_type is int:
+                valid_type = isinstance(actual, int) and not isinstance(actual, bool)
+            else:
+                valid_type = isinstance(actual, field_type)
+
+            if not valid_type:
+                raise IdentityConflictError(
+                    f"{results_path} 第 {line_number} 行的审计字段 {field} 类型不正确"
+                    f"（{label}）：{actual!r}"
+                )
+
+            if actual != expected:
+                raise IdentityConflictError(
+                    f"{results_path} 第 {line_number} 行的审计字段 {field} 与计划不一致"
+                    f"（{label}）：plan={expected!r} results={actual!r}"
+                )
+
+        if key in seen:
+            first_line, first_success = seen[key]
+
+            if first_success and row["success"]:
+                duplicate = "重复成功"
+            elif first_success:
+                duplicate = "成功后失败"
+            elif row["success"]:
+                duplicate = "失败后成功"
+            else:
+                duplicate = "重复失败"
+
             raise IdentityConflictError(
-                f"{results_path} 第 {line_number} 行的 plan_sha256 与当前 plan.json 不一致，"
-                "拒绝续跑（计划被替换或结果来自旧计划）。"
+                f"{results_path} 第 {line_number} 行是重复身份（{duplicate}）：{label}；"
+                f"首次出现在第 {first_line} 行。同一实验身份只允许一条结果记录，"
+                "不自动重试。"
             )
 
-        if row["success"]:
-            if key in successes:
-                raise IdentityConflictError(
-                    f"{results_path} 第 {line_number} 行重复记录了同一成功身份 "
-                    f"sample={row['sample_id']} group={row['group']} "
-                    f"repeat={row['repeat_index']}。"
-                )
+        seen[key] = (line_number, row["success"])
 
+        if row["success"]:
             successes.add(key)
         else:
-            if key in successes:
-                raise IdentityConflictError(
-                    f"{results_path} 第 {line_number} 行：同一身份既有成功又有失败记录，"
-                    "无法判断应否重跑。"
-                )
-
             failures[key] = row
 
     return successes, failures

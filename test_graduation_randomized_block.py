@@ -940,7 +940,7 @@ def test_foreign_and_broken_results(root, base_run):
     # 从该 run-dir 的 plan.json 取 plan_sha256 / experiment_id 来伪造结果行
     for case_name, mutate, needle in (
         ("foreign_identity", "foreign", "计划外身份"),
-        ("duplicate_success", "duplicate", "重复记录了同一成功身份"),
+        ("duplicate_success", "duplicate", "重复身份"),
         ("invalid_json", "invalid", "不是合法 JSON"),
         ("digest_mismatch", "digest", "plan_sha256"),
     ):
@@ -978,6 +978,99 @@ def test_foreign_and_broken_results(root, base_run):
         check(f"{needle} → 0 次 isolate_database", fakes.isolate_calls == [], fakes.isolate_calls)
         check(f"{needle} → results.jsonl 字节不变", results_path.read_bytes() == before)
         check(f"{needle} → stderr 命中关键提示", needle in err, err[-400:])
+
+
+def test_resume_audit_fields(root, base_run):
+    # ㉓ 计划审计字段逐个篡改：身份与 plan_sha256 都保持正确，仍必须拒绝
+    tampered = (
+        ("plan_seq", lambda value: int(value) + 1000),
+        ("round_index", lambda value: int(value) + 1),
+        ("seed", lambda value: int(value) + 1),
+        ("scheme", lambda value: "tampered-scheme"),
+        ("algorithm_version", lambda value: "tampered-v0"),
+    )
+
+    for field, mutate in tampered:
+        run_dir = shutil.copytree(base_run, Path(root) / f"audit_{field}" / base_run.name)
+        results_path = run_dir / run_experiment.RESULTS_NAME
+        rows = read_rows(results_path)
+        rows[0][field] = mutate(rows[0][field])
+        write_rows(results_path, rows)
+        before = results_path.read_bytes()
+
+        runner = FakeRunner()
+        code, out, err, fakes = call_main(
+            ["--sample", "S1", "--group", "A", "--run-dir", str(run_dir)], runner
+        )
+
+        check(f"㉓ 篡改 {field} → exit code 4", code == 4, (code, out[-200:], err[-300:]))
+        check(f"㉓ 篡改 {field} → 0 次 run_one", runner.calls == [], len(runner.calls))
+        check(
+            f"㉓ 篡改 {field} → 0 次 isolate_database",
+            fakes.isolate_calls == [],
+            fakes.isolate_calls,
+        )
+        check(
+            f"㉓ 篡改 {field} → results.jsonl 字节不变",
+            results_path.read_bytes() == before,
+        )
+        check(
+            f"㉓ 篡改 {field} → stderr 指出该字段不一致",
+            field in err and "不一致" in err,
+            err[-400:],
+        )
+
+
+def test_duplicate_identities(root, base_run):
+    # ㉔ 同一身份出现第二条记录，四种成功/失败组合都必须拒绝
+    cases = (
+        ("success_success", True, True, "重复成功"),
+        ("success_failure", True, False, "成功后失败"),
+        ("failure_success", False, True, "失败后成功"),
+        ("failure_failure", False, False, "重复失败"),
+    )
+
+    for name, first_success, second_success, needle in cases:
+        run_dir = shutil.copytree(base_run, Path(root) / f"duplicate_{name}" / base_run.name)
+        results_path = run_dir / run_experiment.RESULTS_NAME
+        rows = read_rows(results_path)
+        first = copy.deepcopy(rows[0])
+        second = copy.deepcopy(rows[0])
+
+        for row, success in ((first, first_success), (second, second_success)):
+            row["success"] = success
+
+            if success:
+                row["error_type"] = None
+                row["error_message"] = None
+            else:
+                row["error_type"] = "mock_error"
+                row["error_message"] = "mock failure"
+
+        write_rows(results_path, [first, second])
+        before = results_path.read_bytes()
+
+        runner = FakeRunner()
+        code, out, err, fakes = call_main(
+            ["--sample", "S1", "--group", "A", "--run-dir", str(run_dir)], runner
+        )
+
+        check(f"㉔ {name} → exit code 4", code == 4, (code, out[-200:], err[-300:]))
+        check(f"㉔ {name} → 0 次 run_one", runner.calls == [], len(runner.calls))
+        check(
+            f"㉔ {name} → 0 次 isolate_database",
+            fakes.isolate_calls == [],
+            fakes.isolate_calls,
+        )
+        check(
+            f"㉔ {name} → results.jsonl 字节不变",
+            results_path.read_bytes() == before,
+        )
+        check(
+            f"㉔ {name} → stderr 指出重复身份",
+            "重复身份" in err and needle in err and "sample=S1" in err and "repeat=0" in err,
+            err[-400:],
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1090,6 +1183,10 @@ def make_base_run(root):
 def _run_all():
     global PASSED
 
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
     root = Path(tempfile.mkdtemp(prefix="graduation_randomized_block_")).resolve()
     runs_dir = GRADUATION_DIR / "runs"
     runs_before = tree_snapshot(runs_dir)
@@ -1116,6 +1213,8 @@ def _run_all():
         test_tampered_plan(root, base_run)
         test_config_change(root, config, base_run)
         test_foreign_and_broken_results(root, base_run)
+        test_resume_audit_fields(root, base_run)
+        test_duplicate_identities(root, base_run)
         test_supplementary_runs(root)
         test_b0_rejected_before_run_dir(root)
     finally:
