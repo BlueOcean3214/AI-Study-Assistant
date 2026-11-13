@@ -12,10 +12,15 @@
 - 用量记录：只用 llm_client.set_usage_recorder 装进程内 recorder，不落库
   （不为采样参数新增数据库字段/表）。
 - 结果只追加：results.jsonl 逐行 append，Prompt 文本按样本/组只写一次，
-  已存在且内容不同时拒绝覆盖；同一 run-dir 里同一实验身份（experiment_id +
-  样本 + 组 + 重复序号）已存在时，在任何模型请求之前拒绝运行。
-- 样本调度按 (样本, 组) 任务对：B0 默认只跑 S5、S7，其他组跑全部样本；
-  显式 --sample 的覆盖语义逐条记进结果（sample_selection / b0_sample_override）。
+  已存在且内容不同时拒绝覆盖。
+- 调度按五轮随机区组计划：每个 run-dir 先由 plan_schedule.build_schedule()
+  生成 plan.json（原子写），执行只读计划、不重算顺序；每个样本跑完 5 轮再进
+  下一个样本，每轮 A/B/C/D 各一次、轮内顺序确定性随机，repeat_index == round_index。
+- 断点续跑：已有成功记录的任务跳过；同一身份已有失败记录时不自动重试，
+  停止并报告等人工处理；无记录的任务按 plan_seq 继续。
+- 样本调度按 (样本, 组) 任务对：B0 默认只跑 S5、S7，但 B0 是 legacy 探索组，
+  已有 10 份结果，不进入五轮计划、不重跑；显式 --sample 的覆盖语义逐条记进
+  结果（sample_selection / b0_sample_override）。
 
 本模块不发起任何真实请求；是否真的调用模型由 CLI 使用者的环境配置决定。
 """
@@ -35,6 +40,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import build_prompts  # noqa: E402
+import plan_schedule  # noqa: E402
 import seed_fixture  # noqa: E402
 
 REAL_DB = (seed_fixture.PROJECT_ROOT / "feedback.db").resolve()
@@ -568,8 +574,19 @@ def run_one(
     b0_sample_override=False,
     draft_runner=None,
     now=None,
+    plan_seq=None,
+    round_index=None,
+    seed=None,
+    scheme=None,
+    algorithm_version=None,
+    plan_sha256=None,
 ):
-    """跑一个 (样本, 组, 重复) 并返回一条待追加的结果记录（不写文件）。"""
+    """跑一个 (样本, 组, 重复) 并返回一条待追加的结果记录（不写文件）。
+
+    plan_seq / round_index / seed / scheme / algorithm_version / plan_sha256 由
+    调度器从 plan.json 传入，只作顺序与计划审计；实验身份仍是
+    (experiment_id, sample_id, group, repeat_index)。
+    """
 
     run_dir = Path(run_dir).resolve()
     sampling = dict(sampling or DEFAULT_SAMPLING)
@@ -628,6 +645,13 @@ def run_one(
         "sample_id": sample_id,
         "group": group,
         "repeat_index": repeat_index,
+        # 计划审计字段：plan_seq 只用于顺序核对，不进入实验身份。
+        "plan_seq": plan_seq,
+        "round_index": repeat_index if round_index is None else round_index,
+        "seed": seed,
+        "scheme": scheme,
+        "algorithm_version": algorithm_version,
+        "plan_sha256": plan_sha256,
         "provider": last.get("provider"),
         "model": last.get("model"),
         "temperature": last.get("temperature", sampling.get("temperature")),
@@ -700,8 +724,8 @@ def parse_args(argv=None):
     parser.add_argument(
         "--repeats",
         type=positive_int,
-        default=1,
-        help="每组重复次数（默认 1；正式实验 5）",
+        default=None,
+        help="显式覆盖轮次数（默认取 config.randomization.round_count=5）",
     )
     parser.add_argument("--run-dir", help="结果目录；默认 runs/<ref>-<UTC 时间戳>")
     parser.add_argument(
@@ -732,22 +756,105 @@ def make_experiment_id(config, run_dir):
 
 
 class IdentityConflictError(RuntimeError):
-    """已有结果无法解析，或本次计划与已有实验身份冲突。"""
+    """已有结果无法解析，或与当前计划不一致（计划外身份、重复成功等）。"""
+
+
+IDENTITY_FIELD_TYPES = (
+    ("experiment_id", str),
+    ("sample_id", str),
+    ("group", str),
+    ("repeat_index", int),
+)
 
 
 def identity_key(experiment_id, sample_id, group, repeat_index):
-    return (str(experiment_id), str(sample_id), str(group), int(repeat_index))
+    """实验身份仍是四元组；plan_seq / round_index 只作顺序审计。
+
+    这里不做 str()/int() 归一化：`int(True) == 1`、`int("1") == 1` 这类自动
+    转换会把非法的 JSON 类型静默变成合法身份，因此只接受严格类型的值。
+    """
+
+    for field, value in (
+        ("experiment_id", experiment_id),
+        ("sample_id", sample_id),
+        ("group", group),
+    ):
+        if not isinstance(value, str):
+            raise IdentityConflictError(
+                f"实验身份字段 {field} 必须是字符串：{value!r}"
+                f"（{type(value).__name__}）"
+            )
+
+    if isinstance(repeat_index, bool) or not isinstance(repeat_index, int):
+        raise IdentityConflictError(
+            "实验身份字段 repeat_index 必须是整数（且不能是 bool）："
+            f"{repeat_index!r}（{type(repeat_index).__name__}）"
+        )
+
+    return (experiment_id, sample_id, group, repeat_index)
 
 
-def read_existing_identities(results_path):
-    """读取已有 results.jsonl 的 (experiment_id, sample_id, group, repeat_index)。"""
+def validate_identity_fields(row, path, line_number):
+    """对 results.jsonl 的原始身份字段做严格类型校验，返回实验身份键。
+
+    - experiment_id / sample_id / group：必须是字符串。
+    - repeat_index：必须是整数，bool 不算（`True` 不能当成 1）。
+    任何字段缺失或类型不符都抛出 IdentityConflictError，绝不自动转换。
+    """
+
+    for field, field_type in IDENTITY_FIELD_TYPES:
+        if field not in row:
+            raise IdentityConflictError(
+                f"{path} 第 {line_number} 行缺少实验身份字段 {field}，"
+                "无法判断是否重复身份，拒绝续跑。"
+            )
+
+        value = row[field]
+
+        if field_type is int:
+            valid = isinstance(value, int) and not isinstance(value, bool)
+            expected = "整数（且不能是 bool）"
+        else:
+            valid = isinstance(value, field_type)
+            expected = "字符串"
+
+        if not valid:
+            raise IdentityConflictError(
+                f"{path} 第 {line_number} 行的实验身份字段 {field} 类型不正确："
+                f"{value!r}（{type(value).__name__}），必须为{expected}；"
+                "拒绝自动类型转换，拒绝续跑。"
+            )
+
+    return identity_key(
+        row["experiment_id"], row["sample_id"], row["group"], row["repeat_index"]
+    )
+
+
+def scheduled_tasks(plan):
+    """按 plan_seq 顺序展开 [(sample_id, task)]，执行器只读这份顺序。"""
+
+    return [
+        (block["sample_id"], task)
+        for block in plan["blocks"]
+        for task in block["tasks"]
+    ]
+
+
+def task_key(plan, sample_id, task):
+    return identity_key(
+        plan["experiment_id"], sample_id, task["group"], task["repeat_index"]
+    )
+
+
+def read_result_rows(results_path):
+    """读取已有 results.jsonl，返回 [(行号, row, 身份键)]；任何非法行都 fail-closed。"""
 
     path = Path(results_path)
 
     if not path.is_file():
-        return set()
+        return []
 
-    keys = set()
+    rows = []
 
     for line_number, line in enumerate(
         path.read_text(encoding="utf-8").splitlines(), 1
@@ -764,58 +871,230 @@ def read_existing_identities(results_path):
                 f"{path} 第 {line_number} 行不是合法 JSON，拒绝在该目录继续追加：{error}"
             ) from error
 
-        missing = [
-            field
-            for field in ("experiment_id", "sample_id", "group", "repeat_index")
-            if row.get(field) is None
-        ]
+        if not isinstance(row, dict):
+            raise IdentityConflictError(f"{path} 第 {line_number} 行不是 JSON 对象")
 
-        if missing:
+        key = validate_identity_fields(row, path, line_number)
+
+        if not isinstance(row.get("success"), bool):
             raise IdentityConflictError(
-                f"{path} 第 {line_number} 行缺少实验身份字段 {missing}，无法判断是否重复"
+                f"{path} 第 {line_number} 行缺少布尔 success 字段，无法判断是否已完成"
             )
 
-        keys.add(
-            identity_key(
-                row["experiment_id"],
-                row["sample_id"],
-                row["group"],
-                row["repeat_index"],
-            )
+        rows.append((line_number, row, key))
+
+    return rows
+
+
+def resume_state(plan, results_path):
+    """按 plan.json 校验已有结果，返回 (successes, failures)。
+
+    - 计划外身份；同一身份出现第二条记录（重复成功 / 成功后失败 / 失败后成功 /
+      重复失败一律拒绝，不区分先后）；plan_seq / round_index / seed / scheme /
+      algorithm_version / plan_sha256 任一缺失、类型错误或与计划不一致：
+      一律抛 IdentityConflictError（调用方在任何模型请求之前拒绝）。
+    - 失败记录原样保留在 failures，不自动重试。
+    """
+
+    planned = {
+        task_key(plan, sample_id, task): (sample_id, task)
+        for sample_id, task in scheduled_tasks(plan)
+    }
+    digest = plan["plan_sha256"]
+    seed = plan["seed"]
+    scheme = plan["scheme"]
+    algorithm_version = plan["algorithm_version"]
+    expected_fields = (
+        ("seed", seed, int),
+        ("scheme", scheme, str),
+        ("algorithm_version", algorithm_version, str),
+        ("plan_sha256", digest, str),
+    )
+    successes = set()
+    failures = {}
+    seen = {}
+
+    for line_number, row, key in read_result_rows(results_path):
+        label = (
+            f"sample={row['sample_id']} group={row['group']} "
+            f"repeat={row['repeat_index']}"
         )
 
-    return keys
-
-
-def find_identity_conflicts(plan, experiment_id, results_path, repeats):
-    """返回与已有结果冲突的 (experiment_id, sample_id, group, repeat_index)。"""
-
-    existing = read_existing_identities(results_path)
-    conflicts = []
-
-    for task in plan:
-        for repeat_index in range(repeats):
-            key = identity_key(
-                experiment_id, task["sample_id"], task["group"], repeat_index
+        if key not in planned:
+            raise IdentityConflictError(
+                f"{results_path} 第 {line_number} 行是计划外身份 "
+                f"{label} experiment_id={row['experiment_id']}；"
+                "拒绝在同一 run-dir 里混入别的实验或别的计划。"
             )
 
-            if key in existing:
-                conflicts.append(key)
+        task = planned[key][1]
+        task_fields = (
+            ("plan_seq", task["plan_seq"], int),
+            ("round_index", task["round_index"], int),
+        ) + expected_fields
 
-    return conflicts
+        for field, expected, field_type in task_fields:
+            actual = row.get(field)
+
+            if actual is None:
+                raise IdentityConflictError(
+                    f"{results_path} 第 {line_number} 行缺少审计字段 {field}（{label}），"
+                    "无法证明该结果属于当前 plan.json，拒绝续跑。"
+                )
+
+            if field_type is int:
+                valid_type = isinstance(actual, int) and not isinstance(actual, bool)
+            else:
+                valid_type = isinstance(actual, field_type)
+
+            if not valid_type:
+                raise IdentityConflictError(
+                    f"{results_path} 第 {line_number} 行的审计字段 {field} 类型不正确"
+                    f"（{label}）：{actual!r}"
+                )
+
+            if actual != expected:
+                raise IdentityConflictError(
+                    f"{results_path} 第 {line_number} 行的审计字段 {field} 与计划不一致"
+                    f"（{label}）：plan={expected!r} results={actual!r}"
+                )
+
+        if key in seen:
+            first_line, first_success = seen[key]
+
+            if first_success and row["success"]:
+                duplicate = "重复成功"
+            elif first_success:
+                duplicate = "成功后失败"
+            elif row["success"]:
+                duplicate = "失败后成功"
+            else:
+                duplicate = "重复失败"
+
+            raise IdentityConflictError(
+                f"{results_path} 第 {line_number} 行是重复身份（{duplicate}）：{label}；"
+                f"首次出现在第 {first_line} 行。同一实验身份只允许一条结果记录，"
+                "不自动重试。"
+            )
+
+        seen[key] = (line_number, row["success"])
+
+        if row["success"]:
+            successes.add(key)
+        else:
+            failures[key] = row
+
+    return successes, failures
 
 
-def describe_plan(plan):
-    """按组汇总计划里的样本，用于运行前打印。"""
+class RandomizationError(RuntimeError):
+    """config.json 的 randomization 块缺失或非法（fail-closed）。"""
 
-    grouped = {}
 
-    for task in plan:
-        grouped.setdefault(task["group"], []).append(task["sample_id"])
+def randomization_settings(config):
+    """读取 config.randomization；缺字段或非法值一律拒绝，不猜默认值。"""
 
-    return "  ".join(
-        f"{group}={','.join(samples)}" for group, samples in grouped.items()
+    block = config.get("randomization")
+
+    if not isinstance(block, dict):
+        raise RandomizationError(
+            "config.json 缺少 randomization 块：五轮随机区组计划需要 "
+            "seed / scheme / algorithm_version / block_unit / round_count"
+        )
+
+    missing = [
+        field
+        for field in ("seed", "scheme", "algorithm_version", "block_unit", "round_count")
+        if field not in block
+    ]
+
+    if missing:
+        raise RandomizationError(f"config.json 的 randomization 块缺少字段：{missing}")
+
+    try:
+        seed = int(block["seed"])
+        round_count = int(block["round_count"])
+    except (TypeError, ValueError) as error:
+        raise RandomizationError(
+            f"randomization.seed / round_count 必须是整数：{block!r}"
+        ) from error
+
+    if round_count < 1:
+        raise RandomizationError(
+            f"randomization.round_count 必须 >= 1，收到 {round_count!r}"
+        )
+
+    if block["block_unit"] != plan_schedule.BLOCK_UNIT:
+        raise RandomizationError(
+            f"randomization.block_unit 必须是 {plan_schedule.BLOCK_UNIT!r}，"
+            f"收到 {block['block_unit']!r}"
+        )
+
+    return {
+        "seed": seed,
+        "scheme": str(block["scheme"]),
+        "algorithm_version": str(block["algorithm_version"]),
+        "round_count": round_count,
+    }
+
+
+def build_plan_schedule(base_plan, settings, rounds, experiment_id, config_hash):
+    """把 resolve_plan 的任务对展开成五轮随机区组计划。
+
+    B0 是 legacy 探索组（已有 10 份结果在 experiments/graduation/runs/），
+    不进入五轮计划、不重跑；显式 --group B0 只跑 B0 时直接拒绝。
+    """
+
+    sample_groups = {}
+    task_meta = {}
+    skipped_b0 = []
+
+    for task in base_plan:
+        if task["group"] == plan_schedule.B0_GROUP:
+            skipped_b0.append(task["sample_id"])
+            continue
+
+        sample_groups.setdefault(task["sample_id"], []).append(task["group"])
+        task_meta[(task["sample_id"], task["group"])] = {
+            "sample_selection": task["sample_selection"],
+            "b0_sample_override": task["b0_sample_override"],
+        }
+
+    if not sample_groups:
+        raise RandomizationError(
+            "拒绝运行：B0 是 legacy 探索组，已有 10 份结果，不进入五轮随机区组计划，"
+            "也不会被重跑；请显式指定 A/B/C/D（或 C-subj/D-subj、S7-empty）组合。"
+        )
+
+    schedule = plan_schedule.build_schedule(
+        experiment_id=experiment_id,
+        sample_groups=sample_groups,
+        rounds=rounds,
+        seed=settings["seed"],
+        scheme=settings["scheme"],
+        algorithm_version=settings["algorithm_version"],
+        config_hash=config_hash,
+        task_meta=task_meta,
     )
+
+    return schedule, skipped_b0
+
+
+def describe_schedule(plan):
+    """按样本区块汇总计划里的组，用于运行前打印。"""
+
+    parts = []
+
+    for block in plan["blocks"]:
+        groups = []
+
+        for task in block["tasks"]:
+            if task["group"] not in groups:
+                groups.append(task["group"])
+
+        parts.append(f"{block['sample_id']}={','.join(groups)}")
+
+    return "  ".join(parts)
 
 
 def main(argv=None):
@@ -823,14 +1102,22 @@ def main(argv=None):
     config = seed_fixture.load_config(args.config)
 
     try:
-        plan = resolve_plan(args, config)
+        base_plan = resolve_plan(args, config)
     except PlanError as error:
         print(f"拒绝运行：{error}", file=sys.stderr)
         return 2
 
-    if not plan:
+    if not base_plan:
         print("没有可运行的任务（B0 只在 S5、S7 上有默认样本，请显式指定 --sample）")
         return 2
+
+    try:
+        settings = randomization_settings(config)
+    except RandomizationError as error:
+        print(f"拒绝运行：{error}", file=sys.stderr)
+        return 2
+
+    rounds = settings["round_count"] if args.repeats is None else args.repeats
 
     run_dir = (
         Path(args.run_dir).expanduser().resolve()
@@ -838,38 +1125,123 @@ def main(argv=None):
         else default_run_dir(config)
     )
     results_path = run_dir / RESULTS_NAME
+    plan_path = run_dir / plan_schedule.PLAN_NAME
     experiment_id = make_experiment_id(config, run_dir)
+    config_hash = plan_schedule.config_sha256(config)
 
-    # 2) 重复实验身份保护：任何模型请求、任何文件写入之前先拒绝
     try:
-        conflicts = find_identity_conflicts(
-            plan, experiment_id, results_path, args.repeats
+        schedule, skipped_b0 = build_plan_schedule(
+            base_plan, settings, rounds, experiment_id, config_hash
         )
+    except RandomizationError as error:
+        print(f"拒绝运行：{error}", file=sys.stderr)
+        return 2
+
+    # 计划先于数据库隔离与任何模型请求：存在则校验，缺失则原子写一份。
+    # 有结果却没有 plan.json 的目录是 legacy（v4.1 及更早），拒绝续跑。
+    try:
+        if plan_path.is_file():
+            plan = plan_schedule.load_plan(plan_path)
+            plan_schedule.validate_plan(
+                plan,
+                experiment_id=experiment_id,
+                config_hash=config_hash,
+                seed=settings["seed"],
+                scheme=settings["scheme"],
+                algorithm_version=settings["algorithm_version"],
+                rounds=rounds,
+                sample_groups={
+                    block["sample_id"]: sorted(
+                        {task["group"] for task in block["tasks"]}
+                    )
+                    for block in schedule["blocks"]
+                },
+            )
+
+            # 计划是唯一顺序依据，但它必须与"同 seed 的确定性推导"逐项一致：
+            # 这样即使有人重写了 plan.json 并重算了 plan_sha256，也骗不过去。
+            def _task_signature(block_list):
+                return [
+                    (
+                        block["sample_id"],
+                        task["plan_seq"],
+                        task["round_index"],
+                        task["repeat_index"],
+                        task["group"],
+                        task["kind"],
+                        task["sample_selection"],
+                        task["b0_sample_override"],
+                    )
+                    for block in block_list
+                    for task in block["tasks"]
+                ]
+
+            if _task_signature(plan["blocks"]) != _task_signature(schedule["blocks"]):
+                raise plan_schedule.PlanIntegrityError(
+                    f"{plan_path} 的任务顺序与同 seed/算法版本推导出的计划不一致，"
+                    "拒绝续跑（不重洗、不覆盖）。"
+                )
+        else:
+            if results_path.is_file() and results_path.stat().st_size > 0:
+                raise plan_schedule.PlanIntegrityError(
+                    f"{run_dir} 已有 results.jsonl 但没有 plan.json（legacy 目录），"
+                    "拒绝续跑；请换新的 --run-dir，或按 docs 的 legacy 说明人工归档。"
+                )
+
+            plan_schedule.write_plan_atomic(plan_path, schedule)
+            plan = schedule
+    except (plan_schedule.PlanIntegrityError, OSError) as error:
+        print(f"拒绝运行：{error}", file=sys.stderr)
+        print("本次没有发起任何模型请求。", file=sys.stderr)
+        return 4
+
+    try:
+        successes, failures_by_key = resume_state(plan, results_path)
     except IdentityConflictError as error:
         print(f"拒绝运行：{error}", file=sys.stderr)
+        print("本次没有发起任何模型请求。", file=sys.stderr)
         return 4
 
-    if conflicts:
+    all_tasks = scheduled_tasks(plan)
+    pending = [
+        (sample_id, task)
+        for sample_id, task in all_tasks
+        if task_key(plan, sample_id, task) not in successes
+    ]
+    blocked = [
+        (sample_id, task)
+        for sample_id, task in pending
+        if task_key(plan, sample_id, task) in failures_by_key
+    ]
+
+    if blocked:
         print(
-            "拒绝运行：本次计划与已有结果身份重复 "
-            f"{len(conflicts)} 条（experiment_id={experiment_id}）。",
+            f"拒绝运行：{len(blocked)} 个任务已有失败记录，不自动重试，"
+            "请人工检查后决定是否换新的 --run-dir。",
             file=sys.stderr,
         )
 
-        for key in conflicts[:5]:
-            print(f"  sample={key[1]} group={key[2]} repeat={key[3]}", file=sys.stderr)
+        for sample_id, task in blocked[:5]:
+            row = failures_by_key[task_key(plan, sample_id, task)]
+            print(
+                f"  sample={sample_id} group={task['group']} "
+                f"repeat={task['repeat_index']} error={row.get('error_type')}",
+                file=sys.stderr,
+            )
 
-        if len(conflicts) > 5:
-            print(f"  … 另有 {len(conflicts) - 5} 条", file=sys.stderr)
+        if len(blocked) > 5:
+            print(f"  … 另有 {len(blocked) - 5} 条", file=sys.stderr)
 
+        return 1
+
+    if not pending:
+        print(f"experiment_id = {experiment_id}")
+        print(f"run_dir       = {run_dir}")
+        print(f"plan          = {plan_path.name} sha256={plan['plan_sha256'][:12]}…")
         print(
-            "同一 run-dir 里不允许重复记录同一实验身份；请改用新的 --run-dir。",
-            file=sys.stderr,
+            f"全部 {len(all_tasks)} 个任务都已有成功记录，本次不发起任何模型请求。"
         )
-
-        return 4
-
-    run_dir.mkdir(parents=True, exist_ok=True)
+        return 0
 
     sampling = dict(config.get("sampling") or DEFAULT_SAMPLING)
 
@@ -888,23 +1260,42 @@ def main(argv=None):
 
     print(f"experiment_id = {experiment_id}")
     print(f"run_dir       = {run_dir}")
-    print(f"plan          = {describe_plan(plan)}  repeats={args.repeats}")
+    print(
+        f"plan          = {describe_schedule(plan)}  "
+        f"scheme={plan['scheme']} seed={plan['seed']} "
+        f"rounds={plan['round_count']} algorithm={plan['algorithm_version']}"
+    )
+    print(
+        f"resume        = 已完成 {len(successes)} / {len(all_tasks)}，"
+        f"本次待执行 {len(pending)}"
+    )
     print(f"sampling      = {sampling}")
 
-    order = []
-    tasks_by_sample = {}
+    if skipped_b0:
+        print(
+            f"B0 legacy     = 跳过 {len(skipped_b0)} 个 B0 任务对"
+            "（既有 10 份结果保持不动，不重跑）"
+        )
 
-    for task in plan:
-        if task["sample_id"] not in tasks_by_sample:
-            tasks_by_sample[task["sample_id"]] = []
-            order.append(task["sample_id"])
+    # 4) 按计划顺序执行：sample 区块 → 轮次 → 组；只读 plan.json，不重算顺序。
+    pending_keys = {
+        task_key(plan, sample_id, task) for sample_id, task in pending
+    }
+    executed = 0
+    failed = 0
 
-        tasks_by_sample[task["sample_id"]].append(task)
+    for block in plan["blocks"]:
+        sample_id = block["sample_id"]
+        sample_tasks = [
+            task
+            for task in block["tasks"]
+            if task_key(plan, sample_id, task) in pending_keys
+        ]
 
-    failures = 0
-    total = 0
+        if not sample_tasks:
+            print(f"  {sample_id}: 全部 {len(block['tasks'])} 个任务已完成，跳过")
+            continue
 
-    for sample_id in order:
         api = build_prompts.project_api(config)
         sample = seed_fixture.load_sample(sample_id, config)
         db_path, api = build_prompts.activate_sample(
@@ -912,10 +1303,15 @@ def main(argv=None):
         )
         moment = seed_fixture.ref_datetime(config)
         inputs = build_prompts.collect_inputs(sample, config, api, moment)
-        groups = [task["group"] for task in tasks_by_sample[sample_id]]
 
-        # 运行前预检：当前样本所有待执行组必须在第一次模型调用之前通过，
-        # 失败即 fail-closed 停止，绝不把无记忆结果记作 C-subj/D-subj。
+        # 运行前预检：只覆盖本样本真正待执行的组，且发生在该样本第一次
+        # 模型调用之前；全部成功的样本根本不会走到这里。
+        groups = []
+
+        for task in sample_tasks:
+            if task["group"] not in groups:
+                groups.append(task["group"])
+
         try:
             preflight_sample(
                 sample_id,
@@ -933,42 +1329,56 @@ def main(argv=None):
             )
             return 3
 
-        for task in tasks_by_sample[sample_id]:
-            for repeat_index in range(args.repeats):
-                record = run_one(
-                    experiment_id=experiment_id,
-                    sample_id=sample_id,
-                    group=task["group"],
-                    repeat_index=repeat_index,
-                    inputs=inputs,
-                    api=api,
-                    run_dir=run_dir,
-                    recorder=recorder,
-                    sampling=sampling,
-                    sample_selection=task["sample_selection"],
-                    b0_sample_override=task["b0_sample_override"],
-                )
-                append_jsonl(results_path, record)
+        for task in sample_tasks:
+            record = run_one(
+                experiment_id=experiment_id,
+                sample_id=sample_id,
+                group=task["group"],
+                repeat_index=task["repeat_index"],
+                inputs=inputs,
+                api=api,
+                run_dir=run_dir,
+                recorder=recorder,
+                sampling=sampling,
+                sample_selection=task["sample_selection"],
+                b0_sample_override=task["b0_sample_override"],
+                plan_seq=task["plan_seq"],
+                round_index=task["round_index"],
+                seed=plan["seed"],
+                scheme=plan["scheme"],
+                algorithm_version=plan["algorithm_version"],
+                plan_sha256=plan["plan_sha256"],
+            )
+            append_jsonl(results_path, record)
 
-                total += 1
-                failures += 0 if record["success"] else 1
+            executed += 1
 
+            print(
+                f"  #{task['plan_seq']:03d} {sample_id}/{task['group']}/"
+                f"round{task['round_index']}: "
+                f"success={record['success']} "
+                f"requests={record['request_count']} "
+                f"corrections={record['corrections_used']} "
+                f"chars={record['prompt_chars']} "
+                f"db={db_path.name}"
+            )
+
+            if not record["success"]:
+                failed += 1
                 print(
-                    f"  {sample_id}/{task['group']}/#{repeat_index}: "
-                    f"success={record['success']} "
-                    f"requests={record['request_count']} "
-                    f"corrections={record['corrections_used']} "
-                    f"chars={record['prompt_chars']} "
-                    f"db={db_path.name}"
+                    f"    error: {record['error_type']} - {record['error_message']}"
                 )
-
-                if not record["success"]:
-                    print(f"    error: {record['error_type']} - {record['error_message']}")
+                print(
+                    "失败记录已保留（不自动重试）；请人工检查后用新的 --run-dir "
+                    "重跑，或修复环境后继续。",
+                    file=sys.stderr,
+                )
+                return 1
 
     print(f"results = {results_path}")
-    print(f"total={total} failures={failures}")
+    print(f"total={executed} failures={failed} skipped={len(all_tasks) - executed}")
 
-    return 0 if failures == 0 else 1
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
 # 毕业设计实验方案设计：长期学习记忆对学习状态评估与个性化计划生成的影响
 
 - 文档状态：**设计稿（Design Only）**，尚未执行任何实验
-- 版本：v4.1（2026-11-12；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
+- 版本：v4.2（2026-11-13；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
   v3 按第二轮意见修订双人盲评与统计细节口径，并按**实跑**校准 §3.2 的记忆 Gold Standard；
   v4 按执行层落地固定 RAG 口径、B0 槽位与采样参数；v4.1（2026-11-13）把 S5×C-subj / S5×D-subj /
-  S7-empty×D 补充组落到执行层，口径不变。均见下节"版本与修改说明"）
+  S7-empty×D 补充组落到执行层；v4.2（2026-11-13）把调度升级为五轮随机区组，`plan.json` 成为
+  执行顺序的唯一依据，并补断点续跑与 fail-closed 校验，口径不变。均见下节"版本与修改说明"）
 - 基线：`main` = `53a18b3985ed9e964ca197e22b167fbb7225d878`
 - 适用系统：AI-Study-Assistant（FastAPI + SQLite + LangGraph + 可切换模型后端）
 - 撰写日期：2026-11-12
@@ -62,10 +63,49 @@
    A/B/B0/C/D，B0 从 B 与 C 之间移到了最后，**结果文件的行序已经变化**，
    旧结果只能按 (sample, group, repeat) 身份逐条对照，不能依赖行序。
    补充组只有显式 `--group`（配合 `--sample S5`）才进入计划。`GROUP_SLOTS` 新增组不会扩张
-   默认矩阵，`CORE_GROUPS` 单独给出主对照集合。
+   默认矩阵，`CORE_GROUPS` 单独给出主对照集合。v4.2 起实际执行顺序由 `plan.json` 决定
+   （§5.3），默认矩阵只决定"哪些任务进计划"，不再决定行序。
 5. **冻结基线不变**：A/B/C/D 的 28 个 Prompt SHA256 与 B0 的 S5/S7 SHA256 全部保持一致
    （`test_graduation_experiment_runner.py` 的 `FROZEN_BASELINE_PROMPT_SHA256`，来源提交
    `df4b938`），自审时逐条比对通过。
+
+### v4.2（2026-11-13，五轮随机区组调度）
+
+本版只改"实验怎么调度、怎么续跑"，**不改假设、统计口径、Prompt 模板、Gold Standard、样本与
+采样参数，也不改 140 / 165 / 84 / 107 等总量**：
+
+1. **五轮随机区组**：`scheme = "five_round_randomized_block_v1"`、`block_unit = "sample"`、
+   `round_count = 5`、`seed = 20261113`，写在 `config.json` 的 `randomization` 块。每个模拟样本
+   是一个区组：先把这个样本的 5 轮全部跑完，再进入下一个样本；样本区块之间的顺序也做确定性
+   随机化。每轮 A/B/C/D 各一次（每个样本共 20 个任务），轮内顺序确定性随机；
+   `repeat_index == round_index`，取值 0..4。`seed` 必须在正式实验开跑前人工确认并冻结，
+   一旦产生结果就不许再改（改了 `plan.json` 校验失败、续跑被拒绝）。
+2. **SHA-256 确定性排序**：`algorithm_version = "sha256-block-order-v1"`。排序键 =
+   `SHA-256("seed|algorithm_version|domain|part1|part2|...")` 的十六进制，升序排序；键相同时按
+   次级键（样本名 / 组名）稳定排序。`domain` 区分 `"sample-block-order"`（样本区块顺序，
+   parts = `sample_id`）与 `"round-group-order"`（轮内组顺序，parts = `sample_id, round_index,
+   group`）。实现**不依赖 Python 全局 `random`**，也不声称 `random.Random` 的序列跨版本一致；
+   换算法必须同时改 `algorithm_version`。
+3. **`plan.json` 持久化与唯一顺序依据**：每个 run-dir 一份，执行器只读计划、不重算顺序。
+   字段、`plan_sha256` / `config_sha256` 的规范化哈希、原子写与 fail-closed 校验见 §5.3。
+   计划写入发生在数据库隔离与任何模型请求之前。
+4. **断点续跑**：已有成功记录的任务跳过（按计划顺序继续）；同一身份已有失败记录时保留原记录、
+   不自动重试、停止并报告等人工处理；运行中新出现的失败立即停止整批；有 `results.jsonl` 但没有
+   `plan.json` 的目录是 legacy（v4.1 及更早），拒绝续跑；计划外身份、同一身份重复成功、非法
+   JSON、`plan_sha256` 不一致，一律 exit non-zero 且 0 次模型请求；预检只在某样本第一条待执行
+   任务之前进行，且只针对该样本真正待执行的组。
+5. **结果行新增字段**：`plan_seq`、`round_index`、`seed`、`scheme`、`algorithm_version`、
+   `plan_sha256`；`plan_seq` 只作顺序审计，实验身份仍是
+   `(experiment_id, sample_id, group, repeat_index)`。
+6. **B0 legacy**：既有 10 份结果（`experiments/graduation/runs/` 下三个目录，来源映射见
+   `runs/B0-REPEAT-MAP.md`）保持不动，不改 JSONL、不补字段、不重跑，也不进入五轮计划；
+   显式只指定 `--group B0` 时会被拒绝并提示 legacy。
+7. **补充实验独立计划**：C-subj/D-subj 在 S5 上两组 × 5 轮 = 10 份；S7-empty × D 是单条件 5 次
+   （同样记录 `round_index` / `repeat_index` = 0..4，但它不是四条件区组，只是单条件的重复观察）。
+   两者各自使用独立 run-dir / 独立 `plan.json`，不与主实验共用。
+8. **统计边界**：样本量仍是 n=7；140 次生成 = 7 样本 × 4 组 × 5 轮，不等于 n=140；五轮是
+   "调度区组"，用来分散服务商侧随时间的漂移，不是增加样本量；随机化只降低"时间顺序"与
+   "实验条件"之间的系统性关联，不能消除服务商模型的整体版本变化（详见 §5.3 的统计边界）。
 
 ---
 
@@ -144,7 +184,8 @@
 由此带来一个**无法完全解耦**的限制：B 组已含 ①②，D 组 = B + ③。为了单独估计 ①② 的作用，
 另设探索组 **B0**（只有原始反馈行，无统计摘要、无 difficulty 硬规则）。B0 **实际调用模型生成**，
 但只覆盖 S5、S7 两个案例、各 5 次（共 10 份），**仅作描述性旁证，不参与主假设检验，也不计入
-四组对照的 140 份主数据**（计数口径见 §2.4）。
+四组对照的 140 份主数据**（计数口径见 §2.4）。这 10 份是 v4.2 之前的 legacy 结果，保持不动、
+不重跑，也不进入五轮随机区组计划（§5.3）。
 
 ---
 
@@ -200,6 +241,7 @@
   与生产"空历史新用户"的提示逐字节一致；这一点用单元断言固定。
 - **B0 是探索组，不是第五个正式对照**：它只有原始反馈行、没有统计摘要与难度硬规则，用来粗略
   估计"①②（程序统计 + 难度规则）"本身的贡献；只在 S5、S7 两个案例上生成，仅供描述性比较。
+  v4.2 起 B0 的 10 份为 legacy，保持不动，不进入五轮计划。
 - **S7-empty 是补充校验，不是第五个样本**：它只跑 D 组（5 次），用于检查"零历史时会不会编造
   记忆"，**不参与四组比较**，也不进入 H1–H5 的配对数据。
 
@@ -207,10 +249,14 @@
 
 - 同一 `user_message`、同一历史种子、同一模型与版本、同一采样参数
   （`temperature=0.7`、`top_p=1.0`、`max_tokens=2048`，五组一致，见 v4 版本说明；实际生效值
-  逐请求记入 `results.jsonl`）、同一系统提示 `plan_draft_system`。
-- 生成顺序**按样本分块随机化**（同一趟实验内打乱条件顺序，用固定随机种子记录）。
-  **实现状态：待后续核实**——当前 `run_experiment.py` 按 `DEFAULT_GROUPS` 的固定顺序执行，
-  未实现块内随机化；本节只记录设计意图，未在 v4.1 增加随机化功能。
+  逐请求记入 `results.jsonl`）、同一系统提示 `plan_draft_system`。若服务商在实验中途整体换版，
+  按 §5.3 的统计边界记录并说明，不能假装版本未变。
+- **生成顺序（v4.2 起）为五轮随机区组**：每个模拟样本是一个区组，先跑完该样本的 5 轮
+  （每轮 A/B/C/D 各一次，共 20 个任务），再进入下一个样本；样本区块顺序与轮内组顺序都由
+  SHA-256 排序键确定性随机化，`seed=20261113` 在开跑前人工确认并冻结。执行顺序只以该 run-dir
+  的 `plan.json` 为准（执行器不重算顺序），字段与校验见 §5.3。
+- 随机化的目的是把同一 (样本, 条件) 的 5 次分散到不同时间点，降低"时间顺序"与"实验条件"的
+  系统性关联；它**不增加样本量**（n 仍是 7），也不能消除服务商模型的整体版本变化（§5.3）。
 - 每次生成记录 `prompt_sha256`（对最终 `messages` 列表做哈希），并断言：同一 (样本, 条件)
   的重跑哈希一致；不同条件之间只在设计槽位上有差异（人工抽查 1 个样本的 diff）。
 - 温度不为 0 时，重跑哈希相同但输出会不同，这是重复实验要测的部分。
@@ -224,7 +270,7 @@ H1/H2 的配对数据。
 | --- | --- | --- | --- | --- | --- |
 | A/B/C/D × S1–S7 | **正式对照**，进 H1/H2/H5 | 28 | 5 | **140** | 84（每格抽 3） |
 | S7-empty（仅 D） | 补充校验（M3 / E1） | 1 | 5 | 5 | 3（只判有无，不打分） |
-| B0 探索（S5、S7） | 描述性旁证 | 2 | 5 | 10 | 10（只判 flag） |
+| B0 探索（S5、S7） | 描述性旁证（legacy，不进入五轮计划） | 2 | 5 | 10 | 10（只判 flag） |
 | C-subj / D-subj（S5） | 敏感性分析 | 2 | 5 | 10 | 10（只判 flag） |
 | **合计** | — | **33** | — | **165** | **107** |
 
@@ -240,6 +286,11 @@ H1/H2 的配对数据。
   不产生 1–5 分，也不进入 P1–P4 的均值。
 - 本表的 140 / 165 / 84 / 107 / 336 / 72 / 408 / 24 / 12 / 23 是全文唯一口径，§5.3、§6、§7、§9
   与附录 B 必须与之逐字一致；任何改动都要同步全文。
+- **B0 与五轮计划（v4.2 起）**：B0 的 10 份是 legacy 结果（三个 run-dir，来源映射见
+  `experiments/graduation/runs/B0-REPEAT-MAP.md`），保持不动——不改 `results.jsonl`、不补
+  v4.2 字段、不重跑，也不进入五轮随机区组计划；显式只指定 `--group B0` 会被拒绝并提示 legacy。
+  补充批次的 C-subj/D-subj 与 S7-empty 仍按本表数量运行，但各自使用独立 run-dir 与独立
+  `plan.json`。
 
 ### 2.5 与生产端到端的边界
 
@@ -660,23 +711,96 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 | 知识库 | 每样本预检索一次，四组复用同一结果（见 §2.2） |
 | 夹具库 | 临时 SQLite（如 `_exp_fixture.db`），**绝不写真实 `feedback.db`**（参考 `agent_eval.py` 的隔离做法） |
 | 温度与重复 | `temperature=0.7`，每 (样本, 条件) 生成 5 次 |
+| 调度与随机化 | v4.2 起：`scheme="five_round_randomized_block_v1"`、`algorithm_version="sha256-block-order-v1"`、`block_unit="sample"`、`round_count=5`、`seed=20261113`（开跑前人工确认并冻结，一有结果不得再改）；每个 run-dir 的 `plan.json` 是执行顺序唯一依据（§5.3） |
 
 ### 5.2 唯一变量
 
 只有 §2.2 矩阵中的槽位变化；`user_message`、知识结果、系统提示、模型参数全部不变。
 
-### 5.3 随机性与重复
+### 5.3 随机性与重复（v4.2：五轮随机区组调度）
 
-- **主实验生成**：每 (样本, 条件) 重复 **5 次**，7×4×5 = **140** 份。
+- **主实验生成**：每 (样本, 条件) 重复 **5 次**，7×4×5 = **140** 份。v4.2 起这 5 次就是 5 个
+  调度轮次（`round_count=5`），`repeat_index == round_index`，取值 0..4。
 - **补充生成**（不计入四组比较）：S7-empty 仅 D 组 5 份、B0（S5/S7）10 份、C-subj/D-subj（S5）
-  10 份，合计 **25** 份；生成任务总数 **165** 份（§2.4）。
+  10 份，合计 **25** 份；生成任务总数 **165** 份（§2.4）。v4.2 起 B0 的 10 份是 legacy，
+  已生成、保持不动、不重跑；新执行只跑 S7-empty 5 份 + C-subj/D-subj 10 份 = **15** 份。
 - **5 次重复的用途**：估计同一格的生成噪声（格内 SD / ICC），并给盲评抽样提供候选；**它不是
   5 个独立学习者**。进入检验前先聚合为该格的样本均值（连续评分）或比例（0/1 判定）。
-- 生成顺序：按样本分块，块内条件顺序随机（固定随机种子，记录在 `config.json`）；补充运行单独
-  分批，不与主实验混在一批里，避免中途改配置。**实现状态见 §2.3：当前执行器为固定顺序，
-  块内随机化待后续核实，v4.1 未实现。**
+- **区组单位是样本**（`block_unit="sample"`）：一个模拟样本是一个区组；先把这个样本的 5 轮全部
+  跑完，再进入下一个样本。样本区块之间的顺序也做确定性随机化。每个样本 5 轮，每轮 A/B/C/D
+  各一次（共 20 个任务），轮内顺序确定性随机；`repeat_index == round_index`，取值 0..4。
+- **确定性排序（不依赖 `random`）**：排序键 =
+  `SHA-256("seed|algorithm_version|domain|part1|part2|...")` 的十六进制，升序排序；键相同时按
+  次级键（样本名 / 组名）稳定排序。`domain` 区分用途：`"sample-block-order"`（样本区块顺序，
+  parts = `sample_id`）与 `"round-group-order"`（轮内组顺序，parts = `sample_id, round_index,
+  group`）。该实现**不依赖 Python 全局 `random`**，也不声称 `random.Random` 的序列跨版本一致；
+  换算法必须同时改 `algorithm_version`。
+- **参数与冻结**：`scheme="five_round_randomized_block_v1"`、
+  `algorithm_version="sha256-block-order-v1"`、`seed=20261113`、`block_unit="sample"`、
+  `round_count=5`，写在 `config.json` 的 `randomization` 块。**`seed` 必须在正式实验开跑前
+  人工确认并冻结；一旦产生结果就不许再改**——改了 `plan.json` 校验失败、续跑被拒绝。
+- **`plan.json` 是执行顺序的唯一依据**：每个 run-dir 一份，执行器只读计划、不重算顺序。字段为
+  `schema_version`、`algorithm_version`、`experiment_id`、`created_at`、`seed`、`scheme`、
+  `block_unit`、`round_count`、`config_sha256`、`plan_sha256`、`sample_order`，以及
+  `blocks[{sample_id, tasks[{plan_seq, round_index, repeat_index, group, kind, sample_selection,
+  b0_sample_override}]}]`。`kind ∈ {main, b0, supplementary}`。`plan_seq` 是全局连续序号
+  （0 起，按执行顺序），**只作顺序审计，不进入实验身份**；实验身份仍是
+  `(experiment_id, sample_id, group, repeat_index)`。
+- 计划文件形态（字段示意，实际 `created_at` / 哈希 / 顺序以运行时为准）：
+
+```json
+{
+  "schema_version": 1,
+  "algorithm_version": "sha256-block-order-v1",
+  "experiment_id": "…",
+  "created_at": "…",
+  "seed": 20261113,
+  "scheme": "five_round_randomized_block_v1",
+  "block_unit": "sample",
+  "round_count": 5,
+  "config_sha256": "…",
+  "plan_sha256": "…",
+  "sample_order": ["…"],
+  "blocks": [
+    {"sample_id": "…", "tasks": [
+      {"plan_seq": 0, "round_index": 0, "repeat_index": 0, "group": "…", "kind": "main",
+       "sample_selection": "default", "b0_sample_override": false}
+    ]}
+  ]
+}
+```
+
+- **哈希与校验**：`plan_sha256 = SHA-256(规范化 JSON(整份计划去掉 plan_sha256 字段))`，
+  规范化 = key 升序 + 紧凑分隔符 + UTF-8 + 不转义非 ASCII；加载时重算，任何字段被改即失败。
+  `config_sha256` = 整份 `config.json` 的同样规范化哈希。
+- **原子写**：同目录 tmp 文件 + `flush` + `fsync` + `os.replace`；写入失败则 **0 次模型请求**、
+  不留残缺文件。计划写入发生在数据库隔离与任何模型请求**之前**。已存在计划时校验
+  `experiment_id` / `config_sha256` / `seed` / `scheme` / `algorithm_version` / `round_count` /
+  任务矩阵 / `plan_sha256`（以及 `schema_version` / `block_unit`），任一不一致 **fail-closed**，
+  绝不重洗、绝不覆盖。
+- **断点续跑语义**：已有成功记录的任务跳过（按计划顺序继续）；同一身份已有失败记录时保留原记录、
+  **不自动重试**、停止并报告等人工处理；运行中新出现的失败立即停止整批。有 `results.jsonl` 但
+  没有 `plan.json` 的目录是 legacy（v4.1 及更早），**拒绝续跑**。结果里出现计划外身份、同一身份
+  重复成功、非法 JSON、`plan_sha256` 不一致，一律 exit non-zero 且 **0 次模型请求**。预检只在
+  某样本第一条待执行任务之前进行，且只针对该样本真正待执行的组；全部任务已成功的样本不再预检。
+- **B0 是 legacy 探索组**：既有 10 份结果（`experiments/graduation/runs/` 下三个目录，来源映射见
+  `runs/B0-REPEAT-MAP.md`）保持不动，不改 JSONL、不补字段、不重跑，也不进入五轮计划；显式只指定
+  `--group B0` 时会被拒绝并提示 legacy。
+- **补充实验用同一机制、各自独立计划**：C-subj/D-subj 在 S5 上两组 × 5 轮 = 10 份；S7-empty × D
+  是单条件 5 次（同样记录 `round_index` / `repeat_index` = 0..4，但它**不是四条件区组**，只是
+  单条件的重复观察）。每个补充 run-dir 有自己的 `plan.json`，不与主实验共用。
 - **人工盲评**：从主实验每 (样本, 条件) 的 5 份中随机抽 **3** 份，共 7×4×3 = **84** 份，两位评分者
   独立评；抽签种子固定。补充运行的 23 份（S7-empty 3、B0 10、敏感性 10）只做 flag 复核。
+
+**统计边界（v4.2 必须写进报告，避免把调度区组误当样本量）**
+
+1. **样本量仍是 n=7 个模拟样本**，没有变化。140 次生成 = 7 样本 × 4 组 × 5 轮，**不等于
+   n=140**；不能按 140 个独立样本计算统计功效，也不能用"重复次数多"换取更小的 p 值。
+2. 五轮是**调度区组**，用来把同一 (样本, 条件) 的 5 次分散到不同时间点，降低服务商侧随时间的
+   漂移对某一条件的系统性影响；**它不是增加样本量**，聚合与检验仍按 §5.5 先做格内聚合。
+3. 随机化只降低"时间顺序"与"实验条件"之间的**系统性关联**，**不能消除**服务商模型的整体版本
+   变化。若整体变化发生在实验中途，仍需在结果里记录（发生时间、provider / model / 版本、
+   受影响批次）并在讨论中说明，不能把跨版本差异写成记忆效应。
 
 ### 5.4 人工盲评与 LLM 辅助
 
@@ -835,21 +959,29 @@ m=7 才可能过线。** 具体地：
    不一致时先修夹具或报实现问题，**不许改预期来迁就**。本轮实跑的基准见 GOLD-CHECK。
 4. **构建条件**：对每个 (样本, 条件) 调 `_build_draft_user_content()` 生成 `messages`，
    计算 `prompt_sha256`，存 `prompts/<sample>/<condition>.json`（含完整 messages，便于复核）。
-5. **生成（主实验）**：按 §2.3 的顺序跑 140 次（当前实现为固定顺序，块内随机化待后续核实），
-   落 `runs/<run_id>.jsonl`（一行一份输出，含原始文本、
-   解析后的 `answer/plan`、usage、latency、错误类型）。
-6. **生成（补充批次）**：在同一配置下另跑 25 次（S7-empty 5、B0 10、C-subj/D-subj 10），写入
-   独立的 `--run-dir`（如 `runs/supplement-*/results.jsonl`）；每条记录带 `sample_id`、`group`
+5. **生成（主实验）**：先按 §5.3 在 run-dir 写 `plan.json`（v4.2 起；原子写，先于数据库隔离与
+   任何模型请求），再按计划顺序跑 140 次：每个样本 5 轮、每轮 A/B/C/D 各一次。落
+   `runs/<run_id>/results.jsonl`（一行一份输出，含原始文本、解析后的 `answer/plan`、usage、
+   latency、错误类型，以及 `plan_seq` / `round_index` / `seed` / `scheme` / `algorithm_version` /
+   `plan_sha256`）。中断后在同一 run-dir 重跑即按计划续跑：成功任务跳过；已有失败记录保留、
+   不自动重试，停止等人工处理。
+6. **生成（补充批次）**：按设计共 25 份（S7-empty 5、B0 10、C-subj/D-subj 10），写入独立的
+   `--run-dir`（如 `runs/supplement-*/results.jsonl`）；每条记录带 `sample_id`、`group`
    与 `sample_selection=explicit`，`B0` 另有 `b0_sample_override`，据此可与主实验区分，
-   不混入主实验的结果文件。
+   不混入主实验的结果文件。v4.2 起每个补充 run-dir 也有自己的 `plan.json`（独立计划，不与主
+   实验共用）：C-subj/D-subj 在 S5 上两组 × 5 轮 = 10 份；S7-empty × D 是单条件 5 次
+   （`round_index` / `repeat_index` = 0..4），**不是四条件区组**，只作单条件的重复观察。
+   B0 的 10 份是 legacy，保持不动、不重跑，也不进入任何五轮计划；因此新执行实际只跑除 B0
+   外的 15 份补充。
 7. **自动判定**：跑 M1–M4、Y1–Y5 与 `check_grounding`，输出 `auto_metrics.csv` 与失败清单；
    补充批次单独出一份表，不并入主表。
 8. **盲评**：生成 84 份主实验盲评包 → 两位评分者独立打分（P1/P2/P4/S2 四项；P3 仅 S1–S6；S3_flag
    仅 S3/S6）→ 记录 `ratings_raw.csv`（含评分者 id、盲 id、分数、0/1 判定、备注）→ 计算一致性并
    裁决；补充的 23 份只做 flag 复核，单独记 `ratings_supplement.csv`。
 9. **分析**：生成描述统计表、箱线图、假设检验结果、错误分类统计、个案摘录（S3/S5/S6/S7）。
-10. **归档**：`experiments/graduation/` 下提交配置、样本、prompt 哈希、聚合指标、评分表、
-    分析脚本与报告；原始输出若过大可只提交 JSONL 压缩包并在报告里给出校验和。
+10. **归档**：`experiments/graduation/` 下提交配置、样本、prompt 哈希、每个 run-dir 的 `plan.json`
+    （v4.2 起，记录执行顺序与 `plan_sha256`）与 `results.jsonl`、聚合指标、评分表、分析脚本与报告；
+    原始输出若过大可只提交 JSONL 压缩包并在报告里给出校验和。
 
 预计规模：主实验 140 次 + 补充 25 次 = **165 次生成**（每次 1–3 次模型调用，合计 165–495 次对话
 调用），约 2 小时机器时间；人工评分：每位评分者 **84 份完整盲评 + 23 份 flag 复核 = 107 份**
@@ -865,9 +997,17 @@ m=7 才可能过线。** 具体地：
 ```json
 {
   "run_id": "20261120T140012Z-S1-D-r3",
+  "experiment_id": "…",
   "sample_id": "S1",
   "condition": "D",
-  "repeat": 3,
+  "group": "D",
+  "repeat_index": 3,
+  "round_index": 3,
+  "plan_seq": 63,
+  "seed": 20261113,
+  "scheme": "five_round_randomized_block_v1",
+  "algorithm_version": "sha256-block-order-v1",
+  "plan_sha256": "…",
   "batch": "main",
   "model": {"provider": "openai_compatible", "name": "<model>", "temperature": 0.7, "top_p": 1.0},
   "base_sha": "<git sha>",
@@ -888,6 +1028,11 @@ m=7 才可能过线。** 具体地：
   "data_kind": "simulated_learner_fixture"
 }
 ```
+
+v4.2 起：`repeat_index == round_index`（取值 0..4）；`plan_seq` 是 `plan.json` 里的全局连续序号，
+只作顺序审计、**不进入实验身份**，实验身份仍是 `(experiment_id, sample_id, group, repeat_index)`；
+`seed` / `scheme` / `algorithm_version` / `plan_sha256` 用于核对结果行与计划文件是否同源。
+旧字段 `condition` / `repeat` 保留显示，实际调度与去重以 `group` / `repeat_index` 为准。
 
 ### 7.2 盲评记录（CSV）
 
@@ -970,6 +1115,10 @@ wrong}`（仅 S6 填写）。主实验 84 份入此表；补充批次另记 `rat
     层被自动保证；代价是"模型看到削弱记忆后是否会降低断言强度"在生成层**无法被测到**，只能由
     M4 在记忆层验证。若要把生成层也测出来，需要另加"注入非 active 记忆"的变体——那等于改产品
     行为，本轮明确不做（§10）。
+17. **时间漂移只被分散、未被消除（v4.2）**：五轮随机区组调度把同一 (样本, 条件) 的 5 次分散到
+    不同时间点，降低"时间顺序"与"实验条件"之间的系统性关联，但**不能消除**服务商模型的整体版本
+    变化。若整体变化发生在实验中途，仍须在结果里记录（发生时间、provider / model / 版本、受影响
+    批次）并在讨论中说明；不能把跨版本的差异写成记忆效应，也不能因为"已经随机化"就省略这项记录。
 
 ---
 
@@ -980,12 +1129,17 @@ wrong}`（仅 S6 填写）。主实验 84 份入此表；补充批次另记 `rat
 ```
 experiments/graduation/
   README.md                  # 如何复现
-  config.json                # 模型、温度、种子、阈值、REF_DATE
+  config.json                # 模型、温度、阈值、REF_DATE，以及 randomization 块
+                             # （seed / scheme / algorithm_version / block_unit / round_count）
+  plan_schedule.py           # v4.2：SHA-256 确定性排序 + plan.json 原子写与校验；
+                             # 不导入执行器、不发任何模型请求
   samples/S1..S7.json        # 样本与 gold
   seed_fixture.py            # 建临时库、插计划/反馈
   build_prompts.py           # 调 _build_draft_user_content 生成 messages + 哈希；
                              # 自身 CLI 用 --supplementary 追加 C-subj/D-subj 与 S7-empty
-  run_experiment.py          # 统一执行器：主实验 140 次 + 补充批次 25 次；
+  run_experiment.py          # 统一执行器：读 plan.json 顺序跑主实验 140 次 + 补充批次；
+                             # 断点续跑（成功跳过 / 已有失败停批等人处理）；
+                             # B0 为 legacy，跳过不跑；计划或结果不一致时 fail-closed
                              # CLI 参数为 --sample / --group / --repeats / --run-dir / --reuse / --config
                              # （没有 --supplementary，补充组靠 --sample/--group 显式进入计划）
   check_memory.py            # M1–M4
@@ -996,6 +1150,9 @@ experiments/graduation/
   report/EXPERIMENT-REPORT.md
 ```
 
+每个 run-dir 由执行器生成 `plan.json`（执行顺序的唯一依据）与 `results.jsonl`（只追加）；
+`runs/B0-REPEAT-MAP.md` 记录既有 B0 10 份结果的来源映射。
+
 **明确不做**
 
 - 不修改 `memory_service.py` / `memory_context.py` / `agent_plan_draft.py` /
@@ -1003,6 +1160,8 @@ experiments/graduation/
 - 不修改 `docs/STAGE2-LEARNING-MEMORY-DESIGN.md` v16 基线。
 - 不写真实 `feedback.db`，不碰 `knowledge/` 与 `.rag_cache/`。
 - 不把模拟结果写成真实用户实验；不编造任何指标数值。
+- 不重跑、不改写、不补字段 B0 的 10 份 legacy 结果（`experiments/graduation/runs/` 下三个目录），
+  也不把它们并入任何五轮计划。
 
 ---
 
