@@ -371,6 +371,8 @@ def test_main_dispatch_respects_plan(run_dir):
     samples = seed_fixture.sample_ids(config)
     target = Path(run_dir) / "dispatch_default"
     dispatched = []
+    preflighted = []
+    events = []
 
     originals = {
         "isolate": run_experiment.isolate_database,
@@ -379,10 +381,17 @@ def test_main_dispatch_respects_plan(run_dir):
         "collect": build_prompts.collect_inputs,
         "project_api": build_prompts.project_api,
         "run_one": run_experiment.run_one,
+        "preflight": run_experiment.preflight_sample,
     }
+
+    def fake_preflight(sample_id, groups, inputs, api, db_path, config, subject_count=None):
+        preflighted.append((sample_id, list(groups)))
+        events.append(("preflight", sample_id))
+        return []
 
     def fake_run_one(**kwargs):
         dispatched.append((kwargs["sample_id"], kwargs["group"], kwargs["repeat_index"]))
+        events.append(("run", kwargs["sample_id"]))
         return {
             "experiment_id": kwargs["experiment_id"],
             "sample_id": kwargs["sample_id"],
@@ -408,6 +417,7 @@ def test_main_dispatch_respects_plan(run_dir):
         {},
     )
     build_prompts.collect_inputs = lambda sample, config, api, moment: {}
+    run_experiment.preflight_sample = fake_preflight
     run_experiment.run_one = fake_run_one
 
     stdout = io.StringIO()
@@ -422,6 +432,7 @@ def test_main_dispatch_respects_plan(run_dir):
         build_prompts.collect_inputs = originals["collect"]
         build_prompts.project_api = originals["project_api"]
         run_experiment.run_one = originals["run_one"]
+        run_experiment.preflight_sample = originals["preflight"]
 
     # main 按样本分块执行（同一实验库只隔离/建一次），所以 B0 跟随所属样本，
     # 与 resolve_plan 返回的"B0 排最后"顺序不同，但任务对集合相同。
@@ -438,6 +449,35 @@ def test_main_dispatch_respects_plan(run_dir):
         "main 实际分发时 B0 只在 S5/S7",
         [(s, g) for s, g, _ in dispatched if g == "B0"] == [("S5", "B0"), ("S7", "B0")],
         dispatched,
+    )
+
+    expected_preflight = [
+        (
+            sample_id,
+            [
+                group
+                for group in default_group_order()
+                if group != "B0" or sample_id in run_experiment.B0_DEFAULT_SAMPLES
+            ],
+        )
+        for sample_id in samples
+    ]
+
+    check("每个样本在模型调用前都做了预检", preflighted == expected_preflight, preflighted)
+
+    first_run = {}
+
+    for index, (kind, sample_id) in enumerate(events):
+        if kind == "run":
+            first_run.setdefault(sample_id, index)
+
+    check(
+        "预检发生在该样本第一次生成之前",
+        all(
+            events.index(("preflight", sample_id)) < index
+            for sample_id, index in first_run.items()
+        ),
+        events,
     )
 
     lines = (target / "results.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1107,6 +1147,7 @@ def test_duplicate_identity_guard(run_dir, config):
         "activate": build_prompts.activate_sample,
         "collect": build_prompts.collect_inputs,
         "load_sample": seed_fixture.load_sample,
+        "preflight": run_experiment.preflight_sample,
     }
 
     isolate_calls = []
@@ -1136,6 +1177,8 @@ def test_duplicate_identity_guard(run_dir, config):
     build_prompts.activate_sample = lambda sample_id, config, reuse=False, sample=None: (Path(f"{sample_id}.db"), {})
     build_prompts.collect_inputs = lambda sample, config, api, moment: {}
     seed_fixture.load_sample = lambda sample_id, config: {}
+    # 本测试只验证重复身份保护；输入预检由 test_graduation_supplementary.py 覆盖
+    run_experiment.preflight_sample = lambda *args, **kwargs: []
 
     stderr = io.StringIO()
     stdout = io.StringIO()
@@ -1207,6 +1250,7 @@ def test_duplicate_identity_guard(run_dir, config):
         build_prompts.activate_sample = original["activate"]
         build_prompts.collect_inputs = original["collect"]
         seed_fixture.load_sample = original["load_sample"]
+        run_experiment.preflight_sample = original["preflight"]
 
 
 def test_frozen_abcd_prompt_hashes(config):

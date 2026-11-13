@@ -976,8 +976,11 @@ experiments/graduation/
   config.json                # 模型、温度、种子、阈值、REF_DATE
   samples/S1..S7.json        # 样本与 gold
   seed_fixture.py            # 建临时库、插计划/反馈
-  build_prompts.py           # 调 _build_draft_user_content 生成 messages + 哈希
-  run_experiment.py          # 统一执行器：主实验 140 次 + 补充批次 25 次（--sample/--group/--supplementary）
+  build_prompts.py           # 调 _build_draft_user_content 生成 messages + 哈希；
+                             # 自身 CLI 用 --supplementary 追加 C-subj/D-subj 与 S7-empty
+  run_experiment.py          # 统一执行器：主实验 140 次 + 补充批次 25 次；
+                             # CLI 参数为 --sample / --group / --repeats / --run-dir / --reuse / --config
+                             # （没有 --supplementary，补充组靠 --sample/--group 显式进入计划）
   check_memory.py            # M1–M4
   check_auto.py              # Y1–Y5 + check_grounding
   make_blind_pack.py         # 盲评包（主实验 84 份 + 补充 flag 23 份）

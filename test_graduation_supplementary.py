@@ -19,7 +19,9 @@
 """
 
 import copy
+import contextlib
 import hashlib
+import io
 import os
 import shutil
 import sqlite3
@@ -462,6 +464,213 @@ def test_main_rejects_before_creating_run_dir():
 
 
 # ---------------------------------------------------------------------------
+# 运行前预检（fail-closed）
+# ---------------------------------------------------------------------------
+
+
+def _preflight_inputs(sample_id):
+    config = _config()
+    sample = seed_fixture.load_sample(sample_id, config)
+    db_path, api = build_prompts.activate_sample(
+        sample_id, config, reuse=False, sample=sample
+    )
+    moment = seed_fixture.ref_datetime(config)
+    inputs = build_prompts.collect_inputs(sample, config, api, moment)
+
+    return config, db_path, api, inputs
+
+
+def _expect_preflight_failure(sample_id, groups, mutate, fragment):
+    config, db_path, api, inputs = _preflight_inputs(sample_id)
+    mutate(inputs)
+
+    try:
+        run_experiment.preflight_sample(sample_id, groups, inputs, api, db_path, config)
+    except run_experiment.PreflightError as error:
+        assert fragment in str(error), (fragment, str(error))
+        return str(error)
+    else:
+        raise AssertionError(f"{sample_id}/{groups} 预检必须失败：{fragment}")
+
+
+def _break_subject_tool_ok(inputs):
+    inputs["subject_memory_tool"]["ok"] = False
+
+
+def _break_subject_tool_empty(inputs):
+    inputs["subject_memory_tool"].update({"ok": True, "count": 0, "memories": []})
+    inputs["subject_memory_result"] = {"count": 0, "memories": []}
+
+
+def _break_subject_wrong_topic(inputs):
+    for item in inputs["subject_memory_tool"]["memories"]:
+        item["subject"] = "线性代数"
+    for item in inputs["subject_memory_result"]["memories"]:
+        item["subject"] = "线性代数"
+
+
+def _break_subject_count(inputs):
+    inputs["subject_memory_tool"]["count"] = 99
+
+
+def test_preflight_subject_success():
+    config, db_path, api, inputs = _preflight_inputs("S5")
+
+    # 设计要求 S5 的主题记忆恰好 2 条概率论记忆
+    assert inputs["subject_memory_result"]["count"] == 2, inputs["subject_memory_result"]
+    assert inputs["subject_filter"] == "概率论", inputs["subject_filter"]
+
+    checks = run_experiment.preflight_sample(
+        "S5", ["C-subj", "D-subj"], inputs, api, db_path, config
+    )
+
+    assert checks, checks
+    failed = [item for item in checks if not item[1]]
+    assert failed == [], failed
+    assert any("evidence 参数一致" in item[0] for item in checks), checks
+
+
+def test_preflight_subject_failure_paths():
+    # 1) Tool 失败
+    _expect_preflight_failure(
+        "S5", ["C-subj"], _break_subject_tool_ok, "主题记忆 Tool 成功"
+    )
+    # 2) Tool 成功但空记忆
+    error = _expect_preflight_failure(
+        "S5", ["D-subj"], _break_subject_tool_empty, "主题记忆非空"
+    )
+    assert "Prompt 含主题记忆区块" in error, error
+    # 3) 返回错误主题的记忆
+    _expect_preflight_failure(
+        "S5", ["C-subj"], _break_subject_wrong_topic, "每条记忆都属于当前主题"
+    )
+    # 4) count 与 memories 数量不一致
+    _expect_preflight_failure(
+        "S5", ["C-subj"], _break_subject_count, "Tool 条数自洽"
+    )
+
+
+def test_preflight_empty_sample_success_and_failure():
+    config, db_path, api, inputs = _preflight_inputs("S7-empty")
+
+    assert inputs["memory_tool"]["ok"] is True, inputs["memory_tool"]
+    assert inputs["memory_tool"]["count"] == 0, inputs["memory_tool"]
+    assert inputs["memory_tool"]["memories"] == [], inputs["memory_tool"]
+
+    checks = run_experiment.preflight_sample(
+        "S7-empty", ["D"], inputs, api, db_path, config
+    )
+
+    assert [item for item in checks if not item[1]] == [], checks
+
+    # 空样本的 Tool 失败也必须拦下，不能记成"零记忆的 D 组"
+    _expect_preflight_failure(
+        "S7-empty",
+        ["D"],
+        lambda broken: broken["memory_tool"].update({"ok": False}),
+        "空样本记忆 Tool 成功",
+    )
+    _expect_preflight_failure(
+        "S7-empty",
+        ["D"],
+        lambda broken: broken["memory_tool"].update(
+            {"ok": True, "count": 1, "memories": [{"type": "task_topic", "subject": "数据结构"}]}
+        ),
+        "空样本记忆条数为 0",
+    )
+
+
+def test_empty_check_detects_event_residue():
+    config = _config()
+    sample = seed_fixture.load_sample("S7-empty", config)
+    seeded = seed_fixture.seed_sample("S7-empty", config)
+    db_path = Path(seeded["db_path"])
+    dump = seed_fixture.dump_memories(db_path)
+
+    assert dump["memories"] == [] and dump["pendings"] == 0 and dump["events"] == []
+
+    polluted = copy.deepcopy(dump)
+    polluted["events"] = [
+        {
+            "memory_id": 1,
+            "event_type": "strength_updated",
+            "created_at": "2026-11-12T00:00:00",
+        }
+    ]
+
+    result = check_memory.verify_sample(sample, polluted, db_path, config, {"ok": True})
+
+    assert result["empty_check"]["ok"] is False, result["empty_check"]
+    assert result["empty_check"]["detail"]["events"] == 1, result["empty_check"]
+
+    # 其余四项仍为 0：失败只能来自事件表残留
+    for name in ("memories", "distinct_keys", "injected", "pendings"):
+        assert result["empty_check"]["detail"][name] == 0, (name, result["empty_check"])
+
+    assert result["failure_count"] >= 1, result["failure_count"]
+    assert any("事件表残留" in reason for reason in result["reasons"]), result["reasons"]
+
+
+def test_main_aborts_before_model_call_on_preflight_failure():
+    target = (
+        Path(tempfile.gettempdir())
+        / "graduation_experiments"
+        / "_supplementary_preflight_run"
+    )
+
+    if target.exists():
+        shutil.rmtree(target)
+
+    dispatched = []
+    originals = {
+        "isolate": run_experiment.isolate_database,
+        "register": seed_fixture.register_project_modules,
+        "collect": build_prompts.collect_inputs,
+        "run_one": run_experiment.run_one,
+    }
+    real_collect = build_prompts.collect_inputs
+
+    def broken_collect(sample, config, api, moment):
+        broken = copy.deepcopy(real_collect(sample, config, api, moment))
+        broken["subject_memory_tool"]["ok"] = False
+        return broken
+
+    def fake_run_one(**kwargs):
+        dispatched.append((kwargs["sample_id"], kwargs["group"]))
+
+    run_experiment.isolate_database = lambda path: (object(), object())
+    seed_fixture.register_project_modules = lambda *args, **kwargs: None
+    build_prompts.collect_inputs = broken_collect
+    run_experiment.run_one = fake_run_one
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+
+    try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            code = run_experiment.main(
+                [
+                    "--sample",
+                    "S5",
+                    "--group",
+                    "C-subj",
+                    "--run-dir",
+                    str(target),
+                ]
+            )
+    finally:
+        run_experiment.isolate_database = originals["isolate"]
+        seed_fixture.register_project_modules = originals["register"]
+        build_prompts.collect_inputs = originals["collect"]
+        run_experiment.run_one = originals["run_one"]
+
+    assert code == 3, (code, stderr.getvalue())
+    assert dispatched == [], f"预检失败后不得调用模型：{dispatched}"
+    assert "预检失败" in stderr.getvalue(), stderr.getvalue()
+    assert not (target / run_experiment.RESULTS_NAME).exists(), "预检失败不得写入结果记录"
+
+
+# ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
 
@@ -483,6 +692,11 @@ def _run_all():
         test_default_plan_has_no_supplementary_groups,
         test_supplementary_plan_counts,
         test_main_rejects_before_creating_run_dir,
+        test_preflight_subject_success,
+        test_preflight_subject_failure_paths,
+        test_preflight_empty_sample_success_and_failure,
+        test_empty_check_detects_event_residue,
+        test_main_aborts_before_model_call_on_preflight_failure,
     ]
 
     for test in tests:

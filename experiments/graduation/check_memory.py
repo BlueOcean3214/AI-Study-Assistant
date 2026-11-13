@@ -257,6 +257,7 @@ def verify_sample(sample, dump, db_path, config, rebuild):
             and detail["distinct_keys"] == 0
             and detail["injected"] == 0
             and detail["pendings"] == 0
+            and detail["events"] == 0
         )
         empty_check = {"ok": empty_ok, "detail": detail}
 
@@ -265,6 +266,11 @@ def verify_sample(sample, dump, db_path, config, rebuild):
             reasons.append(
                 "空 Gold Standard 样本的记忆集合非空："
                 + "、".join(f"{name}={value}" for name, value in detail.items())
+                + (
+                    "（事件表残留表明空样本曾被历史数据污染）"
+                    if detail["events"] != 0
+                    else ""
+                )
             )
 
     return {
