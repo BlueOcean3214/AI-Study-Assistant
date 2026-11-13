@@ -128,7 +128,7 @@ def _memory_entries(user_content):
 
 def test_config_and_samples():
     config = _config()
-    assert config["groups"] == ["A", "B", "C", "D"], config["groups"]
+    assert config["groups"] == ["A", "B", "B0", "C", "D"], config["groups"]
     assert config["memory_limit"] == 5, config["memory_limit"]
     assert config["knowledge_results"] == [], config["knowledge_results"]
     assert config["knowledge_search_failed"] is False
@@ -290,7 +290,7 @@ def test_prompts_build_for_all_samples():
         seed_fixture.seed_sample(sample_id, config)
         build = build_prompts.build_sample_prompts(sample_id, config, reuse=True)
 
-        assert sorted(build["prompts"]) == ["A", "B", "C", "D"], sample_id
+        assert sorted(build["prompts"]) == ["A", "B", "B0", "C", "D"], sample_id
         assert not [check for check in build["checks"] if not check[1]], (
             sample_id,
             [check for check in build["checks"] if not check[1]],
@@ -318,6 +318,13 @@ def test_prompts_build_for_all_samples():
         assert build_prompts.SHORT_TERM_HEADER in contents["D"], sample_id
         assert build_prompts.MEMORY_HEADER in contents["D"], sample_id
 
+        # B0：只有原始反馈行；无统计摘要、无难度硬规则、无短期上下文、无记忆
+        assert "历史反馈：\n[\n" in contents["B0"], sample_id
+        assert '"total_count"' not in contents["B0"], sample_id
+        assert "最近一次反馈是 partial 且原因是任务难度太高" not in contents["B0"], sample_id
+        assert build_prompts.SHORT_TERM_HEADER not in contents["B0"], sample_id
+        assert build_prompts.MEMORY_HEADER not in contents["B0"], sample_id
+
         # C 去掉记忆 == A；D 去掉记忆 == B（逐字）
         block = _memory_block(contents["C"])
         assert build_prompts.strip_memory(contents["C"], block) == contents["A"], sample_id
@@ -326,7 +333,7 @@ def test_prompts_build_for_all_samples():
         # 每组 SHA256 必须与内容一致，且第二次构建完全相同
         again = build_prompts.build_sample_prompts(sample_id, config, reuse=True)
 
-        for group in ("A", "B", "C", "D"):
+        for group in ("A", "B", "B0", "C", "D"):
             prompt = build["prompts"][group]
             recomputed = build_prompts.prompt_sha256(prompt["system"], prompt["user"])
             assert prompt["chars"] == len(prompt["user"]), (sample_id, group)

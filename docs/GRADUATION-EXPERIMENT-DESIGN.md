@@ -1,14 +1,44 @@
 # 毕业设计实验方案设计：长期学习记忆对学习状态评估与个性化计划生成的影响
 
 - 文档状态：**设计稿（Design Only）**，尚未执行任何实验
-- 版本：v3（2026-11-12；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
-  v3 按第二轮意见修订双人盲评与统计细节口径，并按**实跑**校准 §3.2 的记忆 Gold Standard）
+- 版本：v4（2026-11-12；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
+  v3 按第二轮意见修订双人盲评与统计细节口径，并按**实跑**校准 §3.2 的记忆 Gold Standard；
+  v4 按执行层落地固定 RAG 口径、B0 槽位与采样参数，见下节"版本与修改说明"）
 - 基线：`main` = `53a18b3985ed9e964ca197e22b167fbb7225d878`
 - 适用系统：AI-Study-Assistant（FastAPI + SQLite + LangGraph + 可切换模型后端）
 - 撰写日期：2026-11-12
 
 > 本文档只描述**如何做实验**，不包含任何实验结果。文中出现的数字全部是种子数据、
 > 阈值或设计参数，不是模型输出，也不是用户数据。全部学习者为**构造的模拟样本**。
+
+## 版本与修改说明
+
+### v4（2026-11-12，执行层落地）
+
+本版只改"实验怎么跑"，不改 v3 的假设、统计口径与样本设计（140 / 165 / 84 / 107 等口径不变）：
+
+1. **本实验不考察 RAG（知识库检索）**。五组的 `knowledge_results` 一律为 `[]`、
+   `knowledge_search_failed=false`；运行期**不调用 Embedding、不执行向量检索**。
+   理由：知识库当前仅 238 字符，检索阈值 `MIN_SCORE=0.5` 是在本地小模型上标定的，尚未在
+   云端对话模型上重新校准。在这样一个小库上做对照，差异无法归因到记忆，反而会把"这次检索
+   是否命中"混进主效应。因此知识库槽位是**受控常量**而不是实验变量；§0 所说"相同的知识库
+   检索结果"按"同为空"理解。
+2. **B0 探索组落到执行层**：`GROUP_SLOTS["B0"] = {feedback: True, short_term: False,
+   memory: False, summary: False}` —— 只有原始反馈行（`feedback_result["feedback"]`）、
+   `summary = {}`、`difficult = False`，无 `short_term_block`、无 `memory_result`；
+   knowledge 与其他组一致（`[]`）。`build_prompts.py` 与 `run_experiment.py` 共用
+   `group_inputs()` 作为槽位唯一定义来源，A/B/C/D 的 Prompt **逐字节不变**（manifest 里的
+   `prompt_sha256` 是基线）。
+3. **采样参数固定**：`temperature = 0.7`、`top_p = 1.0`、`max_tokens = 2048`，五组完全一致；
+   经 `llm_client.chat(..., sampling=...)` 透传（OpenAI 兼容接口写请求体顶层三键，Ollama 写
+   `options.num_predict`），每次请求**实际生效**的采样参数随用量记录写入 `results.jsonl`。
+   不为记录采样参数新增数据库字段或表。
+4. **执行层边界**：实验跑的是产品自己的起草+校验+有限修正循环
+   （`agent_plan_draft.run_plan_draft_from_inputs()`，内部仍走 JSON 解析、`normalize_plan`、
+   `validate_plan_for_save`、`check_grounding`、`MAX_CORRECTIONS=2`），但**跳过研究阶段**
+   （`tool_calls = 0`、`loop_turns = 0`、`research_final_answer = None`）。`check_grounding`
+   所需的证据由合成 evidence steps 提供：注入反馈的组才有 `get_recent_feedback`，C/D 才有
+   `get_learning_memory`，知识库一律不合成。
 
 ---
 
@@ -116,13 +146,14 @@
 | `difficult`（难度硬规则） | `False` | 由最新反馈计算 | `False` | `False` | 由最新反馈计算 |
 | `short_term_block` | `None` | `render_short_term(collect_short_term(REF_DATE))` | `None` | `None` | 同 B |
 | `memory_result` | `None` | `None` | `None` | `get_learning_memory(limit=5)` | `get_learning_memory(limit=5)` |
-| `knowledge_results` | 固定 | 固定 | 固定 | 固定 | 固定 |
+| `knowledge_results` | `[]` | `[]` | `[]` | `[]` | `[]` |
 | `search_failed` | `False` | `False` | `False` | `False` | `False` |
 
 说明：
 
-- **知识库槽不是实验变量**。每个样本预检索一次（同一查询、同一 top-k），四组复用**同一份**
-  结果；若该样本在知识库中无命中，则四组统一为空结果并记录"本次无知识库结果"。
+- **知识库不是实验变量，本实验也不做 RAG**：五组一律 `knowledge_results = []`、
+  `search_failed = False`，运行期不调用 Embedding、不执行向量检索（理由见 v4 版本说明）。
+  因此"知识库区块"在五组中同为空，任何组间差异都不能归因到检索。
 - **`memory_result` 采用"全类型、无主题过滤、limit=5"**，即
   `agent_tools.get_learning_memory(limit=5)`，与生产中最常见的调用方式一致。这样 C/D 会同时
   看到多个主题的记忆，才能测出"会不会把 A 主题的困难套到 B 主题"（S5）。
@@ -147,8 +178,9 @@
 
 ### 2.3 组间可比性
 
-- 同一 `user_message`、同一历史种子、同一模型与版本、同一 `temperature`（建议 `0.7`，
-  记录 `top_p` 实际值）、同一 `max_tokens`、同一系统提示 `plan_draft_system`。
+- 同一 `user_message`、同一历史种子、同一模型与版本、同一采样参数
+  （`temperature=0.7`、`top_p=1.0`、`max_tokens=2048`，五组一致，见 v4 版本说明；实际生效值
+  逐请求记入 `results.jsonl`）、同一系统提示 `plan_draft_system`。
 - 生成顺序**按样本分块随机化**（同一趟实验内打乱条件顺序，用固定随机种子记录）。
 - 每次生成记录 `prompt_sha256`（对最终 `messages` 列表做哈希），并断言：同一 (样本, 条件)
   的重跑哈希一致；不同条件之间只在设计槽位上有差异（人工抽查 1 个样本的 diff）。
