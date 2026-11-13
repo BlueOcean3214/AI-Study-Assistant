@@ -1,11 +1,13 @@
 # 毕业设计实验方案设计：长期学习记忆对学习状态评估与个性化计划生成的影响
 
 - 文档状态：**设计稿（Design Only）**，尚未执行任何实验
-- 版本：v4.2（2026-11-13；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
+- 版本：v4.3（2026-11-13；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
   v3 按第二轮意见修订双人盲评与统计细节口径，并按**实跑**校准 §3.2 的记忆 Gold Standard；
   v4 按执行层落地固定 RAG 口径、B0 槽位与采样参数；v4.1（2026-11-13）把 S5×C-subj / S5×D-subj /
   S7-empty×D 补充组落到执行层；v4.2（2026-11-13）把调度升级为五轮随机区组，`plan.json` 成为
-  执行顺序的唯一依据，并补断点续跑与 fail-closed 校验，口径不变。均见下节"版本与修改说明"）
+  执行顺序的唯一依据，并补断点续跑与 fail-closed 校验；v4.3（2026-11-13）只改盲评与评分协议
+  （去身份 `blind_id`、84/6/23 抽样规则、私有映射、统一长表），不改假设与统计口径。
+  均见下节"版本与修改说明"）
 - 基线：`main` = `53a18b3985ed9e964ca197e22b167fbb7225d878`
 - 适用系统：AI-Study-Assistant（FastAPI + SQLite + LangGraph + 可切换模型后端）
 - 撰写日期：2026-11-12
@@ -106,6 +108,26 @@
 8. **统计边界**：样本量仍是 n=7；140 次生成 = 7 样本 × 4 组 × 5 轮，不等于 n=140；五轮是
    "调度区组"，用来分散服务商侧随时间的漂移，不是增加样本量；随机化只降低"时间顺序"与
    "实验条件"之间的系统性关联，不能消除服务商模型的整体版本变化（详见 §5.3 的统计边界）。
+
+### v4.3（2026-11-13，盲评与评分协议修订）
+
+本版只改**盲评与评分协议**（§5.3 末条、§5.4、§5.5 的 0.2 表、§7.2），**不改**假设、统计检验、
+Prompt / 样本 / Gold Standard、执行 seed `20261113`，也**不改** 140 / 165 / 84 / 23 这些数量本身：
+
+1. **`blind_id` 彻底去身份**：改用随机 UUID（不含 `sample_id` / 条件 / 轮次 / `run_id` 任何片段
+   或可枚举前缀），取代原示例 `S3-7f2a`（该示例泄露样本号）。
+2. **84 份抽样规则可复现**：候选 `blind_sampling_seed = 2026111301`（**新盲评种子，候选值，
+   待负责人最终冻结**；不得复用执行 seed），SHA-256 确定性排序，domain 与排序键见 §5.4.2。
+3. **新增 6 份校准并与 84 分离**：先从 28 格抽定正式 84，再在剩余 56 份中抽 6 份校准；校准不进入
+   84、不进主 κ / 聚合 / 检验 / 主表。
+4. **补充 23 份规则落定**：S7-empty 5 份无放回抽 3（独立 domain，不得取固定前 3），只评 E1；
+   B0 10 份与 C-subj/D-subj 10 份全量入包，按 §5.4.7 的逐批次矩阵评 E1/E7。
+5. **私有映射 `mapping.csv`**：`blind_id` → 源记录（run-dir / 文件 / 行号 / 行哈希 / 身份 /
+   Prompt 哈希 / 文件哈希）独立保存，不进评审包、不进 Git、不混入评分表，并记录其自身 SHA256。
+6. **评分表统一为长表**：每个 `(blind_id, rater_id)` 一行，两人各一行，原始分全量保留；消除原
+   §5.5 `rater_a/rater_b` 宽表与 §7.2 长表的口径矛盾；裁决表与最终表独立保存、不覆盖上游。
+7. **字段适用范围逐批次写明**：P3 = 72（仅 S1–S6）、`S3_flag` = 24（仅 S3/S6）、
+   `S4_verdict` = 12（仅 S6）；补充批次只评 E1/E7；不适用一律 `N/A` 或空，**不得填 0**。
 
 ---
 
@@ -280,12 +302,14 @@ H1/H2 的配对数据。
 - **人工评分点（按人计，再乘 2）**：84 份完整盲评 × 4 项（P1、P2、P4、S2）= **336** 个 1–5 评分点；
   P3 只评 S1–S6 的 **72** 份（S7 记 N/A）= **72** 个，因此 1–5 评分点合计 **408 个/人**，两人 **816 个**。
 - **每位评分者的工作量**：主实验完整盲评 **84 份** + 补充批次 flag 复核 **23 份** = **107 份/人**，
-  两人共 **214 份次**；不存在"某些份只由一人评"的情况，双人复核覆盖全部 107 份。
+  两人共 **214 份次**；不存在"某些份只由一人评"的情况，双人复核覆盖全部 107 份。v4.3 起**另加校准
+  6 份/人**（两人 12 份次），校准单列、**不计入 107**，只用于统一评分尺度（§5.4.3）。
 - **0/1 判定的份数**：`S3_flag` 只填 S3、S6 共 **24 份**（两人 48 个判定）；`S4_verdict` 只填 S6 共
   **12 份**（两人 24 个判定）；补充批次的 `E1`/`E7` 各 **23 份**（各 46 个判定）。这三类都是 0/1，
   不产生 1–5 分，也不进入 P1–P4 的均值。
 - 本表的 140 / 165 / 84 / 107 / 336 / 72 / 408 / 24 / 12 / 23 是全文唯一口径，§5.3、§6、§7、§9
-  与附录 B 必须与之逐字一致；任何改动都要同步全文。
+  与附录 B 必须与之逐字一致；任何改动都要同步全文。v4.3 的校准 **6 份/人**是**附加项**，不属于本表
+  口径，也不改变 140 / 165 / 84 / 107 / 408。
 - **B0 与五轮计划（v4.2 起）**：B0 的 10 份是 legacy 结果（三个 run-dir，来源映射见
   `experiments/graduation/runs/B0-REPEAT-MAP.md`），保持不动——不改 `results.jsonl`、不补
   v4.2 字段、不重跑，也不进入五轮随机区组计划；显式只指定 `--group B0` 会被拒绝并提示 legacy。
@@ -789,8 +813,10 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 - **补充实验用同一机制、各自独立计划**：C-subj/D-subj 在 S5 上两组 × 5 轮 = 10 份；S7-empty × D
   是单条件 5 次（同样记录 `round_index` / `repeat_index` = 0..4，但它**不是四条件区组**，只是
   单条件的重复观察）。每个补充 run-dir 有自己的 `plan.json`，不与主实验共用。
-- **人工盲评**：从主实验每 (样本, 条件) 的 5 份中随机抽 **3** 份，共 7×4×3 = **84** 份，两位评分者
-  独立评；抽签种子固定。补充运行的 23 份（S7-empty 3、B0 10、敏感性 10）只做 flag 复核。
+- **人工盲评（v4.3 起按 §5.4 执行）**：先从主实验每 (样本, 条件) 的 5 份中按冻结盲评种子抽 **3**
+  份，共 7×4×3 = **84** 份；再由同一 seed 在**剩余 56 份**中另抽 **6** 份校准（与 84 严格分离）。
+  补充批次 23 份（S7-empty 5 取 3、B0 10、C-subj/D-subj 10）只做 flag 复核。抽样规则、去身份
+  `blind_id`、私有映射与评分表结构见 §5.4。
 
 **统计边界（v4.2 必须写进报告，避免把调度区组误当样本量）**
 
@@ -802,17 +828,159 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
    变化。若整体变化发生在实验中途，仍需在结果里记录（发生时间、provider / model / 版本、
    受影响批次）并在讨论中说明，不能把跨版本差异写成记忆效应。
 
-### 5.4 人工盲评与 LLM 辅助
+### 5.4 人工盲评与评分材料（v4.3）
 
-- 盲法：输出文件按 `blind_id` 命名（如 `S3-7f2a`），评分表不含条件列；评分完成后才由脚本回填映射。
-- 两位评分者（作者 + 一名同学），先各自独立评 6 份校准样本，讨论统一尺度后再正式评。
-- 一致性：1–5 分用二次加权 Cohen's κ，目标 κ ≥ 0.6；0/1 判定用 Cohen's κ。κ 必须在本批**未裁决的
-  原始评分**上计算。分歧 > 1 分或 0/1 相反时，由第三人（或双方讨论）裁决，裁决结果单独记录；两位评分者
-  到最终分的完整合并规则（何时取算术均值、何时以裁决值为准、未决项怎么处理）见 §5.5 的 **0.2）**。
-- LLM 作为辅助评分者：同一 rubric、`temperature=0`、评 3 次取多数；只报告其与人工均分的
-  Spearman 相关与 κ，**不作为主结论依据**，也不参与假设检验。
-- 评分范围：只对主实验的 84 份做完整打分（P1/P2/P4/S2，另 P3 限 S1–S6）；补充批次 23 份只判
-  0/1 flag，不计入主 κ。若对补充批次另算一致性，必须单独标注、单独成表。
+> 本节只定义**材料怎么生成、怎么匿名、怎么记录**；评分合并与统计仍按 §5.5，二者冲突时以 §5.5 的
+> 0.1 / 0.2 为准。本节描述的 `make_blind_pack.py` 等脚本**尚未实现**，此处先冻结协议，实现时必须
+> 逐条对齐；不得先写脚本再回头改协议。
+
+#### 5.4.0 只读与隔离边界
+
+1. 盲评包只从 `experiments/graduation/runs/` 下的 `results.jsonl` **只读复制**派生，不修改源文件；
+   打包前后对每个源文件重算 SHA256，必须与执行报告附录 A 的清单一致，不一致立即停止。
+2. 禁止把评分列、`blind_id`、`mapping.csv` 回写进 `results.jsonl` / `plan.json` / B0 legacy；
+   禁止改写、重命名或删除任何 run-dir。
+3. 三类产物分开存放：`blind_pack/`（可分发给评分者）、`blind_private/`（映射与审计，禁止分发）、
+   `blind_ratings/`（原始 / 裁决 / 最终评分表）。
+
+#### 5.4.1 `blind_id`：彻底去身份
+
+- 形式：RFC 4122 UUIDv4 的小写规范串，或 32 位小写十六进制随机串；由 `secrets` / `os.urandom`
+  生成，或由固定盲评种子经 `SHA-256(seed|blind-id-allocation|source_result_row_sha256)` 派生
+  （便于复现，但派生结果同样不得含身份片段）。
+- **禁止**包含或可反推 `sample_id`、`group` / `condition`、`repeat_index` / `round_index`、
+  `run_id`、`experiment_id`、源文件名或生成日期；不得用可枚举序号（`001`、`002`…）代替随机 ID。
+- 同一份输出对两位评分者使用**同一个** `blind_id`；两人只共享评分口径，不共享映射。
+- 文件名只含 `blind_id`（如 `<blind_id>.md`），不得出现样本名、组名、轮次或“第几批”。
+- 每位评分者的盲评包**顺序独立随机化**（两人看到不同顺序），避免顺序效应。
+- 去身份自检（打包脚本必须输出并通过）：对全部 `blind_id` 做正则扫描，不得命中 `S[1-7]`、
+  `A|B|C|D|B0|C-subj|D-subj`、`r[0-4]`、日期或 `run_id` 片段。
+
+#### 5.4.2 主实验 84 份：抽样规则（可复现、可审计）
+
+- **候选参数**：`blind_sampling_seed = 2026111301`。这是**新的盲评种子**，与执行种子 `20261113`
+  无关，**不得**用它替换或重算执行计划。该值目前是**候选值，待负责人在开始评分前最终冻结**；
+  冻结后写入 `experiments/graduation/blind_config.json`（含 seed、domain 列表、算法版本、生成时间）
+  并记录该文件的 SHA256；冻结后不得再改，除非重抽全部盲评并留档说明。
+- **抽样单位**：28 个格子 = 7 个样本 `S1…S7` × 4 个条件 `A/B/C/D`，每格 5 个 `repeat_index`（0..4）。
+- **排序键**：对每格的每个 `repeat_index` 计算
+  `SHA-256(f"{seed}|blind-main-selection|{sample_id}|{group}|{repeat_index}")`，按十六进制升序排序，
+  取前 3；键相同按 `repeat_index` 升序。28 × 3 = **84**，互不重复，恰好每格 3 份。
+- **可审计产物**：`blind_pack/selection_audit.csv`，字段
+  `sample_id, group, repeat_index, plan_seq, source_prompt_sha256, source_result_row_sha256,
+  selection_hash`。该文件**不含 `blind_id`**（否则等于映射），可随包提交，供任何人用同一 seed 复算
+  并核对“选中的就是这 84 份”。
+- **复现要求**：给定 seed、算法版本与源 `results.jsonl` 哈希，重算结果必须逐行一致；不一致按
+  “抽样不可复现”处理并停止评分，**不得手工挑份**。
+
+#### 5.4.3 6 份校准：与 84 严格分离
+
+- **顺序固定**：先按 §5.4.2 抽定正式 84，**之后**才在剩余 56 份（每格 2 份）中抽校准 6 份。
+- **抽样规则**：domain `blind-calibration-selection`，排序键
+  `SHA-256(f"{seed}|blind-calibration-selection|{sample_id}|{group}|{repeat_index}")`，全局升序；
+  依次取用，但**每格至多 1 份、每样本至多 1 份**（重复则跳过顺延），直到取满 6 份。这样 6 份覆盖
+  6 个不同样本、6 个不同格子，避免校准只练到某一类输出。
+- **身份与目录**：校准 6 份标 `phase=calibration`、独立目录 `blind_pack/calibration/`；正式 84 份标
+  `phase=formal`、`blind_pack/formal/`；两者的 `blind_id` 各自独立生成，不得复用。
+- **评分流程**：两位评分者先**各自独立**评完 6 份（不讨论）→ 再讨论统一尺度（记录讨论要点与修订后
+  的评分口径，但**不回写**第一次原始分）→ 之后各自独立评 84 份。
+- **统计地位**：校准 6 份**不属于 84**，不进入主 κ、格内聚合、假设检验、主表与图表；可单独报告
+  `κ_calibration` 作为“尺度是否对齐”的描述性证据，**不得**用它替代主 κ，也不得据此调整 84 的分数。
+- **禁止**：不得从 84 中抽校准；不得用校准份替换 84 中的任何一份；若发现重叠，必须重抽校准并在
+  `blind_private/MAPPING-AUDIT.md` 记录原因与前后两份清单，不得静默替换。
+
+#### 5.4.4 补充批次 23 份：规则
+
+| 批次 | 份数 | 抽样 | 评分字段 |
+| --- | --- | --- | --- |
+| S7-empty × D | 5 | 无放回抽 **3** | 只评 E1 |
+| B0（legacy） | 10 | 全量 | E1、E7 |
+| C-subj / D-subj（S5） | 5 + 5 | 全量 | E1、E7 |
+
+- **S7-empty 3 份**：domain `blind-s7empty-selection`，排序键
+  `SHA-256(f"{seed}|blind-s7empty-selection|S7-empty|D|{repeat_index}")`，取前 3；**不得取固定前 3**
+  或按文件行序取前 3；被选 3 份的 `repeat_index` 只写入私有映射，评分材料与审计文件都不出现。
+- B0 10 份与 C/D-subj 10 份**无需抽样**，全部入包；B0 是 legacy 结果，只读复制，不补字段、不重跑。
+- 补充批次标 `phase=supplementary`，独立目录 `blind_pack/supplementary/`；评分表独立
+  （`ratings_supplement_*.csv`），**不计入主 κ**，不与 84 合并；若另算补充批次一致性，必须单独成表、
+  标注“描述性、样本量小”。
+- S7-empty 只评 E1：该样本零反馈、零计划、零记忆，E7（主题漂移）与 `S3_flag` 都**不适用**，不得
+  为“凑字段”给它打分。
+
+#### 5.4.5 私有映射 `mapping.csv`
+
+- **位置**：`experiments/graduation/blind_private/mapping.csv`。该目录整体 `.gitignore`，禁止提交；
+  评分期间只在本机受控保存，**不得**进入任何评审包、压缩包或共享盘。
+- **字段（至少这些，缺一不可）**：
+
+| 字段 | 说明 |
+| --- | --- |
+| `blind_id` | §5.4.1 生成的匿名 ID，全表唯一 |
+| `phase` | `calibration` / `formal` / `supplementary` |
+| `batch` | `main` / `suppl-subj` / `suppl-s7empty` / `b0-legacy` |
+| `source_run_dir` | 相对 `experiments/graduation/` 的 run-dir 名 |
+| `source_file` | 通常为 `results.jsonl` |
+| `source_row_number` | 1-based JSONL 行号（仅辅助定位，追加后会失效） |
+| `experiment_id` | 源记录的实验身份 |
+| `sample_id` / `group` / `condition` / `repeat_index` / `round_index` | 源记录身份字段，逐条照抄 |
+| `source_prompt_sha256` | 源记录里的 Prompt 哈希 |
+| `source_result_row_sha256` | 该行规范 JSON 的 SHA256（**稳定行标识，优先于行号**） |
+| `source_results_file_sha256` | 打包时源文件整体 SHA256 |
+| `generated_utc` / `generator_version` | 生成时间与打包脚本版本 |
+
+- **自身审计**：生成后记录 `mapping.csv` 的 SHA256、字节数、行数到
+  `blind_private/MAPPING-AUDIT.md`（同样不进 Git）；任何一次重打包都必须保留旧哈希，不得覆盖历史。
+- **一致性自检**：每个 `blind_id` 恰好对应一行；phase 计数必须为 84 / 6 / 23；同一
+  `(source_run_dir, source_row_number, source_result_row_sha256)` 不得对应两个 `blind_id`；84 与 6
+  的交集必须为空。
+
+#### 5.4.6 评分记录：统一长表（取代宽表）
+
+**统一形式**：每个 `(blind_id, rater_id)` **一行**；两位评分者各一行；原始分全量保留，不合并、
+不覆盖、不先取平均。κ 按 `blind_id` 配对两人的原始行计算。
+
+- 正式 84 份（`blind_ratings/ratings_formal_raw.csv`）：
+  `blind_id, rater_id, phase, P1, P2, P3, P4, S2, S3_flag, S4_verdict, notes`
+- 校准 6 份（`blind_ratings/ratings_calibration_raw.csv`）：同一 schema，`phase=calibration`。
+- 补充 23 份（`blind_ratings/ratings_supplement_raw.csv`）：
+  `blind_id, rater_id, phase, E1, E7, notes`
+- **裁决表**（`ratings_adjudicated.csv`）：
+  `blind_id, item, rater_a_value, rater_b_value, final_value, adjudicator, reason, decided_utc`；
+  只对触发阈值（1–5 分相差 >1、0/1 相反）的项写入，**不得**改写原始表。
+- **最终表**（`ratings_final.csv`）：`blind_id, phase, P1, P2, P3, P4, S2, S3_flag, S4_verdict`
+  （补充批次另一份 `ratings_supplement_final.csv`：`blind_id, E1, E7`）；只能由原始表 + 裁决表派生。
+- 评分表**不得**含 `sample_id` / `group` / `repeat_index` / `run_id`；只允许 `blind_id`、`rater_id`、
+  `phase` 与评分列。
+- 缺值与不适用：统一写 `N/A`（CSV 可留空，但必须在该列说明），**不得写 0**；`0` 只表示“判定为没有
+  该问题”。任何“未评完”的格子不得当作 0 参与聚合。
+
+#### 5.4.7 字段适用范围（逐批次矩阵）
+
+| 批次 | 份数 | P1 | P2 | P3 | P4 | S2 | S3_flag | S4_verdict | E1 | E7 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 正式（A/B/C/D） | 84 | ✓ | ✓ | 仅 S1–S6（72） | ✓ | ✓ | 仅 S3/S6（24） | 仅 S6（12） | N/A | N/A |
+| 校准 | 6 | 按所属样本同主表口径 | 同左 | 同左 | 同左 | 同左 | 同左 | 同左 | N/A | N/A |
+| S7-empty × D | 3 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | N/A |
+| B0（S5/S7） | 10 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | ✓ |
+| C-subj / D-subj（S5） | 10 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | ✓ |
+
+- 主 84 的计数口径：P1/P2/P4/S2 各 **84**；P3 **72**（S7 的 12 份不评 P3）；`S3_flag` **24**
+  （S3、S6 各 12）；`S4_verdict` **12**（仅 S6）。这些数只说明“哪些格子该有分”，不改变 84 的
+  实验总量。
+- 补充批次的 E1/E7 只做 **0/1 flag 复核**，没有 1–5 分；`S3_flag` 对补充批次不适用（无 S3/S6 输出）。
+- 若实现时发现 E1/E7 在某批次确有歧义（例如 B0 的 S7 输出是否算“无证据编造”），**先列出该批次的
+  逐样本适用矩阵并报告**，不得直接扩大评分范围或临时改 rubric。
+
+#### 5.4.8 LLM 作为辅助评分者（不参与主结论）
+
+同一 rubric、`temperature=0`、同一份盲评材料评 3 次取多数；只报告其与人工均分的 Spearman 相关与
+κ，**不作为主结论依据**，不参与假设检验，也不得用它替代任何一位人类评分者。
+
+#### 5.4.9 工作量
+
+每位评分者：6 份校准 + 84 份完整盲评 + 23 份 flag 复核 = **113 份**（两人 **226 份次**）；其中
+84 / 23 两个数不变，6 份校准单列、不进主统计。完整盲评含 **408 个 1–5 评分点/人**（两人 816 个）、
+`S3_flag` 24 份/人（两人 48 个判定）、`S4_verdict` 12 份/人（两人 24 个判定）。
 
 ### 5.5 统计方法
 
@@ -846,14 +1014,14 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 
 | 项目 | 规则 |
 | --- | --- |
-| 原始评分 | 两位评分者对每份输出的分数**分两列全量保留**（`rater_a`、`rater_b`），不合并、不覆盖 |
+| 原始评分 | 两位评分者对每份输出的分数**按 §5.4.6 的长表全量保留**（每个 `blind_id` + `rater_id` 一行），不合并、不覆盖；禁止 `rater_a`/`rater_b` 宽表 |
 | 一致性 | 在**未裁决的原始评分**上计算二次加权 Cohen's κ（0/1 项用 Cohen's κ），同时报告有效份数 n |
 | 裁决触发 | 连续评分两人相差 **>1 分**，或 0/1 判定**相反**；相差 ≤1 分的连续评分、一致的 0/1 **不触发** |
 | 裁决执行 | 由第三人（或双方讨论后）给出裁决分，写入**独立裁决列**，并记录裁决人与理由 |
 | 连续评分最终分 | 未触发 → 两人**算术均值**；触发 → **裁决值** |
 | 0/1 最终分 | 两人一致 → 直接采用该值；不一致 → **裁决值** |
 | 未决项 | 保留 `pending` 状态，**不参与**格内均值/比例，不进入任何聚合与检验；报告须列出未决份数 |
-| 数据落库 | `ratings_raw.csv`（原始两列）／`ratings_adjudicated.csv`（裁决列 + 理由）／`ratings_final.csv`（最终分）**三份分列保存**，后一份只能由前一份派生，任何一步都不得覆盖上游数据 |
+| 数据落库 | 原始分按 §5.4.6 长表（`ratings_formal_raw.csv` / `ratings_calibration_raw.csv` / `ratings_supplement_raw.csv`），裁决表 `ratings_adjudicated.csv`（裁决列 + 理由），最终表 `ratings_final.csv` **三份分列保存**，后一份只能由前一份派生，任何一步都不得覆盖上游数据 |
 | 聚合与检验 | 先按 (样本, 条件) 做格内聚合（3 份 → 1 个格值），再做 n=7 样本级配对检验；**任何一步都不得跳过格内聚合直接把份级数据当样本** |
 
 **1）描述统计。** 每条件每指标的均值、标准差、中位数、格内 SD（生成噪声）与 95% bootstrap 置信
@@ -975,18 +1143,20 @@ m=7 才可能过线。** 具体地：
    外的 15 份补充。
 7. **自动判定**：跑 M1–M4、Y1–Y5 与 `check_grounding`，输出 `auto_metrics.csv` 与失败清单；
    补充批次单独出一份表，不并入主表。
-8. **盲评**：生成 84 份主实验盲评包 → 两位评分者独立打分（P1/P2/P4/S2 四项；P3 仅 S1–S6；S3_flag
-   仅 S3/S6）→ 记录 `ratings_raw.csv`（含评分者 id、盲 id、分数、0/1 判定、备注）→ 计算一致性并
-   裁决；补充的 23 份只做 flag 复核，单独记 `ratings_supplement.csv`。
+8. **盲评**：按 §5.4 先抽定 84 份主实验盲评包，再在剩余 56 份中抽 6 份校准（`phase=calibration`）→
+   两位评分者先各自独立评校准 6 份、讨论统一尺度 → 各自独立评 84 份（P1/P2/P4/S2；P3 仅 S1–S6；
+   `S3_flag` 仅 S3/S6；`S4_verdict` 仅 S6）→ 按 §5.4.6 的长表记录原始分 → 计算一致性并裁决；
+   补充 23 份只做 flag 复核（S7-empty 3 份只评 E1），单独记 `ratings_supplement_raw.csv`。
 9. **分析**：生成描述统计表、箱线图、假设检验结果、错误分类统计、个案摘录（S3/S5/S6/S7）。
 10. **归档**：`experiments/graduation/` 下提交配置、样本、prompt 哈希、每个 run-dir 的 `plan.json`
     （v4.2 起，记录执行顺序与 `plan_sha256`）与 `results.jsonl`、聚合指标、评分表、分析脚本与报告；
     原始输出若过大可只提交 JSONL 压缩包并在报告里给出校验和。
 
 预计规模：主实验 140 次 + 补充 25 次 = **165 次生成**（每次 1–3 次模型调用，合计 165–495 次对话
-调用），约 2 小时机器时间；人工评分：每位评分者 **84 份完整盲评 + 23 份 flag 复核 = 107 份**
-（两人共 **214 份次**），其中完整盲评含 **408 个 1–5 评分点/人**（两人 816 个）、`S3_flag` 24 份/人
-（两人 48 个判定）、`S4_verdict` 12 份/人（两人 24 个判定）。
+调用），约 2 小时机器时间；人工评分：每位评分者 **6 份校准 + 84 份完整盲评 + 23 份 flag 复核 =
+113 份**（两人共 **226 份次**），其中 84 / 23 两个数不变、6 份校准单列且不进主统计。完整盲评含
+**408 个 1–5 评分点/人**（两人 816 个）、`S3_flag` 24 份/人（两人 48 个判定）、`S4_verdict` 12 份/人
+（两人 24 个判定）。
 
 ---
 
@@ -1034,13 +1204,25 @@ v4.2 起：`repeat_index == round_index`（取值 0..4）；`plan_seq` 是 `plan
 `seed` / `scheme` / `algorithm_version` / `plan_sha256` 用于核对结果行与计划文件是否同源。
 旧字段 `condition` / `repeat` 保留显示，实际调度与去重以 `group` / `repeat_index` 为准。
 
-### 7.2 盲评记录（CSV）
+### 7.2 盲评记录（CSV，统一长表）
 
-`blind_id, rater_id, P1, P2, P3, P4, S2, S3_flag, S4_verdict, notes`
+**统一形式**：每个 `(blind_id, rater_id)` 一行；两位评分者各一行；原始分全量保留，不合并、不覆盖。
+κ 按 `blind_id` 配对两人的原始行计算。字段适用范围见 §5.4.7，不适用一律 `N/A` 或空，**不得填 0**。
 
-其中 `P3` 可为空（S7 记 N/A）、`S3_flag ∈ {0,1}`（仅 S3、S6 填写）、`S4_verdict ∈ {full, partial,
-wrong}`（仅 S6 填写）。主实验 84 份入此表；补充批次另记 `ratings_supplement.csv`
-（`blind_id, rater_id, E1, E7, S3_flag, notes`），只有 0/1，没有 1–5 分。
+- 正式 84 份（`ratings_formal_raw.csv`）：
+  `blind_id, rater_id, phase, P1, P2, P3, P4, S2, S3_flag, S4_verdict, notes`
+  - `phase=formal`；`P3` 仅 S1–S6 填写（S7 记 `N/A`）；`S3_flag ∈ {0,1}` 仅 S3、S6；
+    `S4_verdict ∈ {full, partial, wrong}` 仅 S6。
+- 校准 6 份（`ratings_calibration_raw.csv`）：同一 schema，`phase=calibration`；不进入主 κ 与检验。
+- 补充 23 份（`ratings_supplement_raw.csv`）：`blind_id, rater_id, phase, E1, E7, notes`
+  （`phase=supplementary`，只有 0/1，没有 1–5 分，也没有 `S3_flag`）。
+- 裁决表 `ratings_adjudicated.csv`：
+  `blind_id, item, rater_a_value, rater_b_value, final_value, adjudicator, reason, decided_utc`；
+  只对触发阈值的项写入，**不得改写原始表**。
+- 最终表 `ratings_final.csv`（及 `ratings_supplement_final.csv`）：只能由原始表 + 裁决表派生。
+
+**私有映射 `mapping.csv` 不属于评分记录**：它单独存放在 `blind_private/`，字段与安全要求见 §5.4.5，
+**不得**混入任何 `ratings_*.csv`，不得随盲评包分发，不得提交 Git。
 
 ### 7.3 记忆核对表（Markdown/CSV）
 
@@ -1144,7 +1326,8 @@ experiments/graduation/
                              # （没有 --supplementary，补充组靠 --sample/--group 显式进入计划）
   check_memory.py            # M1–M4
   check_auto.py              # Y1–Y5 + check_grounding
-  make_blind_pack.py         # 盲评包（主实验 84 份 + 补充 flag 23 份）
+  make_blind_pack.py         # 盲评包（正式 84 + 校准 6 + 补充 flag 23）与私有映射，见 §5.4；
+                             # 尚未实现；实现前不得先生成盲评包
   analyze_stats.py           # Wilcoxon 精确检验、r_rb、dz、Holm、bootstrap CI
   analyze.py                 # 描述统计、图表、案例摘录
   report/EXPERIMENT-REPORT.md
