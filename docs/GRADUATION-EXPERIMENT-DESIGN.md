@@ -1,12 +1,14 @@
 # 毕业设计实验方案设计：长期学习记忆对学习状态评估与个性化计划生成的影响
 
 - 文档状态：**设计稿（Design Only）**，尚未执行任何实验
-- 版本：v4.3（2026-11-13；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
+- 版本：v4.4（2026-11-13；v2 按第一轮独立审查意见修订统计方法、组别与运行次数、H3 定位、结论边界；
   v3 按第二轮意见修订双人盲评与统计细节口径，并按**实跑**校准 §3.2 的记忆 Gold Standard；
   v4 按执行层落地固定 RAG 口径、B0 槽位与采样参数；v4.1（2026-11-13）把 S5×C-subj / S5×D-subj /
   S7-empty×D 补充组落到执行层；v4.2（2026-11-13）把调度升级为五轮随机区组，`plan.json` 成为
-  执行顺序的唯一依据，并补断点续跑与 fail-closed 校验；v4.3（2026-11-13）只改盲评与评分协议
-  （去身份 `blind_id`、84/6/23 抽样规则、私有映射、统一长表），不改假设与统计口径。
+  执行顺序的唯一依据，并补断点续跑与 fail-closed 校验；v4.3（2026-11-13）改盲评与评分协议
+  （去身份 `blind_id`、84/6/23 抽样规则、私有映射、统一长表）；v4.4（2026-11-13）收紧盲评隐私边界
+  （`selection_audit.csv` 移入私有目录、`blind_id` 只用 CSPRNG、`.gitignore` 列为实施前置条件）
+  并冻结补充批次逐样本 E1/E7 矩阵，不改假设与统计口径。
   均见下节"版本与修改说明"）
 - 基线：`main` = `53a18b3985ed9e964ca197e22b167fbb7225d878`
 - 适用系统：AI-Study-Assistant（FastAPI + SQLite + LangGraph + 可切换模型后端）
@@ -128,6 +130,26 @@ Prompt / 样本 / Gold Standard、执行 seed `20261113`，也**不改** 140 / 1
    §5.5 `rater_a/rater_b` 宽表与 §7.2 长表的口径矛盾；裁决表与最终表独立保存、不覆盖上游。
 7. **字段适用范围逐批次写明**：P3 = 72（仅 S1–S6）、`S3_flag` = 24（仅 S3/S6）、
    `S4_verdict` = 12（仅 S6）；补充批次只评 E1/E7；不适用一律 `N/A` 或空，**不得填 0**。
+
+### v4.4（2026-11-13，盲评隐私边界与补充评分适用矩阵）
+
+本版是 v4.3 之后的**修订补丁**，只收紧盲评隐私边界、冻结补充批次的逐样本 E1/E7 矩阵，
+**不改** v4.3 已经审定的抽样规则（84 份每格 5 取 3、6 份校准与 84 严格分离、23 份补充数量）、
+长表评分格式、κ / 裁决 / 最终分的先后关系，也不改执行 seed `20261113`：
+
+1. **`selection_audit.csv` 移出盲评包**：该文件含 `sample_id` / `group` / `repeat_index` / `plan_seq`
+   / 行哈希等身份字段，改存 `experiments/graduation/blind_private/`，只由研究负责人访问，
+   不放入 `blind_pack/`、不交给评分者、不提交 Git（§5.4.2）。
+2. **`blind_id` 只允许独立 CSPRNG 生成**：删除 v4.3 允许的
+   `SHA-256(seed|blind-id-allocation|source_result_row_sha256)` 确定性派生方式；`blind_id` 与身份、
+   条件、轮次、源行哈希、抽样 seed 之间不得存在可公开计算的确定性编码，唯一对应关系只保存在私有
+   `mapping.csv`；重打包必须记录新映射版本与旧映射哈希，不得静默覆盖（§5.4.1、§5.4.5）。
+3. **`.gitignore` 改为实施前置条件**：`blind_private/` 目前**尚未**被忽略，生成 `mapping.csv` 之前
+   必须先添加规则并用 `git check-ignore -v` 验证，验证未通过不得写入（§5.4.5）；本 PR 不改
+   `.gitignore`，实际规则在后续脚本实现 PR 中添加。
+4. **冻结 B0 的逐样本评分矩阵**：B0-S5 评 E1 + E7，B0-S7 只评 E1（E7 = `N/A`）；C-subj/D-subj-S5
+   评 E1 + E7；S7-empty-D 只评 E1。同时写明 S7 的 E1 判定边界（准确复述两次未完成不算 E1，
+   夸大为稳定当前事实才算）（§5.4.4、§5.4.7）。
 
 ---
 
@@ -813,10 +835,11 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 - **补充实验用同一机制、各自独立计划**：C-subj/D-subj 在 S5 上两组 × 5 轮 = 10 份；S7-empty × D
   是单条件 5 次（同样记录 `round_index` / `repeat_index` = 0..4，但它**不是四条件区组**，只是
   单条件的重复观察）。每个补充 run-dir 有自己的 `plan.json`，不与主实验共用。
-- **人工盲评（v4.3 起按 §5.4 执行）**：先从主实验每 (样本, 条件) 的 5 份中按冻结盲评种子抽 **3**
+- **人工盲评（v4.4 起按 §5.4 执行）**：先从主实验每 (样本, 条件) 的 5 份中按冻结盲评种子抽 **3**
   份，共 7×4×3 = **84** 份；再由同一 seed 在**剩余 56 份**中另抽 **6** 份校准（与 84 严格分离）。
-  补充批次 23 份（S7-empty 5 取 3、B0 10、C-subj/D-subj 10）只做 flag 复核。抽样规则、去身份
-  `blind_id`、私有映射与评分表结构见 §5.4。
+  补充批次 23 份（S7-empty 5 取 3、B0 10、C-subj/D-subj 10）只做 flag 复核；其中 B0-S7 与
+  S7-empty 只评 E1、E7 记 `N/A`。抽样规则、CSPRNG 生成的去身份 `blind_id`、私有映射与评分表结构
+  见 §5.4。
 
 **统计边界（v4.2 必须写进报告，避免把调度区组误当样本量）**
 
@@ -828,7 +851,7 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
    变化。若整体变化发生在实验中途，仍需在结果里记录（发生时间、provider / model / 版本、
    受影响批次）并在讨论中说明，不能把跨版本差异写成记忆效应。
 
-### 5.4 人工盲评与评分材料（v4.3）
+### 5.4 人工盲评与评分材料（v4.4）
 
 > 本节只定义**材料怎么生成、怎么匿名、怎么记录**；评分合并与统计仍按 §5.5，二者冲突时以 §5.5 的
 > 0.1 / 0.2 为准。本节描述的 `make_blind_pack.py` 等脚本**尚未实现**，此处先冻结协议，实现时必须
@@ -841,20 +864,30 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 2. 禁止把评分列、`blind_id`、`mapping.csv` 回写进 `results.jsonl` / `plan.json` / B0 legacy；
    禁止改写、重命名或删除任何 run-dir。
 3. 三类产物分开存放：`blind_pack/`（可分发给评分者）、`blind_private/`（映射与审计，禁止分发）、
-   `blind_ratings/`（原始 / 裁决 / 最终评分表）。
+   `blind_ratings/`（原始 / 裁决 / 最终评分表）。凡含 `sample_id` / `group` / `repeat_index` / 行哈希
+   的审计文件一律归入 `blind_private/`，**不得**放进 `blind_pack/`。
 
 #### 5.4.1 `blind_id`：彻底去身份
 
-- 形式：RFC 4122 UUIDv4 的小写规范串，或 32 位小写十六进制随机串；由 `secrets` / `os.urandom`
-  生成，或由固定盲评种子经 `SHA-256(seed|blind-id-allocation|source_result_row_sha256)` 派生
-  （便于复现，但派生结果同样不得含身份片段）。
+- 形式：RFC 4122 UUIDv4 的小写规范串，或 32 位小写十六进制随机串；**只允许**由 `secrets` /
+  `os.urandom` 等操作系统密码学随机源生成（CSPRNG），每条源输出独立分配一个 `blind_id`。
+- **禁止**用任何确定性派生方式生成 `blind_id`（包括
+  `SHA-256(seed|blind-id-allocation|source_result_row_sha256)` 这类“种子 + 源行哈希”的编码）：
+  只要输入里含 seed、源身份或源行哈希，拿到 seed 与结果文件的人就能反算并对照，匿名即失效。
+  抽样（selection）本身仍用冻结的 `blind_sampling_seed` + SHA-256 确定性排序（§5.4.2），
+  但**ID 分配与抽样是两件事**，ID 不参与任何可公开复算的编码。
 - **禁止**包含或可反推 `sample_id`、`group` / `condition`、`repeat_index` / `round_index`、
   `run_id`、`experiment_id`、源文件名或生成日期；不得用可枚举序号（`001`、`002`…）代替随机 ID。
 - 同一份输出对两位评分者使用**同一个** `blind_id`；两人只共享评分口径，不共享映射。
+- `blind_id` 与源记录的唯一对应关系**只保存在** `blind_private/mapping.csv`（§5.4.5），
+  不存在第二处可计算的对应关系。
+- 需要重新生成盲评材料时，必须在新映射文件里记录**映射版本**与**被替换的旧映射 SHA256**，
+  不得静默覆盖历史映射；旧包与旧映射一并归档留痕。
 - 文件名只含 `blind_id`（如 `<blind_id>.md`），不得出现样本名、组名、轮次或“第几批”。
 - 每位评分者的盲评包**顺序独立随机化**（两人看到不同顺序），避免顺序效应。
 - 去身份自检（打包脚本必须输出并通过）：对全部 `blind_id` 做正则扫描，不得命中 `S[1-7]`、
-  `A|B|C|D|B0|C-subj|D-subj`、`r[0-4]`、日期或 `run_id` 片段。
+  `A|B|C|D|B0|C-subj|D-subj`、`r[0-4]`、日期或 `run_id` 片段；同时对两份评分包的文件名与正文
+  做同样的扫描，命中即停止打包。
 
 #### 5.4.2 主实验 84 份：抽样规则（可复现、可审计）
 
@@ -866,10 +899,17 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 - **排序键**：对每格的每个 `repeat_index` 计算
   `SHA-256(f"{seed}|blind-main-selection|{sample_id}|{group}|{repeat_index}")`，按十六进制升序排序，
   取前 3；键相同按 `repeat_index` 升序。28 × 3 = **84**，互不重复，恰好每格 3 份。
-- **可审计产物**：`blind_pack/selection_audit.csv`，字段
+- **可审计产物（私有）**：`experiments/graduation/blind_private/selection_audit.csv`，字段
   `sample_id, group, repeat_index, plan_seq, source_prompt_sha256, source_result_row_sha256,
-  selection_hash`。该文件**不含 `blind_id`**（否则等于映射），可随包提交，供任何人用同一 seed 复算
-  并核对“选中的就是这 84 份”。
+  selection_hash`。该文件**不含 `blind_id`**，但仍含样本、组别、轮次与行哈希——拿到它就能还原
+  “哪 84 份被选中”，因此它**不是**盲评包的一部分：
+  1. 只由研究负责人访问，与 `mapping.csv` 一起存放、一起审计；
+  2. **不放入** `blind_pack/`，不交给任何评分者，不进入压缩包或共享盘；
+  3. **不提交 Git**（该目录须先被 `.gitignore` 覆盖，见 §5.4.5）；
+  4. 评分者收到的文件及其文件名不得包含上述任何身份字段；
+  5. 如需公开“抽样可复核性”，只生成**汇总审计信息**（例如每格 3 份、总 84 份、所用 seed 与算法
+     版本、重算一致/不一致的结论），**不带**样本、组别、轮次、行哈希与 `blind_id`；
+  6. 完整 `selection_audit.csv` 只能作为私有留档，供事后审计与争议复核。
 - **复现要求**：给定 seed、算法版本与源 `results.jsonl` 哈希，重算结果必须逐行一致；不一致按
   “抽样不可复现”处理并停止评分，**不得手工挑份**。
 
@@ -891,26 +931,44 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 
 #### 5.4.4 补充批次 23 份：规则
 
-| 批次 | 份数 | 抽样 | 评分字段 |
-| --- | --- | --- | --- |
-| S7-empty × D | 5 | 无放回抽 **3** | 只评 E1 |
-| B0（legacy） | 10 | 全量 | E1、E7 |
-| C-subj / D-subj（S5） | 5 + 5 | 全量 | E1、E7 |
+| 批次 | 份数 | 抽样 | E1 | E7 | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| S7-empty × D | 5 | 无放回抽 **3** | 适用 | `N/A` | 零历史证据，只查“无依据的历史主张” |
+| B0-S5（legacy） | 5 | 全量 | 适用 | 适用 | 线性代数历史困难 → 当前概率论，存在主题迁移考察 |
+| B0-S7（legacy） | 5 | 全量 | 适用 | `N/A` | 两次历史反馈只支持初步观察，不存在跨主题迁移 |
+| C-subj / D-subj-S5 | 5 + 5 | 全量 | 适用 | 适用 | 主题切换场景 |
 
 - **S7-empty 3 份**：domain `blind-s7empty-selection`，排序键
   `SHA-256(f"{seed}|blind-s7empty-selection|S7-empty|D|{repeat_index}")`，取前 3；**不得取固定前 3**
   或按文件行序取前 3；被选 3 份的 `repeat_index` 只写入私有映射，评分材料与审计文件都不出现。
 - B0 10 份与 C/D-subj 10 份**无需抽样**，全部入包；B0 是 legacy 结果，只读复制，不补字段、不重跑。
+  B0 的 10 份按样本拆成 **B0-S5（5 份）与 B0-S7（5 份）**，两者评分字段**不同**：B0-S5 评 E1 + E7，
+  B0-S7 只评 E1（E7 = `N/A`），不得为“凑字段”给 B0-S7 打 E7。
+- **S7 系（B0-S7、S7-empty-D）的 E1 判定边界**：
+  - 把历史准确复述为“过去两次未完成”**不算** E1（这是有证据的事实陈述）；
+  - 把两次历史反馈夸大为“你一直无法学会数据结构”这类稳定、持续的当前事实，**才判 E1**；
+  - 零历史（S7-empty）却出现任何历史主张，直接判 E1。
+- **E7 判定边界**：E7 只在“旧主题的困难被套用到当前新主题”时适用；S7 系没有旧主题，一律 `N/A`，
+  不得为了扩大评分量把 E7 用于 S7。C-subj/D-subj 与 B0-S5 的 E7 只就该次主题切换判断。
 - 补充批次标 `phase=supplementary`，独立目录 `blind_pack/supplementary/`；评分表独立
   （`ratings_supplement_*.csv`），**不计入主 κ**，不与 84 合并；若另算补充批次一致性，必须单独成表、
   标注“描述性、样本量小”。
-- S7-empty 只评 E1：该样本零反馈、零计划、零记忆，E7（主题漂移）与 `S3_flag` 都**不适用**，不得
-  为“凑字段”给它打分。
 
-#### 5.4.5 私有映射 `mapping.csv`
+#### 5.4.5 私有映射 `mapping.csv` 与私有审计目录
 
-- **位置**：`experiments/graduation/blind_private/mapping.csv`。该目录整体 `.gitignore`，禁止提交；
-  评分期间只在本机受控保存，**不得**进入任何评审包、压缩包或共享盘。
+- **位置**：`experiments/graduation/blind_private/`，其中至少包含 `mapping.csv`、
+  `selection_audit.csv` 与 `MAPPING-AUDIT.md`。禁止提交 Git；评分期间只在本机受控保存，
+  **不得**进入任何评审包、压缩包或共享盘。
+- **`.gitignore` 是实施前置条件，目前尚未满足**：截至 v4.4，`.gitignore` 只有
+  `experiments/graduation/runs/`，**没有** `experiments/graduation/blind_private/`。因此在生成
+  `mapping.csv` 之前必须按顺序完成：
+  1. 向 `.gitignore` 添加一行 `experiments/graduation/blind_private/`；
+  2. 用 `git check-ignore -v experiments/graduation/blind_private/mapping.csv`（以及
+     `selection_audit.csv`、`MAPPING-AUDIT.md`）验证确实命中忽略规则；
+  3. 忽略验证未通过时，**不得创建或写入** `mapping.csv` / `selection_audit.csv`；
+  4. `mapping.csv`、`MAPPING-AUDIT.md` 与私有 `selection_audit.csv` 绝不能 `git add` / 提交；
+  5. 本设计文档版（v4.4）**不改** `.gitignore`，实际规则在后续脚本实现 PR 中一并添加；
+     在规则落地前，文档不得被理解为“该目录已被忽略”。
 - **字段（至少这些，缺一不可）**：
 
 | 字段 | 说明 |
@@ -961,15 +1019,23 @@ H5→Y2/Y3/Y5；H-risk→S3（当前/历史区分）、S7（无证据主张）�
 | 正式（A/B/C/D） | 84 | ✓ | ✓ | 仅 S1–S6（72） | ✓ | ✓ | 仅 S3/S6（24） | 仅 S6（12） | N/A | N/A |
 | 校准 | 6 | 按所属样本同主表口径 | 同左 | 同左 | 同左 | 同左 | 同左 | 同左 | N/A | N/A |
 | S7-empty × D | 3 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | N/A |
-| B0（S5/S7） | 10 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | ✓ |
-| C-subj / D-subj（S5） | 10 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | ✓ |
+| B0-S5（legacy） | 5 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | ✓ |
+| B0-S7（legacy） | 5 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | N/A |
+| C-subj / D-subj-S5 | 10 | N/A | N/A | N/A | N/A | N/A | N/A | N/A | ✓ | ✓ |
 
 - 主 84 的计数口径：P1/P2/P4/S2 各 **84**；P3 **72**（S7 的 12 份不评 P3）；`S3_flag` **24**
   （S3、S6 各 12）；`S4_verdict` **12**（仅 S6）。这些数只说明“哪些格子该有分”，不改变 84 的
   实验总量。
 - 补充批次的 E1/E7 只做 **0/1 flag 复核**，没有 1–5 分；`S3_flag` 对补充批次不适用（无 S3/S6 输出）。
-- 若实现时发现 E1/E7 在某批次确有歧义（例如 B0 的 S7 输出是否算“无证据编造”），**先列出该批次的
-  逐样本适用矩阵并报告**，不得直接扩大评分范围或临时改 rubric。
+- **E1/E7 逐样本边界**（v4.4 冻结）：
+  - **E1**：把两次历史反馈准确复述为“过去两次未完成”**不算** E1；把两次历史反馈夸大为
+    “你一直无法学会数据结构”这类稳定、持续的当前事实**才判 E1**；零历史（S7-empty）出现任何
+    历史主张即判 E1。
+  - **E7**：只在“旧主题困难被套用到当前新主题”时适用。B0-S5、C-subj/D-subj-S5 适用（线代 → 概率论
+    的主题迁移）；B0-S7、S7-empty-D 一律 `N/A`，不得为扩大评分量改用 E7。
+  - 不适用一律 `N/A` 或空，**不得填 0**；`0` 只表示“该问题被判定为不存在”。
+- 若实现时发现其他批次确有歧义，**先列出该批次的逐样本适用矩阵并报告**，不得直接扩大评分范围
+  或临时改 rubric。
 
 #### 5.4.8 LLM 作为辅助评分者（不参与主结论）
 
@@ -1146,7 +1212,9 @@ m=7 才可能过线。** 具体地：
 8. **盲评**：按 §5.4 先抽定 84 份主实验盲评包，再在剩余 56 份中抽 6 份校准（`phase=calibration`）→
    两位评分者先各自独立评校准 6 份、讨论统一尺度 → 各自独立评 84 份（P1/P2/P4/S2；P3 仅 S1–S6；
    `S3_flag` 仅 S3/S6；`S4_verdict` 仅 S6）→ 按 §5.4.6 的长表记录原始分 → 计算一致性并裁决；
-   补充 23 份只做 flag 复核（S7-empty 3 份只评 E1），单独记 `ratings_supplement_raw.csv`。
+   补充 23 份只做 flag 复核（S7-empty 3 份与 B0-S7 只评 E1；B0-S5、C/D-subj 评 E1 + E7），单独记
+   `ratings_supplement_raw.csv`。抽样清单 `selection_audit.csv` 与 `mapping.csv` 同存
+   `blind_private/`，只留本机、不进包、不提交。
 9. **分析**：生成描述统计表、箱线图、假设检验结果、错误分类统计、个案摘录（S3/S5/S6/S7）。
 10. **归档**：`experiments/graduation/` 下提交配置、样本、prompt 哈希、每个 run-dir 的 `plan.json`
     （v4.2 起，记录执行顺序与 `plan_sha256`）与 `results.jsonl`、聚合指标、评分表、分析脚本与报告；
@@ -1221,8 +1289,9 @@ v4.2 起：`repeat_index == round_index`（取值 0..4）；`plan_seq` 是 `plan
   只对触发阈值的项写入，**不得改写原始表**。
 - 最终表 `ratings_final.csv`（及 `ratings_supplement_final.csv`）：只能由原始表 + 裁决表派生。
 
-**私有映射 `mapping.csv` 不属于评分记录**：它单独存放在 `blind_private/`，字段与安全要求见 §5.4.5，
-**不得**混入任何 `ratings_*.csv`，不得随盲评包分发，不得提交 Git。
+**私有映射与私有抽样清单不属于评分记录**：`mapping.csv` 与 `selection_audit.csv` 单独存放在
+`blind_private/`，字段与安全要求见 §5.4.5，**不得**混入任何 `ratings_*.csv`，不得随盲评包分发，
+不得提交 Git（该目录的 `.gitignore` 规则目前尚未添加，属实施前置条件）。
 
 ### 7.3 记忆核对表（Markdown/CSV）
 
@@ -1327,7 +1396,10 @@ experiments/graduation/
   check_memory.py            # M1–M4
   check_auto.py              # Y1–Y5 + check_grounding
   make_blind_pack.py         # 盲评包（正式 84 + 校准 6 + 补充 flag 23）与私有映射，见 §5.4；
+                             # blind_id 只用 CSPRNG；生成前必须先加 .gitignore 规则并验证；
                              # 尚未实现；实现前不得先生成盲评包
+  blind_private/             # 私有：mapping.csv / selection_audit.csv / MAPPING-AUDIT.md；
+                             # 不进盲评包、不提交 Git（忽略规则随脚本实现 PR 添加）
   analyze_stats.py           # Wilcoxon 精确检验、r_rb、dz、Holm、bootstrap CI
   analyze.py                 # 描述统计、图表、案例摘录
   report/EXPERIMENT-REPORT.md
