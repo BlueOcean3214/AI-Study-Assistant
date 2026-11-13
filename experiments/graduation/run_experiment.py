@@ -244,53 +244,111 @@ def evidence_steps(group, inputs):
         )
 
     if slots["memory"]:
+        if slots.get("memory_scope") == "subject":
+            # 补充组：evidence 必须与真正注入 Prompt 的是同一次主题过滤调用，
+            # 并把 subject / limit 原样记进 arguments，便于事后复算。
+            tool_result = inputs["subject_memory_tool"]
+            arguments = {
+                "subject": inputs["subject_filter"],
+                "limit": int(inputs["memory_limit"]),
+            }
+        else:
+            tool_result = inputs["memory_tool"]
+            arguments = {}
+
         steps.append(
             {
                 "type": "tool_call",
                 "tool": "get_learning_memory",
-                "arguments": {},
-                "ok": True,
-                "error_type": None,
-                "result": inputs["memory_tool"],
+                "arguments": arguments,
+                "ok": bool(tool_result.get("ok")),
+                "error_type": tool_result.get("error_type"),
+                "result": tool_result,
             }
         )
 
     return steps
 
 
+class PlanError(RuntimeError):
+    """非法的 (样本, 组) 组合；必须在创建目录与调用模型之前拒绝。"""
+
+
 def resolve_plan(args, config):
     """把 CLI 展开成 (样本, 组) 任务对，B0 的默认样本范围独立于其他组。
 
-    - 不给 --sample：A/B/C/D × 全部样本，B0 × 仅 B0_DEFAULT_SAMPLES（S5、S7）；
+    - 不给 --sample：A/B/B0/C/D × 全部样本，B0 × 仅 B0_DEFAULT_SAMPLES（S5、S7）；
+      补充组 C-subj/D-subj 与 S7-empty 默认绝不进入计划。
     - --group B0：只有 B0 × S5、S7；
     - --group A --group B0：A × 全部样本、B0 × S5、S7；
+    - --group C-subj --group D-subj：只允许 S5（--sample S5 或默认样本里的 S5）；
+    - --sample S7-empty --group D：只允许 D，且必须显式同时给出样本与组；
     - 显式 --sample：样本范围由用户决定，所有选中组都在这些样本上跑；
       该覆盖逐条记进结果元数据（sample_selection / b0_sample_override）。
 
     任务对而不是「一个全局样本列表」：否则混合组时 B0 会被扩张到全部样本。
     """
 
-    groups = list(args.group or build_prompts.GROUP_SLOTS)
+    groups = list(args.group or build_prompts.DEFAULT_GROUPS)
     explicit = bool(args.sample)
     samples = list(args.sample) if explicit else seed_fixture.sample_ids(config)
 
+    for sample_id in samples:
+        try:
+            seed_fixture.load_sample(sample_id, config)
+        except FileNotFoundError as error:
+            raise PlanError(f"样本文件不存在：{sample_id}") from error
+
     plan = []
+
+    def add(sample_id, group):
+        if group not in build_prompts.GROUP_SLOTS:
+            raise PlanError(f"未知的组：{group}")
+
+        if group in build_prompts.SUBJECT_GROUPS:
+            allowed = build_prompts.SUBJECT_GROUP_SAMPLES[group]
+            if sample_id not in allowed:
+                raise PlanError(
+                    f"{group} 只允许在 {'/'.join(allowed)} 上执行，收到 {sample_id}"
+                )
+
+        if sample_id == build_prompts.EMPTY_SAMPLE_ID:
+            if group not in build_prompts.EMPTY_SAMPLE_GROUPS:
+                raise PlanError(
+                    f"{sample_id} 只允许 {'/'.join(build_prompts.EMPTY_SAMPLE_GROUPS)} 组，"
+                    f"收到 {group}；请使用 --sample {sample_id} "
+                    f"--group {' --group '.join(build_prompts.EMPTY_SAMPLE_GROUPS)}"
+                )
+
+            if not explicit:
+                # 默认矩阵永远不包含 S7-empty，避免它混进主实验
+                return
+
+        if not explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES:
+            return
+
+        plan.append(
+            {
+                "sample_id": sample_id,
+                "group": group,
+                "sample_selection": "explicit" if explicit else "default",
+                "b0_sample_override": bool(
+                    explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES
+                ),
+            }
+        )
+
+    # 旧版结果的任务对顺序：先 A/B/C/D 逐样本，再 B0 逐样本（B0 排在最后），
+    # 这样新增补充组不会改变已有记录的顺序，旧结果仍可逐条对照。
+    for sample_id in samples:
+        for group in groups:
+            if group != "B0":
+                add(sample_id, group)
 
     for sample_id in samples:
         for group in groups:
-            if not explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES:
-                continue
-
-            plan.append(
-                {
-                    "sample_id": sample_id,
-                    "group": group,
-                    "sample_selection": "explicit" if explicit else "default",
-                    "b0_sample_override": bool(
-                        explicit and group == "B0" and sample_id not in B0_DEFAULT_SAMPLES
-                    ),
-                }
-            )
+            if group == "B0":
+                add(sample_id, group)
 
     return plan
 
@@ -573,7 +631,11 @@ def main(argv=None):
     args = parse_args(argv)
     config = seed_fixture.load_config(args.config)
 
-    plan = resolve_plan(args, config)
+    try:
+        plan = resolve_plan(args, config)
+    except PlanError as error:
+        print(f"拒绝运行：{error}", file=sys.stderr)
+        return 2
 
     if not plan:
         print("没有可运行的任务（B0 只在 S5、S7 上有默认样本，请显式指定 --sample）")

@@ -280,21 +280,33 @@ def plan_pairs(plan):
     return [(task["sample_id"], task["group"]) for task in plan]
 
 
+def default_group_order():
+    """默认矩阵的组顺序：A/B/C/D 逐样本，B0 排在最后（与 resolve_plan 两阶段一致）。
+
+    补充组 C-subj/D-subj 与 S7-empty 不属于默认矩阵，只有显式 --group/--sample
+    才进入计划，因此这里不取自 GROUP_SLOTS 的全集。
+    """
+
+    non_b0 = [group for group in build_prompts.DEFAULT_GROUPS if group != "B0"]
+    return non_b0 + ["B0"]
+
+
 def test_plan_matrix():
     """B0 的默认样本范围必须独立于其他组（任务对，不是一个全局样本列表）。"""
 
     config = seed_fixture.load_config()
     samples = seed_fixture.sample_ids(config)
-    order = list(build_prompts.GROUP_SLOTS)
+    order = default_group_order()
 
     # 1) 默认全部组：A/B/C/D × 全部样本，B0 只有 S5、S7
     plan = run_experiment.resolve_plan(run_experiment.parse_args([]), config)
     pairs = plan_pairs(plan)
     expected = [
-        (sample_id, group)
+        (sample_id, group) for sample_id in samples for group in order if group != "B0"
+    ] + [
+        (sample_id, "B0")
         for sample_id in samples
-        for group in order
-        if group != "B0" or sample_id in run_experiment.B0_DEFAULT_SAMPLES
+        if sample_id in run_experiment.B0_DEFAULT_SAMPLES
     ]
 
     check("默认计划：任务对完全符合设计", pairs == expected, pairs)
@@ -346,7 +358,8 @@ def test_plan_matrix():
     check(
         "显式 --sample 时五组都跑该样本（含 B0 覆盖标记）",
         plan_pairs(all_groups_explicit) == [("S1", group) for group in order]
-        and all_groups_explicit[2]["b0_sample_override"],
+        and [task["group"] for task in all_groups_explicit if task["b0_sample_override"]]
+        == ["B0"],
         all_groups_explicit,
     )
 
@@ -410,10 +423,12 @@ def test_main_dispatch_respects_plan(run_dir):
         build_prompts.project_api = originals["project_api"]
         run_experiment.run_one = originals["run_one"]
 
+    # main 按样本分块执行（同一实验库只隔离/建一次），所以 B0 跟随所属样本，
+    # 与 resolve_plan 返回的"B0 排最后"顺序不同，但任务对集合相同。
     expected = [
         (sample_id, group, 0)
         for sample_id in samples
-        for group in build_prompts.GROUP_SLOTS
+        for group in default_group_order()
         if group != "B0" or sample_id in run_experiment.B0_DEFAULT_SAMPLES
     ]
 
@@ -671,6 +686,11 @@ def test_slots():
         "short_term_block": "近期情况",
         "memory_result": {"count": 1, "memories": [{"content": "m"}]},
         "memory_tool": {"ok": True, "count": 1, "memories": [{"content": "m"}]},
+        # 补充组：主题过滤后的记忆 Tool 结果（与注入 Prompt 的是同一次调用）
+        "subject_memory_result": {"count": 2, "memories": [{"content": "s"}]},
+        "subject_memory_tool": {"ok": True, "count": 2, "memories": [{"content": "s"}]},
+        "subject_filter": "概率论",
+        "memory_limit": 5,
     }
 
     b0 = build_prompts.group_inputs("B0", inputs)
@@ -703,6 +723,25 @@ def test_slots():
     check("B0 evidence 只有反馈", tools("B0") == ["get_recent_feedback"], tools("B0"))
     check("C evidence 只有记忆", tools("C") == ["get_learning_memory"], tools("C"))
     check("D evidence 反馈+记忆", tools("D") == ["get_recent_feedback", "get_learning_memory"], tools("D"))
+    check(
+        "C-subj evidence 只用主题记忆且 arguments 记录 subject/limit",
+        tools("C-subj") == ["get_learning_memory"]
+        and steps["C-subj"][0]["arguments"] == {"subject": "概率论", "limit": 5}
+        and steps["C-subj"][0]["result"] is inputs["subject_memory_tool"],
+        steps["C-subj"],
+    )
+    check(
+        "D-subj evidence 是反馈+主题记忆",
+        tools("D-subj") == ["get_recent_feedback", "get_learning_memory"]
+        and steps["D-subj"][1]["arguments"] == {"subject": "概率论", "limit": 5}
+        and steps["D-subj"][1]["result"] is inputs["subject_memory_tool"],
+        steps["D-subj"],
+    )
+    check(
+        "C 主组 evidence 仍用全主题记忆且 arguments 为空",
+        steps["C"][0]["result"] is inputs["memory_tool"] and steps["C"][0]["arguments"] == {},
+        steps["C"],
+    )
 
     all_tools = {step["tool"] for group in steps for step in steps[group]}
 
@@ -796,7 +835,7 @@ def test_run_one_end_to_end(run_dir, config, api, inputs, baseline):
     recorder = run_experiment.UsageRecorder()
     records = {}
 
-    for group in build_prompts.GROUP_SLOTS:
+    for group in build_prompts.CORE_GROUPS:
         records[group] = run_experiment.run_one(
             experiment_id="exp-test",
             sample_id="S2",
@@ -812,7 +851,7 @@ def test_run_one_end_to_end(run_dir, config, api, inputs, baseline):
 
     check("五个组都产出一条记录", len(records) == 5, sorted(records))
 
-    for group in build_prompts.GROUP_SLOTS:
+    for group in build_prompts.CORE_GROUPS:
         record = records[group]
         expected = baseline["prompts"][group]["prompt_sha256"]
 

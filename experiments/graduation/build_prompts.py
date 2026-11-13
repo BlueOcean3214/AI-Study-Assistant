@@ -49,7 +49,37 @@ GROUP_SLOTS = {
     "B0": {"feedback": True, "short_term": False, "memory": False, "summary": False},
     "C": {"feedback": False, "short_term": False, "memory": True},
     "D": {"feedback": True, "short_term": True, "memory": True},
+    # 补充分析组（设计 §2.4、§4.1）：与 C/D 唯一差别是长期记忆只取当前主题。
+    # memory_scope="subject" 让 group_inputs() 改用 subject_memory_result；
+    # 不使用 subject 的旧组不写这个键，保持默认的全主题口径。
+    "C-subj": {
+        "feedback": False,
+        "short_term": False,
+        "memory": True,
+        "memory_scope": "subject",
+    },
+    "D-subj": {
+        "feedback": True,
+        "short_term": True,
+        "memory": True,
+        "memory_scope": "subject",
+    },
 }
+
+# 默认执行矩阵仍是五个主组；补充组必须显式 --group 才进入计划。
+CORE_GROUPS = ("A", "B", "B0", "C", "D")
+# 默认矩阵的任务对顺序沿用设计文档（A→B→C→D，B0 排在每组末尾），
+# 保证结果文件里的记录顺序与旧版运行一致、可逐条对照。
+DEFAULT_GROUPS = ("A", "B", "C", "D", "B0")
+SUBJECT_GROUPS = ("C-subj", "D-subj")
+SUBJECT_GROUP_SAMPLES = {"C-subj": ("S5",), "D-subj": ("S5",)}
+
+# 设计 §2.4/§4.1：S7-empty 只与 D 组配对，作为"零历史"的探索性旁证。
+EMPTY_SAMPLE_ID = "S7-empty"
+EMPTY_SAMPLE_GROUPS = ("D",)
+
+# 设计 §4.1：补充分析只做 S5，当前请求点名的主题必须归一化为概率论。
+SUBJECT_FILTER_SAMPLES = {"S5": "概率论"}
 
 MEMORY_HEADER = "【真实长期学习记忆检索结果】"
 SHORT_TERM_HEADER = "【学习者近期情况（程序统计，非模型总结）】"
@@ -59,7 +89,20 @@ MEMORY_USAGE_NOTE = (
     "引用记忆时只能按它写的历史事实表述。"
 )
 
-DIFF_PAIRS = (("A", "B"), ("A", "B0"), ("B", "B0"), ("A", "C"), ("B", "D"))
+DIFF_PAIRS = (
+    ("A", "B"),
+    ("A", "B0"),
+    ("B", "B0"),
+    ("A", "C"),
+    ("B", "D"),
+    # 补充分析组：与 C/D 的差异只应来自"记忆只取当前主题"
+    ("C", "C-subj"),
+    ("D", "D-subj"),
+)
+
+
+class SubjectResolutionError(RuntimeError):
+    """无法从当前请求与历史反馈中唯一确定主题过滤值。"""
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +209,77 @@ def empty_feedback_result(days):
     return {"days": days, "count": 0, "summary": {}, "feedback": []}
 
 
+def groups_for_sample(sample_id, include_supplementary=False):
+    """某个样本允许构建的组。
+
+    S7-empty 只允许 D（零反馈、零计划，必须单独显式指定）；其它样本默认只建
+    A/B/B0/C/D，只有显式要求补充组且该样本有主题过滤定义时才追加 C-subj/D-subj。
+    """
+
+    if sample_id == EMPTY_SAMPLE_ID:
+        return list(EMPTY_SAMPLE_GROUPS)
+
+    groups = list(CORE_GROUPS)
+
+    if include_supplementary and sample_id in SUBJECT_FILTER_SAMPLES:
+        groups.extend(SUBJECT_GROUPS)
+
+    return groups
+
+
+def validate_groups(sample_id, groups):
+    """拒绝与样本不匹配的组；调用方必须在建库与模型请求之前执行。"""
+
+    allowed = groups_for_sample(sample_id, include_supplementary=True)
+    illegal = [group for group in groups if group not in allowed]
+
+    if illegal:
+        raise ValueError(
+            f"{sample_id} 不允许构建的组：{', '.join(illegal)}；"
+            f"允许的组：{', '.join(allowed)}"
+        )
+
+    return list(groups)
+
+
+def resolve_request_subject(sample, user_message, api):
+    """用项目真实 normalize_subject() 从当前请求确定唯一的主题过滤值。
+
+    判定规则：对每条历史反馈的 task 调用 memory_service.normalize_subject()，
+    只保留归一化键出现在当前请求文本里的主题；必须恰好命中一个，否则拒绝构建。
+    这里不做任何字符串截取或手写相似词，过滤值本身就是归一化输出。
+    """
+
+    memory_service = api["memory_service"]
+    request_text = memory_service._clean_text(user_message) or ""
+    sample_label = sample.get("sample_id") or "当前样本"
+    candidates = {}
+
+    for row in sample["feedbacks"]:
+        key, _label = memory_service.normalize_subject(row["task"])
+        if key and key in request_text:
+            candidates.setdefault(key, row["task"])
+
+    if len(candidates) != 1:
+        raise SubjectResolutionError(
+            f"{sample_label} 无法唯一确定主题过滤值："
+            f"请求命中 {sorted(candidates)}（请求文本 {request_text!r}）"
+        )
+
+    key = next(iter(candidates))
+
+    # 归一化必须幂等：把过滤值再过一次 normalize_subject 不能变成别的词，
+    # 防止用近似字符串冒充真实归一化结果。
+    again, _label = memory_service.normalize_subject(key)
+
+    if again != key:
+        raise SubjectResolutionError(
+            f"{sample_label} 主题过滤值 {key!r} 归一化不幂等：{again!r}"
+        )
+
+    return key
+
+
 def collect_inputs(sample, config, api, moment):
     """收集四组共用的原始输入（只读，全部在固定时钟下进行）。"""
 
@@ -177,6 +291,21 @@ def collect_inputs(sample, config, api, moment):
     limit = int(config["memory_limit"])
     plan_date = moment.date().isoformat()
 
+    expected_subject = SUBJECT_FILTER_SAMPLES.get(sample["sample_id"])
+    subject_filter = None
+    subject_memory_tool = None
+
+    if expected_subject is not None:
+        subject_filter = resolve_request_subject(
+            sample, sample["current_user_request"], api
+        )
+
+        if subject_filter != expected_subject:
+            raise SubjectResolutionError(
+                f"{sample['sample_id']} 的主题过滤值经 normalize_subject() 归一化为 "
+                f"{subject_filter!r}，设计要求 {expected_subject!r}"
+            )
+
     with fixed_clock(api["database"], moment):
         feedback_result = agent_tools.get_recent_feedback(days=days)
         difficult, difficult_error = agent_tools._derive_difficult_previous_task()
@@ -185,11 +314,28 @@ def collect_inputs(sample, config, api, moment):
         )
         memory_tool = agent_tools.get_learning_memory(limit=limit)
 
+        if subject_filter is not None:
+            # 复用同一个产品函数，只多传 subject，不复制检索或状态机逻辑
+            subject_memory_tool = agent_tools.get_learning_memory(
+                subject=subject_filter, limit=limit
+            )
+
     if difficult_error:
         raise RuntimeError(f"{sample['sample_id']} 无法推导难度标记：{difficult_error}")
 
     memories = agent_plan_draft._memory_memories(memory_tool)
     memory_result = {"count": len(memories), "memories": memories} if memories else None
+
+    subject_memories = (
+        agent_plan_draft._memory_memories(subject_memory_tool)
+        if subject_memory_tool is not None
+        else []
+    )
+    subject_memory_result = (
+        {"count": len(subject_memories), "memories": subject_memories}
+        if subject_memories
+        else None
+    )
 
     # B0 专用：保留原始反馈行，但统计槽位固定为空 dict、难度标记固定 False
     feedback_list = feedback_result.get("feedback") or []
@@ -212,6 +358,10 @@ def collect_inputs(sample, config, api, moment):
         "short_term_info": short_term["info"],
         "memory_result": memory_result,
         "memory_tool": memory_tool,
+        "memory_limit": limit,
+        "subject_filter": subject_filter,
+        "subject_memory_result": subject_memory_result,
+        "subject_memory_tool": subject_memory_tool,
         "plan_date": plan_date,
     }
 
@@ -240,11 +390,19 @@ def group_inputs(group, inputs):
         )
         difficult = inputs["difficult"] if slots["feedback"] else False
 
+    if not slots["memory"]:
+        memory_result = None
+    elif slots.get("memory_scope") == "subject":
+        # C-subj / D-subj：同一个记忆槽位，只换成"仅当前主题"的 Tool 结果
+        memory_result = inputs["subject_memory_result"]
+    else:
+        memory_result = inputs["memory_result"]
+
     return {
         "feedback_result": feedback_result,
         "difficult": difficult,
         "short_term_block": inputs["short_term_block"] if slots["short_term"] else None,
-        "memory_result": inputs["memory_result"] if slots["memory"] else None,
+        "memory_result": memory_result,
     }
 
 
@@ -333,24 +491,94 @@ def prompt_sha256(system, user):
     return sha256_text(json.dumps(messages, ensure_ascii=False, sort_keys=True))
 
 
+def group_memory_result(group, inputs):
+    """该组实际注入的长期记忆结果；None 表示槽位关闭或没有可注入记忆。"""
+
+    slots = GROUP_SLOTS[group]
+
+    if not slots["memory"]:
+        return None
+
+    if slots.get("memory_scope") == "subject":
+        return inputs["subject_memory_result"]
+
+    return inputs["memory_result"]
+
+
+def group_memory_tool(group, inputs):
+    """该组记忆槽位背后真实调用的 Tool 结果；槽位关闭时为 None。"""
+
+    slots = GROUP_SLOTS[group]
+
+    if not slots["memory"]:
+        return None
+
+    if slots.get("memory_scope") == "subject":
+        return inputs["subject_memory_tool"]
+
+    return inputs["memory_tool"]
+
+
+def active_subject_count(db_path, subject_key):
+    """库内该主题下 status='active' 的记忆行数（独立于 Tool 返回值的核验口径）。"""
+
+    conn = sqlite3.connect(str(db_path))
+
+    try:
+        (count,) = conn.execute(
+            "SELECT COUNT(*) FROM learning_memories "
+            "WHERE status = 'active' AND subject_key = ?",
+            (subject_key,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return int(count)
+
+
 def check_group_relations(contents, inputs, api, db_path, config):
     """核验"四组差异只来自设计允许的槽位"，返回 [(name, ok, detail)]。"""
 
     checks = []
-    memory = inputs["memory_result"]
-    block = memory_block_text(inputs, api) if memory else ""
 
-    for group in GROUP_SLOTS:
+    for group, content in contents.items():
         slots = GROUP_SLOTS[group]
-        content = contents[group]
+        memory = group_memory_result(group, inputs)
+        tool = group_memory_tool(group, inputs)
+        count = (memory or {}).get("count", 0)
 
         has_memory = MEMORY_HEADER in content
         has_short_term = SHORT_TERM_HEADER in content
 
+        # 四件事必须分开核验：槽位是否启用 / Tool 是否成功 / 是否存在可注入记忆 /
+        # Prompt 是否真的出现记忆区块。空记忆样本只允许第四项为"无"。
         checks.append((
-            f"{group}·记忆槽位",
-            has_memory == slots["memory"],
-            f"期望记忆={slots['memory']}，实际={has_memory}",
+            f"{group}·记忆槽位启用",
+            slots["memory"] == (tool is not None),
+            f"设计={'启用' if slots['memory'] else '关闭'}，"
+            f"Tool={'有' if tool is not None else '无'}",
+        ))
+        checks.append((
+            f"{group}·记忆 Tool 成功",
+            (
+                tool.get("ok") is True
+                and count == len((memory or {}).get("memories", []))
+            )
+            if tool is not None
+            else memory is None,
+            f"ok={tool.get('ok')} count={count} reason={tool.get('reason')}"
+            if tool is not None
+            else "槽位关闭，未调用记忆 Tool",
+        ))
+        checks.append((
+            f"{group}·可注入记忆条数",
+            count == len((memory or {}).get("memories", [])),
+            f"count={count}，memories={len((memory or {}).get('memories', []))}",
+        ))
+        checks.append((
+            f"{group}·Prompt 记忆区块",
+            has_memory == bool(memory),
+            f"期望={'有' if memory else '无'}，实际={'有' if has_memory else '无'}",
         ))
         checks.append((
             f"{group}·短期上下文槽位",
@@ -358,57 +586,111 @@ def check_group_relations(contents, inputs, api, db_path, config):
             f"期望短期={slots['short_term']}，实际={has_short_term}",
         ))
 
-    # C = A + 记忆；D = B + 记忆（逐字等价，不允许出现别的差异）
-    if memory:
+    # 主组逐字等价：C = A + 记忆；D = B + 记忆（不允许出现别的差异）
+    for pair, base in (("C", "A"), ("D", "B")):
+        if pair not in contents:
+            continue
+
+        memory = group_memory_result(pair, inputs)
+
+        if not memory:
+            continue
+
+        block = memory_block_text({"memory_result": memory}, api)
+
         checks.append((
-            "C 去记忆后与 A 逐字相同",
-            strip_memory(contents["C"], block) == contents["A"],
-            "C - 记忆区块 == A",
+            f"{pair} 去记忆后与 {base} 逐字相同",
+            strip_memory(contents[pair], block) == contents[base],
+            f"{pair} - 记忆区块 == {base}",
         ))
         checks.append((
-            "D 去记忆后与 B 逐字相同",
-            strip_memory(contents["D"], block) == contents["B"],
-            "D - 记忆区块 == B",
+            f"{pair}·记忆区块只出现一次",
+            contents[pair].count(block) == 1,
+            f"出现 {contents[pair].count(block)} 次",
+        ))
+
+    # 补充组：与主组的唯一差异是记忆检索范围（仅当前主题）
+    for group, base in (("C-subj", "A"), ("D-subj", "B")):
+        if group not in contents:
+            continue
+
+        memory = group_memory_result(group, inputs)
+        subject_key = inputs["subject_filter"]
+
+        if not memory:
+            checks.append((
+                f"{group}·主题记忆非空",
+                False,
+                f"主题 {subject_key!r} 没有可注入记忆，补充组无法成立",
+            ))
+            continue
+
+        block = memory_block_text({"memory_result": memory}, api)
+        expected_count = min(
+            int(config["memory_limit"]), active_subject_count(db_path, subject_key)
+        )
+
+        checks.append((
+            f"{group} 去记忆后与 {base} 逐字相同",
+            strip_memory(contents[group], block) == contents[base],
+            f"{group} - 记忆区块 == {base}",
+        ))
+        checks.append((
+            f"{group}·主题记忆与库内 active 行数一致",
+            memory["count"] == expected_count and memory["count"] > 0,
+            f"主题={subject_key!r}，期望 {expected_count} 条，实际 {memory['count']} 条",
+        ))
+        checks.append((
+            f"{group}·记忆区块只出现一次",
+            contents[group].count(block) == 1,
+            f"出现 {contents[group].count(block)} 次",
         ))
 
     # 反馈/难度槽位：A 与 C 相同（都是空反馈），B 与 D 相同（同一份反馈）
-    checks.append((
-        "A 与 C 的反馈段逐字相同",
-        base_segment(contents["A"]) == base_segment(contents["C"]),
-        "空反馈组共用同一份计划规则与反馈 JSON",
-    ))
-    checks.append((
-        "B 与 D 的反馈段逐字相同",
-        base_segment(contents["B"]) == base_segment(contents["D"]),
-        "有反馈组共用同一份近期反馈与难度标记",
-    ))
+    if {"A", "C"} <= set(contents):
+        checks.append((
+            "A 与 C 的反馈段逐字相同",
+            base_segment(contents["A"]) == base_segment(contents["C"]),
+            "空反馈组共用同一份计划规则与反馈 JSON",
+        ))
+
+    if {"B", "D"} <= set(contents):
+        checks.append((
+            "B 与 D 的反馈段逐字相同",
+            base_segment(contents["B"]) == base_segment(contents["D"]),
+            "有反馈组共用同一份近期反馈与难度标记",
+        ))
 
     # B0：原始反馈行完整保留，但不带统计摘要、不带难度硬规则
-    b0_feedback = inputs["raw_feedback_result"]["feedback"]
-    b0_feedback_json = json.dumps(b0_feedback, ensure_ascii=False, indent=2)
-    checks.append((
-        "B0·原始反馈行完整注入",
-        bool(b0_feedback) and b0_feedback_json in contents["B0"],
-        f"反馈 {len(b0_feedback)} 行",
-    ))
-    checks.append((
-        "B0·无统计摘要",
-        inputs["raw_feedback_result"]["summary"] == {}
-        and '"total_count"' not in contents["B0"]
-        and '"total_count"' in contents["B"],
-        "summary 固定 {}（B 组仍保留真实统计）",
-    ))
-    checks.append((
-        "B0·无难度硬规则",
-        "最近一次反馈是 partial 且原因是任务难度太高" not in contents["B0"],
-        "difficult 固定 False",
-    ))
+    if "B0" in contents:
+        b0_feedback = inputs["raw_feedback_result"]["feedback"]
+        b0_feedback_json = json.dumps(b0_feedback, ensure_ascii=False, indent=2)
+
+        checks.append((
+            "B0·原始反馈行完整注入",
+            bool(b0_feedback) and b0_feedback_json in contents["B0"],
+            f"反馈 {len(b0_feedback)} 行",
+        ))
+        checks.append((
+            "B0·无统计摘要",
+            inputs["raw_feedback_result"]["summary"] == {}
+            and '"total_count"' not in contents["B0"]
+            and ('"total_count"' in contents["B"] if "B" in contents else True),
+            "summary 固定 {}（B 组仍保留真实统计）",
+        ))
+        checks.append((
+            "B0·无难度硬规则",
+            "最近一次反馈是 partial 且原因是任务难度太高" not in contents["B0"],
+            "difficult 固定 False",
+        ))
 
     # 知识库槽位：各组同一份（本阶段固定为空结果；本实验不考察 RAG）
-    knowledge = {knowledge_segment(contents[group]) for group in GROUP_SLOTS}
+    knowledge = {knowledge_segment(contents[group]) for group in contents}
     checks.append(("各组知识库区块逐字相同", len(knowledge) == 1, "knowledge 段一致"))
 
     # 注入公平性：进 Prompt 的记忆必须就是 status=active 的前 limit 条
+    memory = group_memory_result("D", inputs) or group_memory_result("C", inputs)
+
     if memory:
         expected = injected_labels(db_path, int(config["memory_limit"]))
         actual = {(item["type"], item["subject"]) for item in memory["memories"]}
@@ -419,17 +701,24 @@ def check_group_relations(contents, inputs, api, db_path, config):
             f"期望 {sorted(expected)}，实际 {sorted(actual)}",
         ))
 
-        checks.append((
-            "记忆区块只出现一次",
-            contents["D"].count(block) == 1,
-            f"出现 {contents['D'].count(block)} 次",
-        ))
-
     return checks
 
 
-def build_sample_prompts(sample_id, config, reuse=False):
-    """构建一个样本的四组 Prompt（含核验与 Diff），不写文件。"""
+def build_sample_prompts(sample_id, config, reuse=False, groups=None,
+                         include_supplementary=False):
+    """构建一个样本的 Prompt（含核验与 Diff），不写文件。
+
+    groups 显式给出时按该列表构建（仍要用 validate_groups 拒绝非法组合）；
+    否则按 groups_for_sample() 决定：默认只 A/B/B0/C/D，显式要求补充组且该样本
+    有主题过滤定义时追加 C-subj/D-subj；S7-empty 只允许 D。
+    """
+
+    if groups is None:
+        selected = groups_for_sample(
+            sample_id, include_supplementary=include_supplementary
+        )
+    else:
+        selected = validate_groups(sample_id, groups)
 
     sample = seed_fixture.load_sample(sample_id, config)
     db_path, api = activate_sample(sample_id, config, reuse=reuse, sample=sample)
@@ -439,7 +728,7 @@ def build_sample_prompts(sample_id, config, reuse=False):
     system = api["agent_plan_draft"].DRAFT_SYSTEM_PROMPT
 
     contents = {
-        group: build_group_content(group, inputs, api) for group in GROUP_SLOTS
+        group: build_group_content(group, inputs, api) for group in selected
     }
 
     prompts = {}
@@ -458,6 +747,7 @@ def build_sample_prompts(sample_id, config, reuse=False):
 
     return {
         "sample_id": sample_id,
+        "groups": list(selected),
         "db_path": str(db_path),
         "plan_date": inputs["plan_date"],
         "inputs": {
@@ -471,9 +761,14 @@ def build_sample_prompts(sample_id, config, reuse=False):
             "short_term_chars": inputs["short_term_info"]["length"],
             "short_term_dropped": inputs["short_term_info"]["dropped"],
             "memory_count": (inputs["memory_result"] or {}).get("count", 0),
-            "memory_types": sorted(
-                (inputs["memory_result"] or {}).get("memories", [])[0].keys()
-            ),
+            "subject_filter": inputs["subject_filter"],
+            "subject_memory_count": (inputs["subject_memory_result"] or {}).get("count", 0),
+            "memory_types": sorted({
+                key
+                for result in (inputs["memory_result"], inputs["subject_memory_result"])
+                for memory in (result or {}).get("memories", [])
+                for key in memory.keys()
+            }),
             "knowledge_count": len(inputs["knowledge_results"]),
             "knowledge_search_failed": inputs["search_failed"],
         },
@@ -519,6 +814,9 @@ def write_sample_output(sample_dir, build):
     diff_lines.append("")
 
     for left, right in DIFF_PAIRS:
+        if left not in build["contents"] or right not in build["contents"]:
+            continue
+
         diff_lines.append(f"## {left} → {right}")
         diff_lines.append("")
         diff = render_diff(build["sample_id"], left, right, build["contents"])
@@ -531,6 +829,7 @@ def write_sample_output(sample_dir, build):
 
     summary = {
         "sample_id": build["sample_id"],
+        "groups": build["groups"],
         "db_path": build["db_path"],
         "plan_date": build["plan_date"],
         "inputs": build["inputs"],
@@ -556,20 +855,23 @@ def render_report(summaries):
     lines.append("")
     lines.append("本报告由 `experiments/graduation/build_prompts.py` 生成；**没有调用任何模型**。")
     lines.append("")
-    lines.append("| 样本 | 反馈条数 | 难度标记 | 短期上下文字符 | 记忆条数 | A 字符 | B 字符 | B0 字符 | C 字符 | D 字符 | 核验 |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| 样本 | 反馈条数 | 难度标记 | 短期上下文字符 | 记忆条数 | 主题过滤 | 主题记忆条数 | 各组字符 | 核验 |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- |")
 
     for summary in summaries:
         inputs = summary["inputs"]
         prompts = summary["prompts"]
         failed = [item for item in summary["checks"] if not item["ok"]]
         verdict = "通过" if not failed else f"失败 {len(failed)} 项"
+        chars = "、".join(
+            f"{group}={prompt['chars']}" for group, prompt in prompts.items()
+        )
 
         lines.append(
             f"| {summary['sample_id']} | {inputs['feedback_count']} | "
             f"{'是' if inputs['difficult'] else '否'} | {inputs['short_term_chars']} | "
-            f"{inputs['memory_count']} | {prompts['A']['chars']} | {prompts['B']['chars']} | "
-            f"{prompts['B0']['chars']} | {prompts['C']['chars']} | {prompts['D']['chars']} | {verdict} |"
+            f"{inputs['memory_count']} | {inputs['subject_filter'] or '—'} | "
+            f"{inputs['subject_memory_count']} | {chars} | {verdict} |"
         )
 
     lines.append("")
@@ -578,8 +880,7 @@ def render_report(summaries):
     lines.append("| 样本 | 组 | 字符数 | system_sha256 | user_sha256 | prompt_sha256 |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
     for summary in summaries:
-        for group in GROUP_SLOTS:
-            prompt = summary["prompts"][group]
+        for group, prompt in summary["prompts"].items():
             lines.append(
                 f"| {summary['sample_id']} | {group} | {prompt['chars']} | "
                 f"`{prompt['system_sha256'][:12]}…` | `{prompt['user_sha256'][:12]}…` | "
@@ -605,6 +906,8 @@ def render_report(summaries):
     lines.append("- 各组共用同一份用户请求、同一份知识库结果（固定为空）与同一份模拟历史。")
     lines.append("- 组间差异只来自设计 §2.2 允许的槽位：近期反馈、反馈统计/难度、短期上下文、长期记忆。")
     lines.append("- B0 只保留原始反馈行（summary 固定为空、difficult 固定 False、无短期上下文与记忆）。")
+    lines.append("- C-subj / D-subj 的槽位与 C / D 完全相同，唯一差异是长期记忆只检索当前请求对应的主题。")
+    lines.append("- S7-empty 的 D 组是零反馈、零计划样本：记忆槽位仍启用，但库内没有可注入记忆，Prompt 不含记忆区块。")
     lines.append("- 本实验不考察 RAG：全组 knowledge_results=[]、knowledge_search_failed=false，不调用 Embedding、不做向量检索。")
     lines.append("- `ref_date` 固定；`get_feedback_since()` 的时间窗由固定时钟替身提供，不读本机时钟。")
     lines.append("- 本阶段不调用模型、不接知识库；Prompt 只是待测文本，不是实验结果。")
@@ -616,6 +919,12 @@ def render_report(summaries):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="构建 A/B/B0/C/D 实验 Prompt")
     parser.add_argument("--sample", action="append", help="只构建指定样本，可重复")
+    parser.add_argument("--group", action="append", help="只构建指定组，可重复")
+    parser.add_argument(
+        "--supplementary",
+        action="store_true",
+        help="为有主题过滤定义的样本追加 C-subj/D-subj",
+    )
     parser.add_argument("--reuse", action="store_true", help="复用已建好的库，不重建")
     parser.add_argument("--config", help="config.json 路径")
     args = parser.parse_args(argv)
@@ -628,7 +937,18 @@ def main(argv=None):
     failures = 0
 
     for sample_id in targets:
-        build = build_sample_prompts(sample_id, config, reuse=args.reuse)
+        try:
+            build = build_sample_prompts(
+                sample_id,
+                config,
+                reuse=args.reuse,
+                groups=args.group,
+                include_supplementary=args.supplementary,
+            )
+        except (ValueError, SubjectResolutionError) as error:
+            print(f"拒绝构建 {sample_id}：{error}", file=sys.stderr)
+            return 2
+
         summary = write_sample_output(out_root / sample_id, build)
         summaries.append(summary)
 
@@ -638,11 +958,14 @@ def main(argv=None):
         print(
             f"{sample_id}: feedback={summary['inputs']['feedback_count']} "
             f"memory={summary['inputs']['memory_count']} "
-            f"chars A/B/B0/C/D="
-            f"{summary['prompts']['A']['chars']}/{summary['prompts']['B']['chars']}/"
-            f"{summary['prompts']['B0']['chars']}/"
-            f"{summary['prompts']['C']['chars']}/{summary['prompts']['D']['chars']} "
-            f"checks_failed={len(bad)}"
+            f"subject={summary['inputs']['subject_filter']} "
+            f"subject_memory={summary['inputs']['subject_memory_count']} "
+            f"groups="
+            + "/".join(
+                f"{group}:{prompt['chars']}"
+                for group, prompt in summary["prompts"].items()
+            )
+            + f" checks_failed={len(bad)}"
         )
 
         for item in bad:
@@ -654,7 +977,7 @@ def main(argv=None):
             {
                 summary["sample_id"]: {
                     group: summary["prompts"][group]["prompt_sha256"]
-                    for group in GROUP_SLOTS
+                    for group in summary["groups"]
                 }
                 for summary in summaries
             },
