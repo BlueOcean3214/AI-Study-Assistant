@@ -162,13 +162,21 @@ def check_sample(sample_id, config, reuse=False, tool_check=True):
     result = verify_sample(sample, dump, db_path, config, rebuild)
 
     if tool_check:
-        result["tool_check"] = tool_memory_check(db_path, config, result["injected"])
+        result["tool_check"] = tool_memory_check(db_path, config)
     else:
         result["tool_check"] = {
             "attempted": False,
             "ok": False,
             "error": "本次运行显式跳过真实 Tool 调用（--no-tool）",
         }
+
+    # Gold 核验的失败项与 M1–M4 的硬失败分开统计，二者都进 failure_count
+    result["gold_failure_count"] = result["failure_count"]
+    result["metric_checks"] = metric_status_checks(result)
+    result["metric_failure_count"] = sum(
+        1 for check in result["metric_checks"] if check["status"] == STATUS_FAIL and check["hard"]
+    )
+    result["failure_count"] = result["gold_failure_count"] + result["metric_failure_count"]
 
     return result
 
@@ -804,7 +812,392 @@ def _count_causes(rows):
     return counts
 
 
-def tool_memory_check(db_path, config, expected_injected):
+# ---------------------------------------------------------------------------
+# 检查状态：PASS / FAIL / N/A / MANUAL_REVIEW / INCOMPLETE
+#
+# 只有真正的数据完整性、结构或 Tool 调用失败才算硬失败（FAIL）并进入 failure_count；
+# 指标偏低（F1 差、某类召回差）是实验结果，不是检查失败；N/A 是当前条件算不出来；
+# MANUAL_REVIEW 是需要人看原文的提示；INCOMPLETE 是必要检查没执行（例如 --no-tool）。
+# 退出码：0 全部 PASS；1 存在硬失败；2 有检查未执行；3 需要人工复核。
+# ---------------------------------------------------------------------------
+
+STATUS_PASS = "PASS"
+STATUS_FAIL = "FAIL"
+STATUS_NA = "N/A"
+STATUS_MANUAL = "MANUAL_REVIEW"
+STATUS_INCOMPLETE = "INCOMPLETE"
+
+EXIT_PASS = 0
+EXIT_FAIL = 1
+EXIT_INCOMPLETE = 2
+EXIT_MANUAL = 3
+
+# 与内存模型一致的权重：PASS → 0，INCOMPLETE 比 MANUAL_REVIEW 严重（漏检 > 待复核）
+_SEVERITY = {STATUS_PASS: 0, STATUS_NA: 0, STATUS_MANUAL: 1, STATUS_INCOMPLETE: 2, STATUS_FAIL: 3}
+
+
+def _status_check(section, metric, status, hard, reason=""):
+    """一条检查状态。hard=True 且 status=FAIL 时才计入硬失败。"""
+
+    if status not in (STATUS_PASS, STATUS_FAIL, STATUS_NA, STATUS_MANUAL, STATUS_INCOMPLETE):
+        raise ValueError(f"未知检查状态：{status}")
+
+    return {
+        "section": section,
+        "metric": metric,
+        "status": status,
+        "hard": bool(hard and status == STATUS_FAIL),
+        "reason": reason,
+    }
+
+
+def metric_status_checks(item):
+    """把一份样本的 M1–M4 结果统一映射为检查状态（入参是 check_sample 的返回）。"""
+
+    m1 = item["m1"]
+    m2 = item["m2"]
+    m3 = item["m3"]
+    m4 = item["m4"]
+    checks = []
+
+    # ---- M1：分类质量 ----
+    bad_keys = [
+        f"{row['key'][0]}/{row['key'][1]}"
+        for row in item["rows"]
+        if row["key"][0] not in MEMORY_TYPES or not str(row["key"][1] or "").strip()
+    ]
+
+    if bad_keys:
+        checks.append(
+            _status_check(
+                "M1", "memory_type/subject_key 结构", STATUS_FAIL, True,
+                "记忆类型或 subject_key 非法：" + "、".join(bad_keys),
+            )
+        )
+    else:
+        checks.append(
+            _status_check("M1", "memory_type/subject_key 结构", STATUS_PASS, True,
+                          "memory_type 属于 4 类枚举，subject_key 非空")
+        )
+
+    if not m1["normalization_checked"]:
+        checks.append(
+            _status_check(
+                "M1", "subject_key 归一化", STATUS_INCOMPLETE, False,
+                "未加载 MemoryService，无法用真实 normalize_subject() 复核 subject_key",
+            )
+        )
+    elif m1["normalization_mismatches"]:
+        checks.append(
+            _status_check(
+                "M1", "subject_key 归一化", STATUS_FAIL, True,
+                f"{len(m1['normalization_mismatches'])} 条 subject_key 与 normalize_subject() 输出不一致："
+                + "；".join(
+                    f"{entry['source']}:{entry['subject_label']}→{entry['normalized']}"
+                    f"（记录 {entry['recorded']}）"
+                    for entry in m1["normalization_mismatches"]
+                ),
+            )
+        )
+    else:
+        checks.append(
+            _status_check("M1", "subject_key 归一化", STATUS_PASS, True,
+                          "全部 subject_key 与 normalize_subject() 输出一致")
+        )
+
+    # M1 的 P/R/F1 数值只作指标，低分不是检查失败 —— 这里只报一条提示性状态
+    if m1["macro_f1"] is None:
+        checks.append(
+            _status_check(
+                "M1", "4 类 Macro-F1", STATUS_NA, False,
+                f"只有 {m1['macro_defined']}/4 类有定义，4 类 Macro-F1 不可计算；"
+                f"已定义类型均值见 macro_f1_partial",
+            )
+        )
+    else:
+        checks.append(
+            _status_check(
+                "M1", "4 类 Macro-F1", STATUS_PASS, False,
+                f"数值 {m1['macro_f1']:.4f}（指标值，高低不作检查结论）",
+            )
+        )
+
+    # ---- M2：证据可追溯 ----
+    if m2["evidence_ids_total"] == 0:
+        checks.append(
+            _status_check("M2", "证据来源合法性", STATUS_NA, False,
+                          "没有 supports 证据（E_pred 为空），合法率不可计算")
+        )
+    elif m2["illegal"]:
+        checks.append(
+            _status_check(
+                "M2", "证据来源合法性", STATUS_FAIL, True,
+                f"{len(m2['illegal'])} 条 evidence_feedback_id 不属于该样本的种子反馈："
+                + "；".join(
+                    f"{entry['memory_type']}/{entry['subject_key']}→{entry['feedback_id']}"
+                    for entry in m2["illegal"]
+                ),
+            )
+        )
+    else:
+        checks.append(
+            _status_check("M2", "证据来源合法性", STATUS_PASS, True,
+                          f"{m2['evidence_ids_total']} 条证据全部属于种子反馈")
+        )
+
+    checks.append(
+        _status_check("M2", "与 E_gold 的 Jaccard", STATUS_NA, False, m2["jaccard_reason"])
+    )
+
+    if m2["contradict_total"] == 0:
+        checks.append(
+            _status_check("M2", "矛盾计数一致性", STATUS_NA, False,
+                          "没有可与 Gold 比对的已生成记忆")
+        )
+    elif m2["contradict_mismatches"]:
+        checks.append(
+            _status_check(
+                "M2", "矛盾计数一致性", STATUS_FAIL, True,
+                f"{len(m2['contradict_mismatches'])} 条记忆的 contradicts 计数与 Gold 不一致："
+                + "；".join(
+                    f"{entry['memory_type']}/{entry['subject_key']} 期望 {entry['expected']} "
+                    f"实得 {entry['actual']}"
+                    for entry in m2["contradict_mismatches"]
+                ),
+            )
+        )
+    else:
+        checks.append(
+            _status_check("M2", "矛盾计数一致性", STATUS_PASS, True,
+                          f"{m2['contradict_total']} 条记忆的 contradicts 计数与 Gold 一致")
+        )
+
+    # ---- M3：无证据样本夹具 ----
+    if not m3["applicable"]:
+        checks.append(
+            _status_check("M3", "无证据样本约束", STATUS_NA, False, m3["detail"]["reason"])
+        )
+    elif m3["ok"]:
+        checks.append(
+            _status_check("M3", "无证据样本约束", STATUS_PASS, True,
+                          "S7-empty 零记忆" if m3["kind"] == "empty" else "S7 全部带「初步观察：」前缀且 strength ≤ 0.6")
+        )
+    else:
+        if m3["kind"] == "empty":
+            detail = m3["detail"]
+            reason = (
+                "S7-empty 仍生成了记忆："
+                + "、".join(f"{name}={value}" for name, value in detail.items())
+            )
+        else:
+            bad = [row for row in m3["rows"] if not row["ok"]]
+            reason = m3["detail"].get("reason") or (
+                f"{len(bad)}/{m3['n']} 条记忆违反 S7 约束："
+                + "；".join(
+                    f"{row['memory_type']}/{row['subject_key']}"
+                    f"（前缀{'OK' if row['prefix_ok'] else '错'}，strength={row['strength']}）"
+                    for row in bad
+                )
+            )
+        checks.append(_status_check("M3", "无证据样本约束", STATUS_FAIL, True, reason))
+
+    # ---- M4：状态与 Tool 注入 ----
+    injected_rows = [
+        row
+        for row in m4["inconsistent"]
+        if any(check["field"] == "injected" and not check["ok"] for check in row["checks"])
+    ]
+    other_rows = [row for row in m4["inconsistent"] if row not in injected_rows]
+
+    if injected_rows:
+        checks.append(
+            _status_check(
+                "M4", "注入状态与实际注入", STATUS_FAIL, True,
+                f"{len(injected_rows)} 条记忆的 injected 与 Gold 期望不一致："
+                + "；".join(
+                    f"{row['memory_type']}/{row['subject_key']}"
+                    f"（期望 {row['expected_injected']}，实际 {row['actual_injected']}）"
+                    for row in injected_rows
+                ),
+            )
+        )
+    else:
+        checks.append(
+            _status_check("M4", "注入状态与实际注入", STATUS_PASS, True,
+                          f"{m4['total']} 条记忆的 injected 与 Gold 期望一致")
+        )
+
+    if other_rows:
+        checks.append(
+            _status_check(
+                "M4", "status/strength 一致性", STATUS_MANUAL, False,
+                f"{len(other_rows)} 条记忆的 status 或 strength 与 Gold 不一致，"
+                "需人工判定是实现问题还是夹具预期错误（该差异已在 Gold 核验里计入失败项）",
+            )
+        )
+    else:
+        checks.append(
+            _status_check("M4", "status/strength 一致性", STATUS_PASS, True,
+                          "全部记忆的 status 与 strength 在容差内")
+        )
+
+    tool = item.get("tool_check")
+
+    if tool is None:
+        checks.append(
+            _status_check("M4", "真实 get_learning_memory() 核对", STATUS_INCOMPLETE, False,
+                          "本次运行没有做 Tool 侧核对")
+        )
+    elif not tool.get("attempted"):
+        checks.append(
+            _status_check("M4", "真实 get_learning_memory() 核对", STATUS_INCOMPLETE, False,
+                          tool.get("error") or "Tool 未调用（--no-tool）")
+        )
+    elif not tool.get("ok"):
+        checks.append(
+            _status_check("M4", "真实 get_learning_memory() 核对", STATUS_FAIL, True,
+                          tool.get("error") or "Tool 调用失败")
+        )
+    elif not tool.get("matches_injected"):
+        checks.append(
+            _status_check(
+                "M4", "真实 get_learning_memory() 核对", STATUS_FAIL, True,
+                f"Tool 返回集合与注入集合不一致：返回 {tool['returned_count']} 条 "
+                f"{tool['returned_labels']}，库里期望 {tool['expected_count']} 条",
+            )
+        )
+    else:
+        checks.append(
+            _status_check(
+                "M4", "真实 get_learning_memory() 核对", STATUS_PASS, True,
+                f"Tool 返回 {tool['returned_count']} 条，与库里注入集合一致",
+            )
+        )
+
+    if tool is not None and tool.get("attempted") and tool.get("ok"):
+        total = tool.get("evidence_ids_total") or 0
+        rate = tool.get("evidence_legit_rate")
+        if total and rate is not None and rate < 1.0:
+            checks.append(
+                _status_check(
+                    "M4", "Tool 返回证据合法性", STATUS_FAIL, True,
+                    f"真实 Tool 返回的 evidence_feedback_ids 有非法项（合法率 {rate:.4f}）",
+                )
+            )
+        elif total:
+            checks.append(
+                _status_check("M4", "Tool 返回证据合法性", STATUS_PASS, True,
+                              f"{total} 条证据全部属于种子反馈")
+            )
+        else:
+            checks.append(
+                _status_check("M4", "Tool 返回证据合法性", STATUS_NA, False,
+                              "真实 Tool 没有返回带证据的记忆")
+            )
+
+    return checks
+
+
+def _sample_status(item):
+    """单样本状态：硬失败 > 未执行 > 待复核 > PASS。"""
+
+    if item["failure_count"]:
+        return STATUS_FAIL
+    statuses = {check["status"] for check in item.get("metric_checks") or []}
+    if STATUS_INCOMPLETE in statuses:
+        return STATUS_INCOMPLETE
+    if STATUS_MANUAL in statuses:
+        return STATUS_MANUAL
+    return STATUS_PASS
+
+
+def summarize_results(results, scan=None):
+    """全局状态汇总：硬失败、未执行、待复核分别计数，并给出退出码。"""
+
+    hard_failures = 0
+    gold_failures = 0
+    incomplete = 0
+    manual = 0
+    global_checks = []
+
+    for item in results:
+        # 只接受 check_sample() 的产物：缺计数字段说明调用方传了别的东西，
+        # 用 0 兜底会把「没检查」伪装成「没有失败」。
+        missing = [
+            name
+            for name in ("gold_failure_count", "metric_failure_count", "failure_count")
+            if name not in item
+        ]
+        if missing:
+            raise ValueError(
+                "summarize_results 只接受 check_sample() 的结果："
+                f"{item.get('sample_id') or '<未知样本>'} 缺字段 {missing}"
+            )
+        gold_failures += item["gold_failure_count"]
+        hard_failures += item["metric_failure_count"]
+        for check in item.get("metric_checks") or []:
+            if check["status"] == STATUS_FAIL and check["hard"]:
+                pass  # 已在 metric_failure_count 里计过
+            elif check["status"] == STATUS_INCOMPLETE:
+                incomplete += 1
+            elif check["status"] == STATUS_MANUAL:
+                manual += 1
+
+    if scan is None:
+        global_checks.append(
+            _status_check("M3", "D 组断言词扫描", STATUS_INCOMPLETE, False,
+                          "本次运行未扫描 runs/（--no-assertion-scan），断言词结果没有收集")
+        )
+        incomplete += 1
+    elif not scan.get("ok"):
+        global_checks.append(
+            _status_check("M3", "D 组断言词扫描", STATUS_FAIL, True,
+                          scan.get("reason") or "断言词扫描失败")
+        )
+        hard_failures += 1
+    elif scan["hits"]:
+        global_checks.append(
+            _status_check(
+                "M3", "D 组断言词扫描", STATUS_MANUAL, False,
+                f"{len(scan['hits'])} 处关键词命中（{scan['rows_checked']} 行），"
+                "只作人工复核提示，不计入硬失败",
+            )
+        )
+        manual += 1
+    else:
+        global_checks.append(
+            _status_check("M3", "D 组断言词扫描", STATUS_PASS, True,
+                          f"{scan['rows_checked']} 行 D 组答案无断言式关键词")
+        )
+
+    total = gold_failures + hard_failures
+
+    if total:
+        status = STATUS_FAIL
+        exit_code = EXIT_FAIL
+    elif incomplete:
+        status = STATUS_INCOMPLETE
+        exit_code = EXIT_INCOMPLETE
+    elif manual:
+        status = STATUS_MANUAL
+        exit_code = EXIT_MANUAL
+    else:
+        status = STATUS_PASS
+        exit_code = EXIT_PASS
+
+    return {
+        "status": status,
+        "exit_code": exit_code,
+        "gold_failure_count": gold_failures,
+        "metric_failure_count": hard_failures,
+        "failure_count": total,
+        "incomplete_count": incomplete,
+        "manual_review_count": manual,
+        "global_checks": global_checks,
+    }
+
+
+def tool_memory_check(db_path, config):
     """M4 的 Tool 侧核对：在已隔离的临时库上真实调用 get_learning_memory()。
 
     `seed_fixture.project_modules()` 必须先建好隔离（database.DATABASE_PATH 在 workspace 内），
@@ -998,7 +1391,7 @@ def scan_assertion_keywords(runs_dir, sample_ids=SCAN_SAMPLE_IDS, groups=SCAN_GR
     }
 
 
-def metric_rows(results, config, scan=None):
+def metric_rows(results, config, scan=None, summary=None):
     """把每样本 M1–M4 摊平成 CSV 长表（主实验 / 补充批次分开）。"""
 
     rows = []
@@ -1114,24 +1507,20 @@ def metric_rows(results, config, scan=None):
             )
 
         tool = item.get("tool_check")
-        if tool is None:
-            add(scope, sample_id, "M4.tool_injected_match", "N/A", None, None, "verdict", "本次运行未做 Tool 侧核对")
-        elif not tool.get("attempted"):
-            add(scope, sample_id, "M4.tool_injected_match", "N/A", None, None, "verdict", tool.get("error") or "Tool 未调用")
-        elif not tool.get("ok"):
-            add(scope, sample_id, "M4.tool_injected_match", "N/A", None, None, "verdict", tool.get("error") or "Tool 调用失败")
-        else:
-            add(
-                scope, sample_id, "M4.tool_injected_match",
-                "PASS" if tool["matches_injected"] else "FAIL",
-                tool["returned_count"], tool["expected_count"], "verdict",
-                "get_learning_memory(limit=%d) 返回集合 vs 注入集合%s"
-                % (tool["limit"], "（limit 已夹到 Tool 上限）" if tool.get("limit_clamped") else ""),
-            )
+        if tool is not None and tool.get("attempted") and tool.get("ok"):
             add(
                 scope, sample_id, "M4.tool_evidence_legit_rate", tool["evidence_legit_rate"],
                 None, tool["evidence_ids_total"], "ratio",
                 "真实 Tool 返回的 evidence_feedback_ids 合法率",
+            )
+
+        # 统一状态行：M1–M4 的每条检查都以 PASS/FAIL/N/A/MANUAL_REVIEW/INCOMPLETE 出现，
+        # 与终端摘要和报告汇总表同源，不再各写一套口径。
+        for check in item.get("metric_checks") or []:
+            add(
+                scope, sample_id,
+                f"CHECK.{check['section']}.{check['metric']}",
+                check["status"], None, None, "verdict", check["reason"],
             )
 
     pooled = pooled_scores(results, config)
@@ -1182,6 +1571,28 @@ def metric_rows(results, config, scan=None):
                     count, None, "count",
                     "关键词只作提示，最终以人工复核原文为准",
                 )
+            add(
+                scope, sample_id, "CHECK.M3.D组断言词命中", STATUS_MANUAL, None, None,
+                "verdict", "关键词命中需人工复核原文，不计入硬失败",
+            )
+
+    if summary is None:
+        summary = summarize_results(results, scan)
+
+    add("ALL", "ALL", "CHECK.overall_status", summary["status"], None, None,
+        "verdict", f"退出码 {summary['exit_code']}")
+    add("ALL", "ALL", "CHECK.failure_count", summary["failure_count"],
+        summary["gold_failure_count"], None, "count",
+        f"Gold 差异 {summary['gold_failure_count']} + 检查硬失败 {summary['metric_failure_count']}")
+    add("ALL", "ALL", "CHECK.incomplete_count", summary["incomplete_count"],
+        None, None, "count", "必要检查未执行的数量（不能算 PASS）")
+    add("ALL", "ALL", "CHECK.manual_review_count", summary["manual_review_count"],
+        None, None, "count", "需人工复核的数量（不计入硬失败）")
+    for check in summary["global_checks"]:
+        add(
+            "ALL", "ALL", f"CHECK.{check['section']}.{check['metric']}", check["status"],
+            None, None, "verdict", check["reason"],
+        )
 
     return rows
 
@@ -1198,7 +1609,10 @@ def write_metrics_csv(rows, path):
             writer.writerow(row)
 
 
-def render_report(results, config, scan=None):
+def render_report(results, config, scan=None, summary=None):
+    if summary is None:
+        summary = summarize_results(results, scan)
+
     lines = []
     lines.append("# 记忆 Gold Standard 核验报告")
     lines.append("")
@@ -1209,27 +1623,55 @@ def render_report(results, config, scan=None):
         f"- 版本：check_memory v{VERSION}；M1–M4 口径对应 v4.5 §4.1，主实验与补充批次分开标注"
     )
     lines.append("- 不适用一律写 N/A（附原因），不用 SKIP 或 0 冒充通过")
+    lines.append(
+        "- 状态口径：PASS 通过；FAIL 数据完整性/结构/Tool 调用等硬失败（计入失败项）；"
+        "N/A 当前条件算不出；MANUAL_REVIEW 需人工看原文；INCOMPLETE 必要检查未执行"
+    )
+    lines.append("")
+    lines.append(f"**总体状态：{summary['status']}**（退出码 {summary['exit_code']}）")
     lines.append("")
 
     total_memories = sum(len(item["rows"]) for item in results)
-    total_failures = sum(item["failure_count"] for item in results)
 
     lines.append("## 总览")
     lines.append("")
-    lines.append("| 样本 | 记忆条数 | 注入条数 | 多余记忆 | 核验失败项 | 结果 |")
-    lines.append("| --- | --- | --- | --- | --- | --- |")
+    lines.append(
+        "| 样本 | 记忆条数 | 注入条数 | 多余记忆 | Gold 失败项 | 检查硬失败 | 结果 |"
+    )
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
     for item in results:
         verdict = "通过" if item["failure_count"] == 0 else "失败"
         lines.append(
             f"| {item['sample_id']} | {len(item['rows'])} | {len(item['injected'])} | "
-            f"{len(item['unexpected'])} | {item['failure_count']} | {verdict} |"
+            f"{len(item['unexpected'])} | "
+            f"{item.get('gold_failure_count', item['failure_count'])} | "
+            f"{item.get('metric_failure_count', 0)} | {verdict} |"
         )
     lines.append("")
     lines.append(
-        f"合计 {total_memories} 条记忆，失败项 {total_failures} 项，"
-        f"多余记忆 {sum(len(item['unexpected']) for item in results)} 条；"
-        f"结论：{'全部通过' if total_failures == 0 else '存在不一致'}"
+        f"合计 {total_memories} 条记忆，失败项 {summary['failure_count']} 项"
+        f"（Gold 差异 {summary['gold_failure_count']} 项 + 检查硬失败 {summary['metric_failure_count']} 项），"
+        f"多余记忆 {sum(len(item['unexpected']) for item in results)} 条，"
+        f"未执行检查 {summary['incomplete_count']} 项，待人工复核 {summary['manual_review_count']} 项；"
+        f"结论：{summary['status']}"
     )
+    lines.append("")
+
+    lines.append("## 检查状态汇总（M1–M4 与全局）")
+    lines.append("")
+    lines.append("| 范围 | 检查项 | 状态 | 说明 |")
+    lines.append("| --- | --- | --- | --- |")
+    for item in results:
+        for check in item.get("metric_checks") or []:
+            lines.append(
+                f"| {item['sample_id']} | {check['section']} {check['metric']} | "
+                f"{check['status']} | {check['reason'] or '—'} |"
+            )
+    for check in summary["global_checks"]:
+        lines.append(
+            f"| GLOBAL | {check['section']} {check['metric']} | "
+            f"{check['status']} | {check['reason'] or '—'} |"
+        )
     lines.append("")
 
     for item in results:
@@ -1237,7 +1679,27 @@ def render_report(results, config, scan=None):
         lines.append("")
         lines.append(f"- 数据库：`{item['db_path']}`")
         lines.append(f"- 待定证据（pendings）：{item['pendings']}")
-        lines.append(f"- 核验失败项：{item['failure_count']}")
+        lines.append(
+            f"- 核验失败项：{item['failure_count']}"
+            f"（Gold 差异 {item.get('gold_failure_count', item['failure_count'])} + "
+            f"检查硬失败 {item.get('metric_failure_count', 0)}）"
+        )
+
+        if item.get("metric_checks"):
+            flagged = [
+                check
+                for check in item["metric_checks"]
+                if check["status"] not in (STATUS_PASS, STATUS_NA)
+            ]
+            if flagged:
+                lines.append("- 检查状态：")
+                for check in flagged:
+                    lines.append(
+                        f"  - {check['section']} {check['metric']}：{check['status']}"
+                        f"（{check['reason'] or '—'}）"
+                    )
+            else:
+                lines.append("- 检查状态：全部 PASS（N/A 项已在汇总表注明原因）")
 
         if item.get("empty_check") is not None:
             check = item["empty_check"]
@@ -1567,7 +2029,9 @@ def main(argv=None):
     if not args.no_assertion_scan:
         scan = scan_assertion_keywords(args.runs_dir)
 
-    report = render_report(results, config, scan)
+    summary = summarize_results(results, scan)
+
+    report = render_report(results, config, scan, summary=summary)
     report_path = Path(args.report) if args.report else (
         seed_fixture.workspace_dir(config) / "memory_check.md"
     )
@@ -1576,20 +2040,33 @@ def main(argv=None):
     metrics_path = Path(args.metrics) if args.metrics else (
         seed_fixture.workspace_dir(config) / "memory_metrics.csv"
     )
-    metric_items = metric_rows(results, config, scan)
+    metric_items = metric_rows(results, config, scan, summary=summary)
     write_metrics_csv(metric_items, metrics_path)
 
     for item in results:
+        statuses = {}
+        for check in item.get("metric_checks") or []:
+            statuses[check["status"]] = statuses.get(check["status"], 0) + 1
         print(
             f"{item['sample_id']}: memories={len(item['rows'])} "
             f"injected={len(item['injected'])} failures={item['failure_count']} "
-            f"M4={item['m4']['consistent']}/{item['m4']['total']}"
+            f"(gold={item.get('gold_failure_count', item['failure_count'])} "
+            f"metrics={item.get('metric_failure_count', 0)}) "
+            f"M4={item['m4']['consistent']}/{item['m4']['total']} "
+            f"status={_sample_status(item)}"
         )
+        if statuses:
+            print("  checks: " + ", ".join(f"{name}={count}" for name, count in sorted(statuses.items())))
 
     print("报告：" + str(report_path))
     print("指标：" + str(metrics_path))
+    print(
+        f"总体状态：{summary['status']}；失败项 {summary['failure_count']}（Gold {summary['gold_failure_count']} + "
+        f"检查硬失败 {summary['metric_failure_count']}），未执行 {summary['incomplete_count']}，"
+        f"待人工复核 {summary['manual_review_count']}；退出码 {summary['exit_code']}"
+    )
 
-    return 0 if all(item["failure_count"] == 0 for item in results) else 1
+    return summary["exit_code"]
 
 
 if __name__ == "__main__":

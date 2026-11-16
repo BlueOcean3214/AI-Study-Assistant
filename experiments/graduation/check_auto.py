@@ -246,6 +246,10 @@ def verify_manifest(run_name, run_dir, hashes, rows_count):
 # ---------------------------------------------------------------------------
 
 
+PROMPT_SYSTEM_PREFIX = "===== SYSTEM =====\n"
+PROMPT_USER_SEP = "\n\n===== USER =====\n"
+
+
 def prompt_text(run_dir, sample_id, group):
     path = Path(run_dir) / "prompts" / str(sample_id) / f"{group}.txt"
     if not path.is_file():
@@ -255,6 +259,93 @@ def prompt_text(run_dir, sample_id, group):
 
 def memory_block_present(text):
     return isinstance(text, str) and build_prompts.MEMORY_HEADER in text
+
+
+def parse_prompt_archive(text):
+    """把归档 Prompt 拆回 (system, user)。
+
+    分隔符只在「文档级」出现一次：先确认 SYSTEM 前缀，再按唯一的 USER 分隔符切分。
+    任何一处不满足就抛 ValueError —— 宁可判 UNVERIFIABLE，也不用字符串切割截断内容。
+    """
+
+    if not isinstance(text, str) or not text.startswith(PROMPT_SYSTEM_PREFIX):
+        raise ValueError("归档 Prompt 缺少 `===== SYSTEM =====` 头部")
+
+    body = text[len(PROMPT_SYSTEM_PREFIX):]
+    occurrences = body.count(PROMPT_USER_SEP)
+
+    if occurrences != 1:
+        raise ValueError(f"归档 Prompt 的 `===== USER =====` 分隔符出现 {occurrences} 次（应为 1 次），无法安全切分")
+
+    system, _, user = body.partition(PROMPT_USER_SEP)
+
+    if not system.strip():
+        raise ValueError("归档 Prompt 的 SYSTEM 内容为空")
+
+    if not user.strip():
+        raise ValueError("归档 Prompt 的 USER 内容为空")
+
+    return system, user
+
+
+def parse_memory_payload(user_text):
+    """从 USER 内容里解析记忆区块的真实记忆列表。
+
+    返回 (header_present, payload, error)。payload 是 Prompt 里实际注入的记忆对象列表；
+    header_present 为 True 但 payload 为空/解析失败时 error 非空 —— 这正是
+    「Prompt 声称有记忆来源，却没有真实记忆内容」的情况。
+    """
+
+    if not isinstance(user_text, str) or build_prompts.MEMORY_HEADER not in user_text:
+        return False, [], None
+
+    header_index = user_text.index(build_prompts.MEMORY_HEADER)
+    tail = user_text[header_index + len(build_prompts.MEMORY_HEADER):]
+    array_index = tail.find("[")
+
+    if array_index < 0:
+        return True, [], "记忆区块后找不到 JSON 数组"
+
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(tail[array_index:])
+    except json.JSONDecodeError as error:
+        return True, [], f"记忆区块的 JSON 解析失败：{error}"
+
+    if not isinstance(payload, list) or not payload:
+        return True, [], "记忆区块的 JSON 不是非空数组"
+
+    contents = [
+        str(item.get("content") or "").strip()
+        for item in payload
+        if isinstance(item, dict)
+    ]
+
+    if len(contents) != len(payload):
+        return True, [], "记忆区块里有非对象条目"
+
+    if not any(contents):
+        return True, [], "记忆区块里所有记忆的 content 都是空的"
+
+    return True, payload, None
+
+
+def verify_prompt_hash(text, row):
+    """用 build_prompts.prompt_sha256() 的同一算法重算并比对归档行里的 prompt_sha256。"""
+
+    expected = row.get("prompt_sha256")
+
+    if not isinstance(expected, str) or not expected:
+        return None, "归档行没有 prompt_sha256 字段，无法确认 Prompt 未被改写"
+
+    system, user = parse_prompt_archive(text)
+    actual = build_prompts.prompt_sha256(system, user)
+
+    if actual != expected:
+        return None, (
+            f"Prompt 重算 SHA-256 与归档行不一致：重算 {actual[:16]}… / 归档 {expected[:16]}…"
+        )
+
+    return actual, None
 
 
 def reconstruct_steps(group, feedback_count, memory_count):
@@ -294,7 +385,12 @@ def reconstruct_steps(group, feedback_count, memory_count):
 
 
 def grounding_for_row(row, run_dir, sample_cache, checker, memory_markers):
-    """返回 (status, detail)。status ∈ PASS / FAIL / UNVERIFIABLE。"""
+    """返回 (status, detail)。status ∈ PASS / FAIL / UNVERIFIABLE。
+
+    证据链必须先自证：归档 Prompt 能安全解析、SHA-256 能按 build_prompts.prompt_sha256()
+    重算一致、记忆区块里是真的记忆内容。任一步做不到就是 UNVERIFIABLE，不冒充 PASS；
+    Prompt 自带记忆来源却没有可解析的真实记忆时是 FAIL。
+    """
 
     sample_id = row.get("sample_id")
     group = row.get("group")
@@ -314,15 +410,36 @@ def grounding_for_row(row, run_dir, sample_cache, checker, memory_markers):
     if text is None:
         return "UNVERIFIABLE", "缺少 Prompt 文件，无法确认当时注入的 evidence"
 
+    try:
+        _, user_text = parse_prompt_archive(text)
+        verified_sha, hash_error = verify_prompt_hash(text, row)
+    except ValueError as error:
+        return "UNVERIFIABLE", f"归档 Prompt 格式无法解析：{error}"
+
+    if hash_error:
+        return "UNVERIFIABLE", hash_error
+
+    header_present, payload, payload_error = parse_memory_payload(user_text)
+    slots = build_prompts.GROUP_SLOTS[group]
+
+    if header_present and payload_error:
+        return "FAIL", f"Prompt 有记忆区块但取不到真实记忆内容：{payload_error}"
+
+    if header_present and not slots["memory"]:
+        return "FAIL", f"该组（{group}）不应注入长期记忆，但 Prompt 出现记忆区块"
+
+    if not header_present and slots["memory"] and slots.get("memory_required") is True:
+        return "FAIL", f"该组（{group}）应注入长期记忆，但 Prompt 没有记忆区块"
+
     feedback_count = len(sample.get("feedbacks") or [])
-    memory_count = 1 if memory_block_present(text) else 0
+    memory_count = len(payload) if header_present else 0
     steps = reconstruct_steps(group, feedback_count, memory_count)
 
-    # memory_result 只有在 Prompt 里确有记忆区块时才存在；这与运行时的
-    # agent_plan_draft._collect_tool_data() 一致（没有有效记忆时为 None）。
+    # 这里传入的是从归档 Prompt 里解析出来的真实记忆对象，
+    # 与 agent_plan_draft._memory_block() 收到的同一份数据同构。
     memory_result = None
     if memory_count:
-        memory_result = {"count": 1, "memories": [{"content": "（归档 Prompt 中确有记忆区块）"}]}
+        memory_result = {"count": memory_count, "memories": payload}
 
     texts = [answer]
     if isinstance(reason, str):
@@ -333,13 +450,18 @@ def grounding_for_row(row, run_dir, sample_cache, checker, memory_markers):
     if violations:
         return "FAIL", "；".join(violations)
 
-    # 归档没有保存 steps / 最终 draft 消息，无法证明"同一份 memory_result 拼进了
-    # 最终 draft"；只要模型没有声称记忆来源，这不影响判定。
     claimed_memory = any(marker in answer for marker in memory_markers)
+    detail = (
+        f"Prompt SHA-256 重算一致（{verified_sha[:16]}…），记忆 {memory_count} 条；"
+        "来源主张与注入一致"
+    )
     if memory_count and not claimed_memory:
-        return "PASS", "来源主张与注入一致（记忆区块存在；模型未声称记忆来源）"
+        detail = (
+            f"Prompt SHA-256 重算一致（{verified_sha[:16]}…），注入记忆 {memory_count} 条；"
+            "模型未声称记忆来源"
+        )
 
-    return "PASS", "来源主张与注入一致"
+    return "PASS", detail
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import os
 import re
@@ -51,7 +52,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# v4.5 冻结值：seed 与算法版本一旦被改写，所有已产出的 selection_audit 都会失效，
+# 因此脚本自己再硬编码一份，配置被随手改动时直接拒绝（不静默接受）。
+FROZEN_SEED = 2026111301
+FROZEN_ALGORITHM_VERSION = "sha256-domain-separated-selection-v1"
 
 GRADUATION_DIR = Path(__file__).resolve().parent
 REPO_ROOT = GRADUATION_DIR.parents[1]
@@ -186,22 +192,43 @@ IDENTITY_KEY_NAMES = {
 }
 
 
-def load_blind_config(path: Path = CONFIG_PATH) -> dict:
+def load_blind_config(path: Path | None = None) -> dict:
+    path = Path(path) if path else CONFIG_PATH
     if not path.is_file():
         raise PackError(f"缺少配置文件：{path}")
-    config = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise PackError(f"{path} 不是合法 JSON：{exc}") from exc
+    if not isinstance(config, dict):
+        raise PackError(f"{path} 顶层必须是 JSON 对象")
     required = {
         "protocol_version",
         "blind_sampling_seed",
         "algorithm_version",
         "selection_domains",
         "created_utc",
+        "frozen",
     }
     missing = sorted(required - set(config))
     if missing:
         raise PackError(f"blind_config.json 缺字段：{missing}")
-    if not isinstance(config["blind_sampling_seed"], int):
+    seed = config["blind_sampling_seed"]
+    if not isinstance(seed, int) or isinstance(seed, bool):
         raise PackError("blind_sampling_seed 必须是整数")
+    # 冻结校验：改写 seed / 算法版本会让历史 selection_audit 全部对不上，必须硬拒绝
+    if seed != FROZEN_SEED:
+        raise PackError(
+            f"blind_sampling_seed 已被冻结为 {FROZEN_SEED}，实际 {seed}；"
+            "修改 seed 会使所有已产出的 selection_audit.csv 失效"
+        )
+    algorithm_version = config["algorithm_version"]
+    if algorithm_version != FROZEN_ALGORITHM_VERSION:
+        raise PackError(
+            f"algorithm_version 已被冻结为 {FROZEN_ALGORITHM_VERSION}，实际 {algorithm_version!r}"
+        )
+    if config["frozen"] is not True:
+        raise PackError("blind_config.json 的 frozen 必须为 true（抽样参数已冻结）")
     domains = config["selection_domains"]
     expected = {
         "formal": DOMAIN_FORMAL,
@@ -295,7 +322,8 @@ def _as_dict(value, what: str):
     raise PackError(f"{what} 必须是 JSON 对象，实际 {type(value).__name__}")
 
 
-def read_rows(run_dir_name: str, batch: str, runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
+def read_rows(run_dir_name: str, batch: str, runs_dir: Path | None = None) -> list[SourceRow]:
+    runs_dir = Path(runs_dir) if runs_dir else RUNS_DIR
     path = runs_dir / run_dir_name / SOURCE_FILE
     if not path.is_file():
         raise PackError(f"缺少源文件：{path}")
@@ -351,7 +379,7 @@ def _validate_row_shape(row: dict, where: str) -> None:
     _as_dict(row.get("final_output"), f"{where} final_output")
 
 
-def load_main_rows(runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
+def load_main_rows(runs_dir: Path | None = None) -> list[SourceRow]:
     rows = read_rows(MAIN_RUN, BATCH_MAIN, runs_dir)
     cells: dict[tuple, list[int]] = {}
     for item in rows:
@@ -369,7 +397,8 @@ def load_main_rows(runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
     return rows
 
 
-def load_b0_rows(runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
+def load_b0_rows(runs_dir: Path | None = None) -> list[SourceRow]:
+    runs_dir = Path(runs_dir) if runs_dir else RUNS_DIR
     rows: list[SourceRow] = []
     for run_dir in B0_RUNS:
         rows.extend(read_rows(run_dir, BATCH_B0, runs_dir))
@@ -385,7 +414,8 @@ def load_b0_rows(runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
     return rows
 
 
-def load_s7empty_rows(runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
+def load_s7empty_rows(runs_dir: Path | None = None) -> list[SourceRow]:
+    runs_dir = Path(runs_dir) if runs_dir else RUNS_DIR
     rows = read_rows(S7EMPTY_RUN, BATCH_S7EMPTY, runs_dir)
     if len(rows) != 5 or sorted(item.repeat_index for item in rows) != REPEATS:
         raise PackError("S7-empty 源输出必须是 5 份 repeat_index 0..4")
@@ -394,15 +424,21 @@ def load_s7empty_rows(runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
     return rows
 
 
-def load_subj_rows(runs_dir: Path = RUNS_DIR) -> list[SourceRow]:
+def load_subj_rows(runs_dir: Path | None = None) -> list[SourceRow]:
     rows = read_rows(SUBJ_RUN, BATCH_SUBJ, runs_dir)
     if len(rows) != 10:
         raise PackError(f"suppl-subj 应有 10 行，实际 {len(rows)}")
-    by_group: dict[str, int] = {}
+    samples = {item.sample_id for item in rows}
+    if samples != {"S5"}:
+        raise PackError(f"suppl-subj 的 sample_id 必须全部是 S5，实际 {sorted(samples)}")
+    by_group: dict[str, list[int]] = {}
     for item in rows:
-        by_group[item.group] = by_group.get(item.group, 0) + 1
-    if by_group != {"C-subj": 5, "D-subj": 5}:
-        raise PackError(f"suppl-subj 分组不符：{by_group}")
+        by_group.setdefault(item.group, []).append(item.repeat_index)
+    if set(by_group) != {"C-subj", "D-subj"}:
+        raise PackError(f"suppl-subj 分组不符：{sorted(by_group)}")
+    for group, repeats in sorted(by_group.items()):
+        if sorted(repeats) != REPEATS:
+            raise PackError(f"suppl-subj 的 {group} repeat_index 必须恰好覆盖 0..4，实际 {sorted(repeats)}")
     return rows
 
 
@@ -480,7 +516,8 @@ def select_s7empty(rows: list[SourceRow], seed: int, domain: str = DOMAIN_S7EMPT
 # --------------------------------------------------------------------------
 
 
-def load_sample_context(sample_id: str, samples_dir: Path = SAMPLES_DIR) -> dict:
+def load_sample_context(sample_id: str, samples_dir: Path | None = None) -> dict:
+    samples_dir = Path(samples_dir) if samples_dir else SAMPLES_DIR
     path = samples_dir / f"{sample_id}.json"
     if not path.is_file():
         raise PackError(f"缺少样本文件：{path}")
@@ -614,33 +651,42 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
-def ensure_private_gate(private_dir: Path, allow_outside_repo: bool = False) -> list[str]:
-    """返回证据行；失败抛 PackError（绝不创建/写入私有文件）。"""
-    evidence: list[str] = []
-    resolved = private_dir.resolve()
-    try:
-        resolved.relative_to(REPO_ROOT)
-        inside = True
-    except ValueError:
-        inside = False
-    if not inside:
-        if not allow_outside_repo:
-            raise PackError(
-                f"私有目录 {resolved} 不在仓库 {REPO_ROOT} 内；如确为临时/测试目录，"
-                "必须显式传 --allow-outside-repo"
-            )
-        evidence.append(f"[gate] {resolved} 在仓库外，跳过 .gitignore 校验（--allow-outside-repo）")
-        return evidence
+def ensure_private_gate(private_dir: Path, repo_root: Path | None = None) -> list[str]:
+    """返回证据行；失败抛 PackError（绝不创建/写入私有文件）。
 
-    top = _git(["rev-parse", "--show-toplevel"], REPO_ROOT)
+    仓库外路径一律拒绝：不存在任何“临时目录免检”的正式入口。
+    测试通过把 `REPO_ROOT`（或 repo_root 参数）指向临时 Git 仓库来验证同一套逻辑。
+    """
+
+    evidence: list[str] = []
+    repo_root = Path(repo_root).resolve() if repo_root else REPO_ROOT
+    resolved = Path(private_dir).resolve()
+    try:
+        resolved.relative_to(repo_root)
+    except ValueError:
+        raise PackError(
+            f"私有目录 {resolved} 不在仓库 {repo_root} 内；私有映射只能写在仓库内已被 "
+            ".gitignore 忽略的目录，拒绝写入（不存在绕过开关）"
+        ) from None
+
+    top = _git(["rev-parse", "--show-toplevel"], repo_root)
     if top.returncode != 0:
-        raise PackError(f"git rev-parse 失败：{top.stderr.strip()}")
-    if Path(top.stdout.strip()).resolve() != REPO_ROOT:
-        raise PackError(f"仓库根不一致：git={top.stdout.strip()} 期望={REPO_ROOT}")
+        raise PackError(f"git rev-parse 失败（{repo_root}）：{top.stderr.strip()}")
+    if Path(top.stdout.strip()).resolve() != repo_root:
+        raise PackError(f"仓库根不一致：git={top.stdout.strip()} 期望={repo_root}")
+    evidence.append(f"[gate] git rev-parse --show-toplevel = {top.stdout.strip()}")
+
+    ignore_file = repo_root / ".gitignore"
+    if not ignore_file.is_file():
+        raise PackError(f"仓库缺少 .gitignore（{ignore_file}），无法证明私有目录被忽略")
 
     for name in PRIVATE_FILES:
         target = resolved / name
-        result = _git(["check-ignore", "-v", str(target)], REPO_ROOT)
+        # --no-index 让「已被跟踪」的文件也照常报出忽略规则：Git 默认对已跟踪路径
+        # 返回 1，会把「已跟踪」误报成「未被忽略」，掩盖真正需要清理的危险状态。
+        result = _git(["check-ignore", "-v", "--no-index", str(target)], repo_root)
+        if result.returncode != 0 and "unknown option" in result.stderr:
+            result = _git(["check-ignore", "-v", str(target)], repo_root)
         if result.returncode != 0 or ".gitignore" not in result.stdout:
             raise PackError(
                 "私有目录未被 .gitignore 覆盖，拒绝写入。请先在 .gitignore 添加 "
@@ -651,7 +697,7 @@ def ensure_private_gate(private_dir: Path, allow_outside_repo: bool = False) -> 
             )
         evidence.append(result.stdout.strip())
 
-    tracked = _git(["ls-files", "--", str(resolved)], REPO_ROOT)
+    tracked = _git(["ls-files", "--", str(resolved)], repo_root)
     if tracked.returncode != 0:
         raise PackError(f"git ls-files 失败：{tracked.stderr.strip()}")
     if tracked.stdout.strip():
@@ -660,6 +706,24 @@ def ensure_private_gate(private_dir: Path, allow_outside_repo: bool = False) -> 
         )
     evidence.append("[gate] git ls-files 无私有文件（0 条）")
     return evidence
+
+
+def ensure_path_layout(pack_dir: Path, private_dir: Path) -> None:
+    """盲评包目录与私有目录必须互不包含：私有映射绝不能落在评分者可见的目录里。"""
+
+    pack_dir = Path(pack_dir).resolve()
+    private_dir = Path(private_dir).resolve()
+    if pack_dir == private_dir:
+        raise PackError(f"pack_dir 与 private_dir 不能是同一目录：{pack_dir}")
+    for outer, inner, label in (
+        (pack_dir, private_dir, "private_dir 位于 pack_dir 内（会被分发给评分者）"),
+        (private_dir, pack_dir, "pack_dir 位于 private_dir 内（评分材料会被当成私有文件）"),
+    ):
+        try:
+            inner.relative_to(outer)
+        except ValueError:
+            continue
+        raise PackError(f"路径冲突：{label}：{outer} / {inner}")
 
 
 # --------------------------------------------------------------------------
@@ -674,18 +738,27 @@ def write_text_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def render_csv_text(columns: list[str], rows: list[dict]) -> str:
+    """把 CSV 渲染成字符串（行尾统一 \n），便于先算哈希/字节数再落盘。"""
+
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns, lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name, "") for name in columns})
+    return buffer.getvalue()
+
+
 def write_csv_atomic(path: Path, columns: list[str], rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=columns, lineterminator="\n")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({name: row.get(name, "") for name in columns})
+        handle.write(render_csv_text(columns, rows))
     os.replace(tmp, path)
 
 
-def manifest_hashes(path: Path = MANIFEST_PATH) -> dict[tuple[str, str], dict]:
+def manifest_hashes(path: Path | None = None) -> dict[tuple[str, str], dict]:
+    path = Path(path) if path else MANIFEST_PATH
     table: dict[tuple[str, str], dict] = {}
     if not path.is_file():
         return table
@@ -696,35 +769,117 @@ def manifest_hashes(path: Path = MANIFEST_PATH) -> dict[tuple[str, str], dict]:
     return table
 
 
-def verify_source_files(rows: list[SourceRow], manifest: dict) -> list[dict]:
-    """打包前核对：源文件整体 SHA256 必须与执行报告附录 A（manifest）一致。"""
-    report = []
-    files = {}
-    for item in rows:
-        files.setdefault(item.run_dir, item.results_file_sha256)
-    for run_dir, actual in sorted(files.items()):
+# B0 是基线提交之前的 legacy 结果，manifest 允许没有条目；主实验与新补充批次不允许缺。
+LEGACY_MANIFEST_OPTIONAL = frozenset(B0_RUNS)
+
+
+def source_run_dirs() -> list[str]:
+    return [MAIN_RUN, *B0_RUNS, S7EMPTY_RUN, SUBJ_RUN]
+
+
+def snapshot_sources(run_dirs=None, runs_dir: Path | None = None) -> dict[str, dict]:
+    """从真实磁盘重算每个 run 的 SHA256 / 字节数 / 记录条数（不使用任何缓存值）。"""
+
+    runs_dir = Path(runs_dir) if runs_dir else RUNS_DIR
+    snapshot: dict[str, dict] = {}
+    for run_dir in run_dirs or source_run_dirs():
+        path = runs_dir / run_dir / SOURCE_FILE
+        if not path.is_file():
+            raise PackError(f"缺少源文件：{path}")
+        records = 0
+        with path.open("rb") as handle:
+            for line in handle:
+                if line.strip():
+                    records += 1
+        snapshot[run_dir] = {
+            "sha256": sha256_file(path),
+            "size_bytes": path.stat().st_size,
+            "records": records,
+        }
+    return snapshot
+
+
+def _describe_mismatch(row: dict) -> str:
+    """把不一致字段逐个写清楚：只报「不一致」而不说哪一项，等于让人猜。"""
+
+    parts = [row["run_dir"], f"status={row['status']}"]
+    if "sha256" in row["status"]:
+        parts.append(f"expected_sha256={row['expected']}")
+        parts.append(f"actual_sha256={row['actual']}")
+    if "size_bytes" in row["status"]:
+        parts.append(f"expected_size_bytes={row['expected_size_bytes']}")
+        parts.append(f"actual_size_bytes={row['size_bytes']}")
+    if "records" in row["status"]:
+        parts.append(f"expected_records={row['expected_records']}")
+        parts.append(f"actual_records={row['records']}")
+    return " ".join(parts)
+
+
+def verify_snapshot(snapshot: dict[str, dict], manifest: dict) -> list[dict]:
+    """打包前核对：源文件哈希/大小/条数必须与执行报告附录 A（manifest）一致。"""
+
+    report: list[dict] = []
+    for run_dir, actual in sorted(snapshot.items()):
         relative = f"experiments/graduation/runs/{run_dir}/{SOURCE_FILE}"
         entry = manifest.get((relative, SOURCE_FILE))
+        row = {
+            "run_dir": run_dir,
+            "expected": "",
+            "actual": actual["sha256"],
+            "size_bytes": actual["size_bytes"],
+            "records": actual["records"],
+            "expected_size_bytes": "",
+            "expected_records": "",
+            "status": "",
+        }
         if entry is None:
-            report.append(
-                {"run_dir": run_dir, "actual": actual, "expected": "", "status": "manifest_missing"}
+            row["status"] = (
+                "legacy_no_manifest" if run_dir in LEGACY_MANIFEST_OPTIONAL else "manifest_missing"
             )
+            report.append(row)
             continue
-        expected = (entry.get("sha256") or "").strip().lower()
-        status = "match" if expected == actual else "mismatch"
-        report.append(
-            {"run_dir": run_dir, "actual": actual, "expected": expected, "status": status}
-        )
-    mismatch = [row for row in report if row["status"] == "mismatch"]
-    if mismatch:
+        row["expected"] = (entry.get("sha256") or "").strip().lower()
+        problems = []
+        if row["expected"] != actual["sha256"]:
+            problems.append("sha256")
+        row["expected_size_bytes"] = (entry.get("size_bytes") or "").strip()
+        if row["expected_size_bytes"] and row["expected_size_bytes"] != str(actual["size_bytes"]):
+            problems.append("size_bytes")
+        row["expected_records"] = (entry.get("records") or "").strip()
+        if row["expected_records"] and row["expected_records"] != str(actual["records"]):
+            problems.append("records")
+        row["status"] = "match" if not problems else "mismatch:" + ",".join(problems)
+        report.append(row)
+
+    mismatched = [row for row in report if row["status"].startswith("mismatch")]
+    if mismatched:
         raise PackError(
             "源 results.jsonl 与 manifest 不一致，停止打包："
-            + "；".join(f"{row['run_dir']} expected={row['expected']} actual={row['actual']}" for row in mismatch)
+            + "；".join(_describe_mismatch(row) for row in mismatched)
+        )
+    missing = [row for row in report if row["status"] == "manifest_missing"]
+    if missing:
+        raise PackError(
+            "主实验/补充实验源文件在 manifest 中缺失（只有 B0 legacy 允许例外）："
+            + "、".join(row["run_dir"] for row in missing)
         )
     return report
 
 
-def build_items(seed: int, runs_dir: Path = RUNS_DIR):
+def verify_sources_unchanged(before: dict[str, dict], after: dict[str, dict]) -> None:
+    """打包前后逐 run 比对真实哈希；任一变化即失败，绝不报告打包成功。"""
+
+    if set(before) != set(after):
+        raise PackError(f"打包前后源文件集合不一致：before={sorted(before)} after={sorted(after)}")
+    for run_dir in sorted(before):
+        if before[run_dir] != after[run_dir]:
+            raise PackError(
+                f"打包期间源文件被改动：{run_dir} before={before[run_dir]} after={after[run_dir]}"
+            )
+
+
+def build_items(seed: int, runs_dir: Path | None = None):
+    runs_dir = Path(runs_dir) if runs_dir else RUNS_DIR
     main_rows = load_main_rows(runs_dir)
     b0_rows = load_b0_rows(runs_dir)
     s7_rows = load_s7empty_rows(runs_dir)
@@ -800,16 +955,35 @@ def assign_ids(items: list[dict]) -> None:
                 continue
             break
         used.add(blind_id)
-        used.add(blind_id)
         assert_identity_free(f"blind_id={blind_id}", blind_id, IDENTITY_PATTERNS + STRICT_DATE_PATTERNS)
         item["blind_id"] = blind_id
 
 
-def order_rows(items: list[dict], rater_id: str) -> list[tuple[int, str]]:
-    rng = secrets.SystemRandom()
+def order_rows(items: list[dict], rng=None) -> list[tuple[int, str]]:
+    rng = rng if rng is not None else secrets.SystemRandom()
     shuffled = list(items)
     rng.shuffle(shuffled)
     return [(index + 1, item["blind_id"]) for index, item in enumerate(shuffled)]
+
+
+def build_rater_orders(items: list[dict], rng=None) -> tuple[list[tuple[int, str]], list[tuple[int, str]]]:
+    """两位评分者的材料顺序必须独立随机且**必定不同**。
+
+    两次独立 shuffle 在数学上可能恰好一致（n! 分之一），这里显式排除：
+    重试有限次后仍未不同，就确定性地旋转一位作为兜底，保证 sequence 不相等。
+    """
+
+    rng = rng if rng is not None else secrets.SystemRandom()
+    first = order_rows(items, rng)
+    if len(first) < 2:
+        return first, first
+    first_seq = [blind_id for _, blind_id in first]
+    for _ in range(64):
+        second = order_rows(items, rng)
+        if [blind_id for _, blind_id in second] != first_seq:
+            return first, second
+    rotated = first_seq[1:] + first_seq[:1]
+    return first, [(index + 1, blind_id) for index, blind_id in enumerate(rotated)]
 
 
 def render_audit(
@@ -911,24 +1085,86 @@ def render_audit(
     return "\n".join(lines)
 
 
-def append_repack_note(private_dir: Path, note: str) -> None:
-    audit = private_dir / "MAPPING-AUDIT.md"
-    if audit.is_file():
-        with audit.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.write(f"- {note}\n")
+def archive_previous_outputs(
+    pack_dir: Path, private_dir: Path, generated_utc: str
+) -> tuple[str, str, int]:
+    """重打包前把旧的一整套产物归档：旧 blind_pack/ + mapping + selection_audit + MAPPING-AUDIT。
 
+    旧材料（含旧 blind_id）必须成套留档，之后再清空活动包目录，避免新旧 blind_id 混在
+    同一个可分发目录里。归档目录带逐文件 SHA256 清单，不能静默覆盖。
+    """
 
-def archive_previous_mapping(private_dir: Path, generated_utc: str) -> tuple[str, str]:
-    mapping = private_dir / "mapping.csv"
-    old_sha = sha256_file(mapping)
-    archive_dir = private_dir / "mapping_archive"
-    archive_dir.mkdir(parents=True, exist_ok=True)
+    pack_dir = Path(pack_dir)
+    private_dir = Path(private_dir)
+    old_mapping = private_dir / "mapping.csv"
+    if not old_mapping.is_file():
+        raise PackError(
+            f"--repack 需要已存在的 {old_mapping}；没有旧映射就没有可归档的版本关系"
+        )
+
     stamp = generated_utc.replace(":", "").replace("-", "")
-    target = archive_dir / f"mapping-{stamp}-{old_sha[:8]}.csv"
+    archive_root = private_dir / "archive"
+    target = archive_root / f"pack-{stamp}"
     if target.exists():
         raise PackError(f"归档目标已存在，拒绝覆盖：{target}")
-    shutil.copy2(mapping, target)
-    return old_sha, str(target.relative_to(private_dir))
+    # 先写到 staging，全部复制成功后再原子改名为正式的 pack-<stamp>/：
+    # 复制中途失败只会留下可清理的 staging，不会出现“半个归档”占住归档名。
+    staging = archive_root / f".pack-{stamp}.staging"
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    old_mapping_sha = sha256_file(old_mapping)
+
+    entries: list[tuple[str, str]] = []
+    try:
+        for name in PRIVATE_FILES:
+            source = private_dir / name
+            if not source.is_file():
+                continue
+            destination = staging / "private" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            entries.append((f"private/{name}", sha256_file(destination)))
+
+        if pack_dir.is_dir():
+            for path in sorted(pack_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(pack_dir).as_posix()
+                destination = staging / "blind_pack" / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, destination)
+                entries.append((f"blind_pack/{relative}", sha256_file(destination)))
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise PackError(f"归档旧产物失败，已放弃本次归档并保留活动包原状：{exc}") from exc
+
+    lines = [
+        "# ARCHIVE-MANIFEST（私有留档，禁止分发 / 禁止提交 Git）",
+        "",
+        f"- 归档时间 (UTC)：{generated_utc}",
+        f"- 生成器版本：{VERSION}",
+        f"- 被替换旧 mapping.csv SHA256：{old_mapping_sha}",
+        f"- 归档文件数：{len(entries)}",
+        "",
+        "| 归档路径 | SHA256 |",
+        "| --- | --- |",
+    ]
+    lines += [f"| {relative} | {digest} |" for relative, digest in entries]
+    (staging / "ARCHIVE-MANIFEST.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8", newline="\n"
+    )
+    os.replace(staging, target)
+
+    if pack_dir.is_dir():
+        try:
+            shutil.rmtree(pack_dir)
+        except OSError as exc:
+            raise PackError(
+                f"旧产物已完整归档到 {target.relative_to(private_dir)}，但清空活动包目录失败：{exc}；"
+                "请不要删除该归档，手动清理活动包后重试"
+            ) from exc
+    return str(target.relative_to(private_dir)), old_mapping_sha, len(entries)
 
 
 # --------------------------------------------------------------------------
@@ -946,18 +1182,21 @@ def run_pack(args) -> int:
     seed = int(config["blind_sampling_seed"])
     algorithm_version = str(config["algorithm_version"])
 
-    built = build_items(seed, runs_dir)
-    items = built["items"]
+    # 打包前：从磁盘重算全部源文件哈希/大小/条数，并与 manifest 核对（B0 允许 legacy 缺条目）
+    snapshot_before = snapshot_sources(runs_dir=runs_dir)
     manifest = manifest_hashes()
-    source_report = verify_source_files(built["main_rows"] + [i["row"] for i in items], manifest)
+    source_report = verify_snapshot(snapshot_before, manifest)
 
-    gate_evidence = ensure_private_gate(private_dir, allow_outside_repo=args.allow_outside_repo)
+    ensure_path_layout(pack_dir, private_dir)
+    gate_evidence = ensure_private_gate(private_dir)
     if private_dir.joinpath("mapping.csv").exists() and not args.repack:
         raise PackError(
             f"{private_dir / 'mapping.csv'} 已存在：重打包必须显式 --repack，"
             "并会在 MAPPING-AUDIT.md 记录被替换旧映射的 SHA256（不得静默覆盖）"
         )
 
+    built = build_items(seed, runs_dir)
+    items = built["items"]
     assign_ids(items)
 
     # 材料正文：先渲染 + 扫描，全部通过才落盘（避免半成品包）
@@ -981,9 +1220,12 @@ def run_pack(args) -> int:
     generated_utc = utc_now()
     repack_notes = []
     if args.repack and (private_dir / "mapping.csv").exists():
-        old_sha, archive_rel = archive_previous_mapping(private_dir, generated_utc)
+        archive_rel, old_sha, archived_count = archive_previous_outputs(
+            pack_dir, private_dir, generated_utc
+        )
         repack_notes.append(
-            f"{generated_utc} 重打包：被替换旧映射 SHA256={old_sha}，归档为 {archive_rel}"
+            f"{generated_utc} 重打包：被替换旧映射 SHA256={old_sha}，"
+            f"旧包 + 旧私有文件共 {archived_count} 个文件成套归档为 {archive_rel}"
         )
 
     mapping_rows = []
@@ -1038,30 +1280,21 @@ def run_pack(args) -> int:
         print(f"[dry-run] 扫描通过；非身份日期告警 {len(warnings)} 处；未写任何文件")
         return 0
 
-    # ---- 落盘：pack ----
-    for phase in (PHASE_FORMAL, PHASE_CALIBRATION, PHASE_SUPPLEMENTARY):
-        phase_dir = pack_dir / phase
-        phase_dir.mkdir(parents=True, exist_ok=True)
-        for item in items:
-            if item["phase"] != phase:
-                continue
-            _, text = packets[item["blind_id"]]
-            write_text_atomic(phase_dir / f"{item['blind_id']}.md", text)
-        for rater_id in ("rater_a", "rater_b"):
-            write_csv_atomic(
-                phase_dir / f"order_{rater_id}.csv",
-                ["position", "blind_id"],
-                [{"position": pos, "blind_id": bid} for pos, bid in order_rows(
-                    [i for i in items if i["phase"] == phase], rater_id
-                )],
-            )
+    # ---- 打包后复核（在写任何文件之前）：重新从磁盘计算全部源文件哈希，逐 run 与打包前比对 ----
+    snapshot_after = snapshot_sources(runs_dir=runs_dir)
+    verify_sources_unchanged(snapshot_before, snapshot_after)
 
-    # ---- 落盘：private ----
-    private_dir.mkdir(parents=True, exist_ok=True)
-    write_csv_atomic(private_dir / "selection_audit.csv", AUDIT_COLUMNS, audit_rows)
-    write_csv_atomic(private_dir / "mapping.csv", MAPPING_COLUMNS, mapping_rows)
-    mapping_sha = sha256_file(private_dir / "mapping.csv")
-    mapping_bytes = (private_dir / "mapping.csv").stat().st_size
+    # ---- 落盘：先把全部内容在内存里生成，pack 写进 staging 目录，最后才一次性发布 ----
+    phase_plans = []
+    for phase in (PHASE_FORMAL, PHASE_CALIBRATION, PHASE_SUPPLEMENTARY):
+        phase_items = [item for item in items if item["phase"] == phase]
+        order_a, order_b = build_rater_orders(phase_items)
+        phase_plans.append((phase, phase_items, order_a, order_b))
+
+    mapping_text = render_csv_text(MAPPING_COLUMNS, mapping_rows)
+    mapping_sha = sha256_text(mapping_text)
+    mapping_bytes = len(mapping_text.encode("utf-8"))
+    selection_audit_text = render_csv_text(AUDIT_COLUMNS, audit_rows)
     audit_text = render_audit(
         generated_utc=generated_utc,
         config_sha=config_sha,
@@ -1078,22 +1311,47 @@ def run_pack(args) -> int:
         private_dir=private_dir,
         repack_notes=repack_notes,
     )
-    if repack_notes and (private_dir / "MAPPING-AUDIT.md").is_file():
-        # 重打包：保留历史，追加新记录而不是覆盖
-        write_text_atomic(private_dir / "MAPPING-AUDIT.md", audit_text)
-        for note in repack_notes:
-            append_repack_note(private_dir, note)
-    else:
-        write_text_atomic(private_dir / "MAPPING-AUDIT.md", audit_text)
 
-    # ---- 打包后复核：源文件哈希未变 ----
-    post_report = verify_source_files(built["main_rows"], manifest)
-    if [row["actual"] for row in post_report] != [row["actual"] for row in source_report if row["status"] != "manifest_missing"][: len(post_report)]:
-        # 兜底：逐个 run 比对（顺序不保证）
-        before = {row["run_dir"]: row["actual"] for row in source_report}
-        for row in post_report:
-            if before.get(row["run_dir"]) not in (None, row["actual"]):
-                raise PackError(f"打包后源文件被改动：{row['run_dir']}")
+    stamp = generated_utc.replace(":", "").replace("-", "")
+    staging_dir = pack_dir.parent / f".{pack_dir.name}.staging-{stamp}"
+    if staging_dir.exists():
+        shutil.rmtree(staging_dir)
+    private_written = False
+    try:
+        for phase, phase_items, order_a, order_b in phase_plans:
+            phase_dir = staging_dir / phase
+            phase_dir.mkdir(parents=True, exist_ok=True)
+            for item in phase_items:
+                _, text = packets[item["blind_id"]]
+                write_text_atomic(phase_dir / f"{item['blind_id']}.md", text)
+            for rater_id, order in (("rater_a", order_a), ("rater_b", order_b)):
+                write_csv_atomic(
+                    phase_dir / f"order_{rater_id}.csv",
+                    ["position", "blind_id"],
+                    [{"position": pos, "blind_id": bid} for pos, bid in order],
+                )
+
+        # 私有文件先落盘（评分材料离开 mapping 就无法回溯，绝不能先发布材料）
+        private_dir.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(private_dir / "selection_audit.csv", selection_audit_text)
+        write_text_atomic(private_dir / "mapping.csv", mapping_text)
+        write_text_atomic(private_dir / "MAPPING-AUDIT.md", audit_text)
+        private_written = True
+
+        if pack_dir.exists():
+            if any(pack_dir.iterdir()):
+                raise PackError(f"活动包目录非空且未归档：{pack_dir}；拒绝把新包与旧包混在一起")
+            pack_dir.rmdir()
+        os.replace(staging_dir, pack_dir)
+    except (OSError, PackError) as exc:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        detail = (
+            f"私有文件已写入 {private_dir}（mapping.csv SHA256={mapping_sha}），"
+            "下次重打包必须显式 --repack 才会归档并替换"
+            if private_written
+            else "未写入任何私有文件"
+        )
+        raise PackError(f"写入盲评包失败：{exc}；{detail}") from exc
 
     print("blind pack 生成完成（无评分、无模型调用、未修改 runs/ 与 feedback.db）")
     print(f"  pack_dir      = {pack_dir}")
@@ -1152,11 +1410,6 @@ def parse_args(argv=None):
     parser.add_argument("--private-dir", default=None, help="私有映射目录")
     parser.add_argument("--repack", action="store_true", help="允许覆盖 mapping.csv（会归档旧映射）")
     parser.add_argument("--dry-run", action="store_true", help="只做抽样与校验，不写文件")
-    parser.add_argument(
-        "--allow-outside-repo",
-        action="store_true",
-        help="仅用于临时/测试目录：私有目录在仓库外时跳过 .gitignore 校验",
-    )
     return parser.parse_args(argv)
 
 

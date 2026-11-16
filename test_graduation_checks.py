@@ -15,13 +15,17 @@ T7  M3 断言词扫描：只读、只扫 S7/S7-empty 的 D 组、命中计数与
 T8  check_auto.read_rows：合法行通过；非法字段逐项进 problems。
 T9  check_auto.analyze_row / metric_rows_for_scope：无夹具时 Y1=N/A、无 Prompt 时 grounding=UNVERIFIABLE，
     且不把 N/A 写成 PASS；write_csv 可回读。
+T11 check_auto 的 Prompt 归档：parse_prompt_archive / parse_memory_payload / verify_prompt_hash /
+    grounding_for_row 的 PASS / FAIL / UNVERIFIABLE 分支，调用真实 agent_plan_draft.check_grounding。
 """
 
 import csv
 import hashlib
 import json
 import os
+import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -33,9 +37,12 @@ sys.path.insert(0, str(GRADUATION_DIR))
 TMP_ROOT = Path(tempfile.mkdtemp(prefix="grad_checks_"))
 os.environ["FEEDBACK_DB_PATH"] = str(TMP_ROOT / "graduation_experiments" / "_test_placeholder.db")
 
+sys.path.insert(0, str(PROJECT_DIR))
+
 import check_memory as cm  # noqa: E402
 import check_auto as ca  # noqa: E402
 import seed_fixture  # noqa: E402
+import build_prompts as bp  # noqa: E402
 
 PASSED = []
 FAILED = []
@@ -371,7 +378,7 @@ def test_pooled_and_csv():
     make_db(db_path, [], [], feedback_ids=[])
 
     def item(sample_id, m1):
-        return {
+        result = {
             "sample_id": sample_id,
             "m1": m1,
             "m2": {
@@ -382,7 +389,7 @@ def test_pooled_and_csv():
                 "contradict_mismatches": [], "missing_memories": 0,
             },
             "m3": {"kind": "none", "applicable": False, "ok": None, "n": 0, "rows": [],
-                   "score": None, "detail": {}},
+                   "score": None, "detail": {"reason": "非 S7 样本不适用"}},
             "m4": {
                 "rows": [], "consistent": 1, "total": 1, "ratio": 1.0,
                 "by_field": {name: {"matched": 1, "total": 1} for name in
@@ -390,7 +397,17 @@ def test_pooled_and_csv():
                 "inconsistent": [], "diagnostic_counts": {},
             },
             "tool_check": {"attempted": False, "ok": False, "error": "未调用"},
+            "rows": [],
         }
+        # 与 check_sample() 的产物保持同一形状：summary 只接受带计数字段的结果
+        result["gold_failure_count"] = 0
+        result["metric_checks"] = cm.metric_status_checks(result)
+        result["metric_failure_count"] = sum(
+            1 for entry in result["metric_checks"]
+            if entry["status"] == cm.STATUS_FAIL and entry["hard"]
+        )
+        result["failure_count"] = result["gold_failure_count"] + result["metric_failure_count"]
+        return result
 
     def m1_for(tp, fp, fn):
         types = {}
@@ -574,21 +591,358 @@ def test_auto_analysis():
     check("T9 check_auto.write_csv 可回读", len(read_back) == 2 and "metric" in read_back[0], read_back)
 
 
-def main():
-    test_m1()
-    test_m2()
-    test_m3()
-    test_m4()
-    test_pooled_and_csv()
-    test_scan()
-    test_read_rows()
-    test_auto_analysis()
+def test_status_accounting():
+    """T10：M1–M4 的状态必须真的进 failure_count 与退出码，不能只写在文字里。"""
 
-    print()
-    print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
-    for name, detail in FAILED:
-        print(f"  FAILED {name}: {detail}")
-    return 0 if not FAILED else 1
+    def base_item(sample_id="S1"):
+        return {
+            "sample_id": sample_id,
+            "rows": [
+                {"key": ("difficulty", "概率论"), "memory_type": "difficulty",
+                 "subject_key": "概率论"},
+            ],
+            "m1": {
+                "types": {}, "macro_f1": 1.0, "macro_f1_partial": 1.0,
+                "macro_defined": 4, "macro_n": 4, "task_topic": {},
+                "normalization_mismatches": [], "normalization_checked": 1,
+            },
+            "m2": {
+                "legit_rate": 1.0, "legal_ids": 1, "evidence_ids_total": 1,
+                "seed_feedback_count": 1, "illegal": [], "jaccard": None,
+                "jaccard_reason": "无 E_gold", "contradict_ratio": 1.0,
+                "contradict_matches": 1, "contradict_total": 1,
+                "contradict_mismatches": [], "missing_memories": 0,
+            },
+            "m3": {"kind": "none", "applicable": False, "ok": None, "n": 0,
+                   "rows": [], "score": None, "detail": {"reason": "非 S7 样本不适用"}},
+            "m4": {
+                "rows": [], "consistent": 1, "total": 1, "ratio": 1.0,
+                "by_field": {name: {"matched": 1, "total": 1} for name in
+                             ("status", "strength", "injected")},
+                "inconsistent": [], "diagnostic_counts": {},
+            },
+            "tool_check": {
+                "attempted": True, "ok": True, "matches_injected": True,
+                "returned_count": 1, "returned_labels": ["difficulty/概率论"],
+                "expected_count": 1, "evidence_ids_total": 1,
+                "evidence_legit_rate": 1.0,
+            },
+        }
+
+    def finish(item, gold=0):
+        item["gold_failure_count"] = gold
+        item["metric_checks"] = cm.metric_status_checks(item)
+        item["metric_failure_count"] = sum(
+            1 for entry in item["metric_checks"]
+            if entry["status"] == cm.STATUS_FAIL and entry["hard"]
+        )
+        item["failure_count"] = gold + item["metric_failure_count"]
+        return item
+
+    # ① 全 PASS：状态 PASS、退出码 0
+    ok_item = finish(base_item())
+    summary = cm.summarize_results([ok_item], scan={"ok": True, "hits": [], "rows_checked": 3})
+    check("T10 全部 PASS → status=PASS/exit 0",
+          (summary["status"], summary["exit_code"]) == (cm.STATUS_PASS, cm.EXIT_PASS), summary)
+
+    # ② 注入状态不一致 → M4 硬失败必须进 metric_failure_count 与退出码
+    bad = base_item("S4")
+    bad["m4"]["inconsistent"] = [{
+        "memory_type": "difficulty", "subject_key": "概率论",
+        "expected_injected": False, "actual_injected": True,
+        "checks": [{"field": "injected", "ok": False}],
+    }]
+    bad_item = finish(bad)
+    injected_checks = [c for c in bad_item["metric_checks"] if c["metric"] == "注入状态与实际注入"]
+    check("T10 注入不一致 → M4 记为硬失败",
+          injected_checks and injected_checks[0]["status"] == cm.STATUS_FAIL
+          and injected_checks[0]["hard"], injected_checks)
+    check("T10 硬失败进入 metric_failure_count 与 failure_count",
+          bad_item["metric_failure_count"] >= 1
+          and bad_item["failure_count"] == bad_item["gold_failure_count"] + bad_item["metric_failure_count"],
+          (bad_item["metric_failure_count"], bad_item["failure_count"]))
+    summary_bad = cm.summarize_results([bad_item], scan={"ok": True, "hits": [], "rows_checked": 3})
+    check("T10 硬失败 → status=FAIL/exit 1",
+          (summary_bad["status"], summary_bad["exit_code"]) == (cm.STATUS_FAIL, cm.EXIT_FAIL),
+          summary_bad)
+
+    # ③ --no-tool：M4 的 Tool 核对是 INCOMPLETE，整套不能报 PASS
+    no_tool = base_item("S5")
+    no_tool["tool_check"] = {
+        "attempted": False, "ok": False,
+        "error": "本次运行显式跳过真实 Tool 调用（--no-tool）",
+    }
+    no_tool_item = finish(no_tool)
+    tool_checks = [c for c in no_tool_item["metric_checks"] if c["metric"] == "真实 get_learning_memory() 核对"]
+    check("T10 --no-tool 时 M4 Tool 核对记 INCOMPLETE 而不是 PASS",
+          tool_checks and tool_checks[0]["status"] == cm.STATUS_INCOMPLETE,
+          tool_checks)
+    check("T10 INCOMPLETE 不计硬失败，但样本状态不是 PASS",
+          no_tool_item["metric_failure_count"] == 0
+          and cm._sample_status(no_tool_item) == cm.STATUS_INCOMPLETE,
+          cm._sample_status(no_tool_item))
+    summary_no_tool = cm.summarize_results([no_tool_item],
+                                           scan={"ok": True, "hits": [], "rows_checked": 3})
+    check("T10 --no-tool → status=INCOMPLETE/exit 2（不冒充全绿）",
+          (summary_no_tool["status"], summary_no_tool["exit_code"])
+          == (cm.STATUS_INCOMPLETE, cm.EXIT_INCOMPLETE)
+          and summary_no_tool["incomplete_count"] >= 1,
+          summary_no_tool)
+
+    # ④ 未扫描 runs/：同样是 INCOMPLETE，不是 PASS
+    summary_no_scan = cm.summarize_results([ok_item], scan=None)
+    check("T10 未扫描断言词 → INCOMPLETE/exit 2",
+          (summary_no_scan["status"], summary_no_scan["exit_code"])
+          == (cm.STATUS_INCOMPLETE, cm.EXIT_INCOMPLETE)
+          and any(c["status"] == cm.STATUS_INCOMPLETE for c in summary_no_scan["global_checks"]),
+          summary_no_scan["status"])
+
+    # ⑤ 断言词命中：MANUAL_REVIEW，不升级成 FAIL 也不降级成 PASS
+    summary_manual = cm.summarize_results(
+        [ok_item], scan={"ok": True, "hits": [{"line": 1}], "rows_checked": 3}
+    )
+    check("T10 断言词命中 → MANUAL_REVIEW/exit 3",
+          (summary_manual["status"], summary_manual["exit_code"])
+          == (cm.STATUS_MANUAL, cm.EXIT_MANUAL), summary_manual["status"])
+
+    # ⑥ 形状不对的结果必须显式报错，不能用 0 兜底当成没有失败
+    broken = dict(base_item("S6"))
+    for name in ("gold_failure_count", "metric_failure_count", "failure_count"):
+        broken.pop(name, None)
+    try:
+        cm.summarize_results([broken], scan={"ok": True, "hits": [], "rows_checked": 3})
+    except ValueError as error:
+        check("T10 缺计数字段 → ValueError 指出样本",
+              "S6" in str(error) and "failure_count" in str(error), str(error))
+    else:
+        check("T10 缺计数字段 → ValueError 指出样本", False, "没有报错")
+
+
+# ---------------------------------------------------------------------------
+# T11 check_auto 的 Prompt 归档 / 哈希 / 记忆注入核验
+# ---------------------------------------------------------------------------
+
+def _write_prompt(run_dir, sample_id, group, system, user):
+    path = Path(run_dir) / "prompts" / str(sample_id) / f"{group}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        ca.PROMPT_SYSTEM_PREFIX + system + ca.PROMPT_USER_SEP + user,
+        encoding="utf-8",
+    )
+    return path
+
+
+def _samples(*sample_ids):
+    return {sid: {"sample_id": sid, "feedbacks": []} for sid in sample_ids}
+
+
+def test_grounding():
+    """T11：归档 Prompt 必须能安全拆回 (system, user)、SHA-256 能按同一算法重算一致、
+    记忆区块里必须是真实记忆对象；任何一条做不到都不能记 PASS。"""
+
+    import agent_plan_draft as apd
+
+    run_dir = TMP_ROOT / "grounding-run"
+    system = "你是学习规划助手。"
+    memory = [{"type": "difficulty", "subject": "概率论", "content": "条件概率掌握薄弱"}]
+    user = (
+        "请为学习者制定计划。\n\n"
+        + bp.MEMORY_HEADER + "\n"
+        + json.dumps(memory, ensure_ascii=False)
+    )
+    _write_prompt(run_dir, "S1", "C", system, user)
+    good = _row(
+        sample_id="S1",
+        group="C",
+        prompt_sha256=bp.prompt_sha256(system, user),
+        final_output={
+            "answer": "建议先复习条件概率。",
+            "plan": {"reason": "按历史情况", "steps": []},
+        },
+    )
+    cache = _samples("S1", "S2", "S3", "S4", "S9")
+
+    status, detail = ca.grounding_for_row(
+        good, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 哈希一致 + 记忆可解析 → PASS",
+          status == "PASS" and "重算一致" in detail and "记忆 1 条" in detail,
+          (status, detail))
+
+    claimed = json.loads(json.dumps(good, ensure_ascii=False))
+    claimed["final_output"]["answer"] = "根据学习记忆，你在概率论上比较薄弱。"
+    status, detail = ca.grounding_for_row(
+        claimed, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 声称记忆来源且有真实注入 → PASS 且标注主张一致",
+          status == "PASS" and "来源主张与注入一致" in detail, (status, detail))
+
+    tampered = json.loads(json.dumps(good, ensure_ascii=False))
+    tampered["prompt_sha256"] = "0" * 64
+    status, detail = ca.grounding_for_row(
+        tampered, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 Prompt 被改写（哈希不符）→ UNVERIFIABLE，不冒充 PASS",
+          status == "UNVERIFIABLE" and "不一致" in detail, (status, detail))
+
+    empty_user = "请为学习者制定计划。\n\n" + bp.MEMORY_HEADER + "\n[]"
+    _write_prompt(run_dir, "S2", "C", system, empty_user)
+    empty_row = _row(
+        sample_id="S2",
+        group="C",
+        prompt_sha256=bp.prompt_sha256(system, empty_user),
+        final_output={"answer": "好的", "plan": {"reason": "按当前情况", "steps": []}},
+    )
+    status, detail = ca.grounding_for_row(
+        empty_row, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 记忆区块为空数组 → FAIL（取不到真实记忆内容）",
+          status == "FAIL" and "取不到真实记忆内容" in detail, (status, detail))
+
+    _write_prompt(run_dir, "S3", "A", system, user)
+    a_row = _row(
+        sample_id="S3",
+        group="A",
+        prompt_sha256=bp.prompt_sha256(system, user),
+        final_output={"answer": "好的", "plan": {"reason": "按当前情况", "steps": []}},
+    )
+    status, detail = ca.grounding_for_row(
+        a_row, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 A 组 Prompt 出现记忆区块 → FAIL（该组不应注入长期记忆）",
+          status == "FAIL" and "不应注入长期记忆" in detail, (status, detail))
+
+    broken_path = Path(run_dir) / "prompts" / "S4" / "C.txt"
+    broken_path.parent.mkdir(parents=True, exist_ok=True)
+    broken_path.write_text("系统提示\n\n===== USER =====\n用户请求", encoding="utf-8")
+    broken_row = _row(sample_id="S4", group="C")
+    status, detail = ca.grounding_for_row(
+        broken_row, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 缺 `===== SYSTEM =====` 头 → UNVERIFIABLE",
+          status == "UNVERIFIABLE" and "格式无法解析" in detail, (status, detail))
+
+    no_hash = json.loads(json.dumps(good, ensure_ascii=False))
+    no_hash.pop("prompt_sha256")
+    status, detail = ca.grounding_for_row(
+        no_hash, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 归档行缺 prompt_sha256 → UNVERIFIABLE",
+          status == "UNVERIFIABLE" and "没有 prompt_sha256" in detail, (status, detail))
+
+    missing_row = _row(sample_id="S9", group="C")
+    status, detail = ca.grounding_for_row(
+        missing_row, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 缺 Prompt 文件 → UNVERIFIABLE",
+          status == "UNVERIFIABLE" and "缺少 Prompt 文件" in detail, (status, detail))
+
+    kb = json.loads(json.dumps(good, ensure_ascii=False))
+    kb["final_output"]["answer"] = "根据知识库，条件概率需要复习。"
+    status, detail = ca.grounding_for_row(
+        kb, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS
+    )
+    check("T11 真实 check_grounding 的违例原样进 FAIL",
+          status == "FAIL" and "声称依据知识库" in detail, (status, detail))
+
+    archive = ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP + "用户"
+    check("T11 parse_prompt_archive 安全拆回 (system, user)",
+          ca.parse_prompt_archive(archive) == ("系统", "用户"),
+          ca.parse_prompt_archive(archive))
+
+    try:
+        ca.parse_prompt_archive(archive + ca.PROMPT_USER_SEP + "重复")
+    except ValueError as error:
+        check("T11 USER 分隔符出现两次 → ValueError（不做截断式切分）",
+              "2 次" in str(error), str(error))
+    else:
+        check("T11 USER 分隔符出现两次 → ValueError（不做截断式切分）", False, "没有报错")
+
+    for label, bad, expected in (
+        ("SYSTEM 为空", ca.PROMPT_SYSTEM_PREFIX + ca.PROMPT_USER_SEP + "用户", "SYSTEM 内容为空"),
+        ("USER 为空", ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP, "USER 内容为空"),
+    ):
+        try:
+            ca.parse_prompt_archive(bad)
+        except ValueError as error:
+            check(f"T11 {label} → ValueError", expected in str(error), str(error))
+        else:
+            check(f"T11 {label} → ValueError", False, "没有报错")
+
+    archive_row = dict(good, prompt_sha256=bp.prompt_sha256("系统", "用户"))
+    actual, error = ca.verify_prompt_hash(archive, archive_row)
+    check("T11 verify_prompt_hash 返回与归档一致的重算值",
+          error is None and actual == archive_row["prompt_sha256"], (actual, error))
+
+    check("T11 无记忆区块时 parse_memory_payload 返回 (False, [], None)",
+          ca.parse_memory_payload("纯用户请求") == (False, [], None))
+
+    present, payload, error = ca.parse_memory_payload(
+        "用户请求\n" + bp.MEMORY_HEADER + "\n" + json.dumps(memory, ensure_ascii=False)
+    )
+    check("T11 parse_memory_payload 还原真实记忆对象",
+          present and error is None and payload == memory, (present, payload, error))
+
+    payload_cases = (
+        ("没有 JSON 数组", "用户请求\n" + bp.MEMORY_HEADER + "\n没有数组", "找不到 JSON 数组"),
+        ("JSON 损坏", "用户请求\n" + bp.MEMORY_HEADER + '\n[{"content": ]', "JSON 解析失败"),
+        ("空数组", "用户请求\n" + bp.MEMORY_HEADER + "\n[]", "不是非空数组"),
+        ("非对象条目", "用户请求\n" + bp.MEMORY_HEADER + '\n["x"]', "非对象条目"),
+        ("content 全为空", "用户请求\n" + bp.MEMORY_HEADER + '\n[{"content": "  "}]',
+         "content 都是空的"),
+    )
+    for label, text, expected in payload_cases:
+        present, got, error = ca.parse_memory_payload(text)
+        check(f"T11 记忆区块{label} → 显式报错而不是空 payload",
+              present and got == [] and expected in (error or ""), (present, got, error))
+
+    analysis, failures = ca.analyze_row(
+        "grounding-run", run_dir, 1, good, None,
+        seed_fixture.load_config(None), cache, apd.check_grounding,
+        apd.MEMORY_CLAIM_MARKERS,
+    )
+    check("T11 analyze_row 把 grounding PASS 计入分析且不进失败清单",
+          analysis["grounding"] == "PASS"
+          and not any(item["metric"] == "grounding" for item in failures),
+          (analysis["grounding"], failures))
+
+
+def _force_rmtree(target):
+    """Windows 上临时目录里的只读文件会让 rmtree 静默失败，先解除只读再重试。"""
+
+    def onexc(func, path, exc):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(target, onexc=onexc)
+    else:
+        shutil.rmtree(target, onerror=lambda func, path, exc_info: onexc(func, path, exc_info[1]))
+
+
+def main():
+    try:
+        test_m1()
+        test_m2()
+        test_m3()
+        test_m4()
+        test_pooled_and_csv()
+        test_scan()
+        test_read_rows()
+        test_auto_analysis()
+        test_status_accounting()
+        test_grounding()
+
+        print()
+        print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")
+        for name, detail in FAILED:
+            print(f"  FAILED {name}: {detail}")
+        return 0 if not FAILED else 1
+    finally:
+        _force_rmtree(TMP_ROOT)
 
 
 if __name__ == "__main__":
