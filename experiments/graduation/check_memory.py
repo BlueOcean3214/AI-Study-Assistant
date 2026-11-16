@@ -26,7 +26,7 @@
     python experiments/graduation/check_memory.py                # 重建后核验（含 S7-empty 补充样本）
     python experiments/graduation/check_memory.py --reuse        # 复用已有库
     python experiments/graduation/check_memory.py --report out/x.md --metrics out/m.csv
-    python experiments/graduation/check_memory.py --no-tool      # 不调真实 Tool，M4 的 Tool 核对记 N/A
+    python experiments/graduation/check_memory.py --no-tool      # 不调真实 Tool，Tool 核对记「检查未完成」
 """
 
 import argparse
@@ -827,6 +827,10 @@ STATUS_NA = "N/A"
 STATUS_MANUAL = "MANUAL_REVIEW"
 STATUS_INCOMPLETE = "INCOMPLETE"
 
+# M4 里"真实 Tool 核对"这条检查的名字：统一状态表、M4 明细表、终端打印都从这里取，
+# 免得一处改名、另一处继续用旧名字从而各判一套状态。
+TOOL_CHECK_METRIC = "真实 get_learning_memory() 核对"
+
 EXIT_PASS = 0
 EXIT_FAIL = 1
 EXIT_INCOMPLETE = 2
@@ -1045,23 +1049,23 @@ def metric_status_checks(item):
 
     if tool is None:
         checks.append(
-            _status_check("M4", "真实 get_learning_memory() 核对", STATUS_INCOMPLETE, False,
+            _status_check("M4", TOOL_CHECK_METRIC, STATUS_INCOMPLETE, False,
                           "本次运行没有做 Tool 侧核对")
         )
     elif not tool.get("attempted"):
         checks.append(
-            _status_check("M4", "真实 get_learning_memory() 核对", STATUS_INCOMPLETE, False,
+            _status_check("M4", TOOL_CHECK_METRIC, STATUS_INCOMPLETE, False,
                           tool.get("error") or "Tool 未调用（--no-tool）")
         )
     elif not tool.get("ok"):
         checks.append(
-            _status_check("M4", "真实 get_learning_memory() 核对", STATUS_FAIL, True,
+            _status_check("M4", TOOL_CHECK_METRIC, STATUS_FAIL, True,
                           tool.get("error") or "Tool 调用失败")
         )
     elif not tool.get("matches_injected"):
         checks.append(
             _status_check(
-                "M4", "真实 get_learning_memory() 核对", STATUS_FAIL, True,
+                "M4", TOOL_CHECK_METRIC, STATUS_FAIL, True,
                 f"Tool 返回集合与注入集合不一致：返回 {tool['returned_count']} 条 "
                 f"{tool['returned_labels']}，库里期望 {tool['expected_count']} 条",
             )
@@ -1069,7 +1073,7 @@ def metric_status_checks(item):
     else:
         checks.append(
             _status_check(
-                "M4", "真实 get_learning_memory() 核对", STATUS_PASS, True,
+                "M4", TOOL_CHECK_METRIC, STATUS_PASS, True,
                 f"Tool 返回 {tool['returned_count']} 条，与库里注入集合一致",
             )
         )
@@ -1109,6 +1113,64 @@ def _sample_status(item):
     if STATUS_MANUAL in statuses:
         return STATUS_MANUAL
     return STATUS_PASS
+
+
+# 报告里显示的状态文字必须由状态本身决定，不能各表各判一套：
+# 「检查未完成」绝不能写成「通过」，也不能写成看起来像结论的 N/A。
+_STATUS_LABEL = {
+    STATUS_PASS: "通过",
+    STATUS_FAIL: "失败",
+    STATUS_NA: "不适用",
+    STATUS_MANUAL: "待人工复核",
+    STATUS_INCOMPLETE: "检查未完成",
+}
+
+
+def _status_label(status):
+    if status not in _STATUS_LABEL:
+        raise ValueError(f"未知检查状态：{status}")
+    return _STATUS_LABEL[status]
+
+
+def _metric_check(item, section, metric):
+    """从该样本的统一检查清单里取一条检查，取不到返回 None。"""
+
+    for check in item.get("metric_checks") or []:
+        if check["section"] == section and check["metric"] == metric:
+            return check
+    return None
+
+
+def tool_verdict_label(item):
+    """M4 明细表里的 Tool 列文字：取统一状态表里的同一条检查，不另判一套。"""
+
+    tool_state = _metric_check(item, "M4", TOOL_CHECK_METRIC)
+    if tool_state is None:
+        return f"{_status_label(STATUS_INCOMPLETE)}（缺少 Tool 核对记录）"
+    label = _status_label(tool_state["status"])
+    if tool_state["status"] != STATUS_PASS:
+        reason = str(tool_state.get("reason") or "").strip()
+        if reason:
+            label += f"（{reason}）"
+    return label
+
+
+def overview_table(results):
+    """报告「总览」表：结果列必须由统一状态判定，不能只看 failure_count。"""
+
+    lines = ["| 样本 | 记忆条数 | 注入条数 | 多余记忆 | Gold 失败项 | 检查硬失败 | 结果 |"]
+    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    for item in results:
+        # 一律按统一状态判定：failure_count == 0 只说明「没查到硬失败」，
+        # 检查没执行（--no-tool、缺数据）或待人工复核时都不能写成通过。
+        verdict = _status_label(_sample_status(item))
+        lines.append(
+            f"| {item['sample_id']} | {len(item['rows'])} | {len(item['injected'])} | "
+            f"{len(item['unexpected'])} | "
+            f"{item.get('gold_failure_count', item['failure_count'])} | "
+            f"{item.get('metric_failure_count', 0)} | {verdict} |"
+        )
+    return lines
 
 
 def summarize_results(results, scan=None):
@@ -1635,18 +1697,7 @@ def render_report(results, config, scan=None, summary=None):
 
     lines.append("## 总览")
     lines.append("")
-    lines.append(
-        "| 样本 | 记忆条数 | 注入条数 | 多余记忆 | Gold 失败项 | 检查硬失败 | 结果 |"
-    )
-    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
-    for item in results:
-        verdict = "通过" if item["failure_count"] == 0 else "失败"
-        lines.append(
-            f"| {item['sample_id']} | {len(item['rows'])} | {len(item['injected'])} | "
-            f"{len(item['unexpected'])} | "
-            f"{item.get('gold_failure_count', item['failure_count'])} | "
-            f"{item.get('metric_failure_count', 0)} | {verdict} |"
-        )
+    lines.extend(overview_table(results))
     lines.append("")
     lines.append(
         f"合计 {total_memories} 条记忆，失败项 {summary['failure_count']} 项"
@@ -1946,13 +1997,9 @@ def render_report(results, config, scan=None, summary=None):
     for item in results:
         scope = "主实验" if _scope_of(item["sample_id"], config) == "main" else "补充"
         m4 = item["m4"]
-        tool = item.get("tool_check") or {}
-        if tool.get("attempted") and tool.get("ok"):
-            tool_verdict = "PASS" if tool["matches_injected"] else "FAIL"
-        elif tool:
-            tool_verdict = "N/A（" + str(tool.get("error")) + "）"
-        else:
-            tool_verdict = "N/A（未调用）"
+        # Tool 列的状态直接取统一状态表里的同一条检查，不再自己用 attempted/ok 重判一遍：
+        # 那样会让 M4 明细表写 N/A、统一状态表写 INCOMPLETE，读者无从判断哪个才算数。
+        tool_verdict = tool_verdict_label(item)
         causes = "；".join(
             f"{name}×{count}" for name, count in sorted(m4["diagnostic_counts"].items())
         ) or "无"
@@ -2005,7 +2052,8 @@ def main(argv=None):
         help="扫描 D 组断言词的 runs 目录（只读，默认 experiments/graduation/runs）",
     )
     parser.add_argument(
-        "--no-tool", action="store_true", help="不调用真实 get_learning_memory()，Tool 侧核对记 N/A"
+        "--no-tool", action="store_true",
+        help="不调用真实 get_learning_memory()：Tool 侧核对记「检查未完成」，退出码为 2，不算通过"
     )
     parser.add_argument(
         "--no-assertion-scan", action="store_true", help="不扫描 runs/，断言词结果记 N/A"

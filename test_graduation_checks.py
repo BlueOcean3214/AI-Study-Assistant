@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """check_memory.py（M1–M4）与 check_auto.py 的自写回归测试（无 pytest，直接 python 运行）。
 
@@ -19,8 +19,10 @@ T11 check_auto 的 Prompt 归档：parse_prompt_archive / parse_memory_payload /
     grounding_for_row 的 PASS / FAIL / UNVERIFIABLE 分支，调用真实 agent_plan_draft.check_grounding。
 """
 
+import contextlib
 import csv
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -744,7 +746,17 @@ def test_grounding():
 
     run_dir = TMP_ROOT / "grounding-run"
     system = "你是学习规划助手。"
-    memory = [{"type": "difficulty", "subject": "概率论", "content": "条件概率掌握薄弱"}]
+    # 与真实归档一致：记忆区块里是完整的公开投影（8 个字段），不是简写版
+    memory = [{
+        "type": "difficulty",
+        "subject": "概率论",
+        "content": "条件概率掌握薄弱",
+        "strength": 0.6,
+        "evidence_count": 2,
+        "episode": "ep-1",
+        "evidence_feedback_ids": [1, 2],
+        "updated_at": "2026-11-01T00:00:00Z",
+    }]
     user = (
         "请为学习者制定计划。\n\n"
         + bp.MEMORY_HEADER + "\n"
@@ -883,13 +895,15 @@ def test_grounding():
     check("T11 parse_memory_payload 还原真实记忆对象",
           present and error is None and payload == memory, (present, payload, error))
 
+    partial = dict(memory[0], content="  ")
     payload_cases = (
         ("没有 JSON 数组", "用户请求\n" + bp.MEMORY_HEADER + "\n没有数组", "找不到 JSON 数组"),
         ("JSON 损坏", "用户请求\n" + bp.MEMORY_HEADER + '\n[{"content": ]', "JSON 解析失败"),
         ("空数组", "用户请求\n" + bp.MEMORY_HEADER + "\n[]", "不是非空数组"),
-        ("非对象条目", "用户请求\n" + bp.MEMORY_HEADER + '\n["x"]', "非对象条目"),
-        ("content 全为空", "用户请求\n" + bp.MEMORY_HEADER + '\n[{"content": "  "}]',
-         "content 都是空的"),
+        ("非对象条目", "用户请求\n" + bp.MEMORY_HEADER + '\n["x"]', "不是 JSON 对象"),
+        ("content 为空",
+         "用户请求\n" + bp.MEMORY_HEADER + "\n" + json.dumps([partial], ensure_ascii=False),
+         "的 content 为空"),
     )
     for label, text, expected in payload_cases:
         present, got, error = ca.parse_memory_payload(text)
@@ -905,6 +919,261 @@ def test_grounding():
           analysis["grounding"] == "PASS"
           and not any(item["metric"] == "grounding" for item in failures),
           (analysis["grounding"], failures))
+
+
+# ---------------------------------------------------------------------------
+# T12 check_auto：manifest 不可信必须在算指标前终止
+# ---------------------------------------------------------------------------
+
+def _manifest_entry(run_dir, run_name):
+    results = run_dir / "results.jsonl"
+    return {
+        "relative_path": f"experiments/graduation/runs/{run_name}/results.jsonl",
+        "sha256": hashlib.sha256(results.read_bytes()).hexdigest(),
+        "size_bytes": str(results.stat().st_size),
+        "records": "2",
+    }
+
+
+@contextlib.contextmanager
+def _patched_manifest(path):
+    saved = ca.MANIFEST_PATH
+    ca.MANIFEST_PATH = path
+    try:
+        yield
+    finally:
+        ca.MANIFEST_PATH = saved
+
+
+def test_auto_manifest_failclosed():
+    runs_dir = TMP_ROOT / "manifest-runs"
+    run_name = "manifest-run"
+    run_dir = runs_dir / run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rows = [_row(repeat_index=0), _row(repeat_index=1, sample_id="S2")]
+    (run_dir / "results.jsonl").write_text(
+        "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8"
+    )
+    before = hashlib.sha256((run_dir / "results.jsonl").read_bytes()).hexdigest()
+    config = seed_fixture.load_config(None)
+    columns = ["relative_path", "sha256", "size_bytes", "records"]
+    manifest = TMP_ROOT / "manifest.csv"
+
+    # 指标计算必须完全没被调用：manifest 不可信时不能先算再说
+    saved_analyze = ca.analyze_row
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("manifest 不可信时不得开始计算指标")
+
+    ca.analyze_row = forbidden
+    try:
+        cases = []
+
+        good = _manifest_entry(run_dir, run_name)
+        ca.write_csv(manifest, columns, [good])
+        with _patched_manifest(manifest):
+            try:
+                ca.collect_scope("main", [run_name], runs_dir, None, config, {}, None, ())
+                good_status = "no-error"
+            except AssertionError:
+                # manifest 校验放行后才会去算指标，被这个桩拦住 → 说明这一步校验真的过了
+                good_status = "reached-metrics"
+            except ca.CheckError as error:
+                good_status = str(error)
+        assert good_status == "reached-metrics", good_status
+
+        empty_sha = dict(good, sha256="")
+        ca.write_csv(manifest, columns, [empty_sha])
+
+        invalid_size = dict(good, size_bytes="")
+        # 另一个 path 用来放这一份，避免和后一条互相覆盖
+        size_manifest = TMP_ROOT / "manifest-bad-size.csv"
+        ca.write_csv(size_manifest, columns, [invalid_size])
+
+        dup_manifest = TMP_ROOT / "manifest-dup.csv"
+        ca.write_csv(dup_manifest, columns, [good, dict(good)])
+
+        empty_manifest = TMP_ROOT / "manifest-empty.csv"
+        ca.write_csv(empty_manifest, columns, [])
+
+        missing = TMP_ROOT / "no-such-manifest.csv"
+        cases = [
+            ("空 sha256", manifest, "sha256 为空"),
+            ("空 size_bytes", size_manifest, "size_bytes 为空"),
+            ("重复条目", dup_manifest, "重复条目"),
+            ("缺条目", empty_manifest, "manifest 未收录"),
+            ("manifest 缺失", missing, "清单文件缺失"),
+        ]
+
+        for label, manifest_path, fragment in cases:
+            raised = None
+            try:
+                # patch 必须包住这次调用本身：lambda 事后执行会读回真实 MANIFEST_PATH
+                with _patched_manifest(manifest_path):
+                    ca.collect_scope(
+                        "main", [run_name], runs_dir, None, config, {}, None, ())
+            except ca.CheckError as error:
+                raised = str(error)
+            except AssertionError:
+                raised = "指标被计算了（manifest 未 fail-closed）"
+            check(f"T12 {label} → 在算指标前抛 CheckError", raised is not None, raised)
+            if raised is not None:
+                check(f"T12 {label} 错误信息含 {fragment}", fragment in raised, raised)
+                check(f"T12 {label} 明确写了 fail-closed",
+                      "fail-closed" in raised or "manifest" in raised, raised)
+
+        # 这条错误必须走 main() 的真实 except 分支并给出退出码 2
+        def raising_run(args):
+            raise ca.CheckError("manifest 校验未通过，已在计算指标前终止（fail-closed）")
+
+        saved_run = ca.run
+        ca.run = raising_run
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = ca.main(["--runs-dir", str(runs_dir)])
+        finally:
+            ca.run = saved_run
+        check("T12 CheckError 经 main() 返回退出码 2", code == 2, code)
+        check("T12 main() 把失败原因写到 stderr", "FAILED" in err.getvalue(), err.getvalue())
+    finally:
+        ca.analyze_row = saved_analyze
+
+    after = hashlib.sha256((run_dir / "results.jsonl").read_bytes()).hexdigest()
+    check("T12 核对过程只读，results.jsonl 字节未变", before == after, (before, after))
+
+
+# ---------------------------------------------------------------------------
+# T13 记忆公开投影：字段白名单与取值校验
+# ---------------------------------------------------------------------------
+
+def _memory_item(**overrides):
+    item = {
+        "type": "difficulty",
+        "subject": "概率论",
+        "content": "在条件概率上反复出错",
+        "strength": 0.6,
+        "evidence_count": 2,
+        "episode": "ep-1",
+        "evidence_feedback_ids": [1, 2],
+        "updated_at": "2026-11-01T00:00:00Z",
+    }
+    item.update(overrides)
+    return item
+
+
+def test_memory_payload_item_validation():
+    def payload(item):
+        return (
+            bp.MEMORY_HEADER
+            + "\n"
+            + json.dumps([item], ensure_ascii=False)
+            + "\n"
+            + ca.MEMORY_SUFFIX_MARKER
+            + "\n答案"
+        )
+
+    present, items, error = ca.parse_memory_payload(payload(_memory_item()))
+    check("T13 合法投影被接受", present is True and error is None and len(items) == 1,
+          (present, items, error))
+
+    cases = [
+        ("多余字段", _memory_item(owner="me"), "含公开投影之外的字段"),
+        ("type 非法", _memory_item(type="unknown"), "的 type 非法"),
+        ("subject 为空", _memory_item(subject=""), "的 subject 为空"),
+        ("content 为空", _memory_item(content=""), "的 content 为空"),
+        ("strength 非数字", _memory_item(strength="0.6"), "的 strength 不是数字"),
+        ("strength 越界", _memory_item(strength=2), "的 strength 超出 0–1 范围"),
+        ("evidence_count 为负", _memory_item(evidence_count=-1), "的 evidence_count 不是非负整数"),
+        ("evidence_feedback_ids 不是数组", _memory_item(evidence_feedback_ids="1,2"),
+         "的 evidence_feedback_ids 不是数组"),
+        ("证据 id 超过 5 个", _memory_item(evidence_feedback_ids=[1, 2, 3, 4, 5, 6]), "超过 5 个"),
+        ("证据 id 非法", _memory_item(evidence_feedback_ids=[1, "x"]), "含非法 id"),
+        ("updated_at 类型非法", _memory_item(updated_at=20261101), "的 updated_at 类型非法"),
+    ]
+    for label, item, fragment in cases:
+        present, items, error = ca.parse_memory_payload(payload(item))
+        check(f"T13 {label} 被拒绝", present is True and error is not None and items == [],
+              (label, items, error))
+        check(f"T13 {label} 错误信息含「{fragment}」",
+              error is not None and fragment in error, error)
+
+    # 无记忆区块时不冒充「校验通过」
+    check("T13 无记忆区块 → present=False 且无 payload",
+          ca.parse_memory_payload("纯用户请求") == (False, [], None))
+
+
+# ---------------------------------------------------------------------------
+# T14 check_memory：报告状态必须统一，不能只在文字里改
+# ---------------------------------------------------------------------------
+
+def _status_item(sample_id, checks, *, failure_count=0, gold=0, metric_failures=0):
+    return {
+        "sample_id": sample_id,
+        "rows": [{"key": "k1"}],
+        "injected": [("difficulty", "概率论")],
+        "unexpected": [],
+        "gold_failure_count": gold,
+        "metric_failure_count": metric_failures,
+        "failure_count": failure_count,
+        "metric_checks": checks,
+    }
+
+
+def _check_row(section, metric, status, reason="", hard=False):
+    return {"section": section, "metric": metric, "status": status,
+            "reason": reason, "hard": hard}
+
+
+def test_overview_status_unified():
+    passing = _status_item("S1", [
+        _check_row("M1", "类型 P/R/F1", "PASS"),
+        _check_row("M4", cm.TOOL_CHECK_METRIC, "PASS"),
+    ])
+    incomplete = _status_item("S2", [_check_row("M4", cm.TOOL_CHECK_METRIC, cm.STATUS_INCOMPLETE, "未执行")])
+    manual = _status_item("S3", [_check_row("M3", "断言词扫描", cm.STATUS_MANUAL, "命中")])
+    failed = _status_item("S4", [_check_row("M4", "注入一致性", cm.STATUS_FAIL, "不一致", hard=True)],
+                          failure_count=1, metric_failures=1)
+    not_applicable = _status_item("S5-empty", [_check_row("M1", "类型 P/R/F1", cm.STATUS_NA)])
+
+    check("T14 PASS 项总览写「通过」", cm._sample_status(passing) == cm.STATUS_PASS, passing)
+    check("T14 检查未完成的样本总览不能写通过", cm._sample_status(incomplete) == cm.STATUS_INCOMPLETE,
+          incomplete)
+    check("T14 待人工复核的样本总览写「待人工复核」", cm._sample_status(manual) == cm.STATUS_MANUAL, manual)
+    check("T14 硬失败样本总览写「失败」", cm._sample_status(failed) == cm.STATUS_FAIL, failed)
+    check("T14 N/A 样本仍是 PASS（不适用 ≠ 未完成）",
+          cm._sample_status(not_applicable) == cm.STATUS_PASS, not_applicable)
+
+    table = cm.overview_table([passing, incomplete, manual, failed, not_applicable])
+    text = "\n".join(table)
+    check("T14 总览表把 5 种状态分别写出来",
+          "通过" in text and "检查未完成" in text and "待人工复核" in text and "失败" in text, text)
+    check("T14 总览表不再直接用「硬失败为 0 就通过」",
+          "| S2 | 1 | 1 | 0 | 0 | 0 | 检查未完成 |" in text, text)
+    check("T14 总览表 header 保留原有列",
+          table[0].startswith("| 样本 | 记忆条数 | 注入条数 | 多余记忆 | Gold 失败项 | 检查硬失败 | 结果 |"),
+          table[0])
+
+    unknown = None
+    try:
+        cm._status_label("WHATEVER")
+    except ValueError as error:
+        unknown = str(error)
+    check("T14 未知状态直接报错，不静默当通过", unknown is not None, unknown)
+
+    # M4 明细表的 Tool 列必须取自同一份状态表
+    no_tool = _status_item("S6", [_check_row("M4", "注入一致性", cm.STATUS_PASS)])
+    label_missing = cm.tool_verdict_label(no_tool)
+    check("T14 缺 Tool 核对记录时 M4 明细写「检查未完成」", "检查未完成" in label_missing, label_missing)
+
+    tool_failed = _status_item("S7", [_check_row("M4", cm.TOOL_CHECK_METRIC, "FAIL", "记忆条数不符", True)])
+    label_failed = cm.tool_verdict_label(tool_failed)
+    check("T14 Tool 核对失败时 M4 明细写失败并带原因",
+          label_failed.startswith("失败") and "记忆条数不符" in label_failed, label_failed)
+
+    tool_ok = _status_item("S8", [_check_row("M4", cm.TOOL_CHECK_METRIC, cm.STATUS_PASS)])
+    check("T14 Tool 核对通过时 M4 明细只写「通过」",
+          cm.tool_verdict_label(tool_ok) == "通过", cm.tool_verdict_label(tool_ok))
 
 
 def _force_rmtree(target):
@@ -935,6 +1204,9 @@ def main():
         test_auto_analysis()
         test_status_accounting()
         test_grounding()
+        test_auto_manifest_failclosed()
+        test_memory_payload_item_validation()
+        test_overview_status_unified()
 
         print()
         print(f"通过 {len(PASSED)} 项，失败 {len(FAILED)} 项")

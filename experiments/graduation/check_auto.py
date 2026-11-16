@@ -33,6 +33,7 @@ import argparse
 import csv
 import hashlib
 import json
+import re
 import statistics
 import sys
 import tempfile
@@ -56,6 +57,16 @@ SUPPLEMENT_RUNS = (
     "b0-remainder-20261113T013105Z",
 )
 MANIFEST_PATH = HERE.parents[1] / "docs" / "GRADUATION-EXPERIMENT-FILE-MANIFEST.csv"
+
+# 唯一允许「manifest 完全没有条目」的 run：B0 是基线提交 df4b938 之前的 legacy 结果。
+# 白名单之外一律 fail-closed；B0 若已有条目，其字段仍必须完整合法（见 verify_manifest）。
+LEGACY_NO_MANIFEST_RUNS = frozenset({
+    "20261112T210000-20261113T011751Z",
+    "20261112T210000-20261113T012031Z",
+    "b0-remainder-20261113T013105Z",
+})
+
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 # 合法取值（v4.5 §4.2、§5.1）
 MAIN_GROUPS = ("A", "B", "C", "D", "B0")
@@ -209,36 +220,90 @@ def read_rows(run_dir):
     return rows, problems
 
 
-def manifest_hashes():
-    """docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv → {relative_path: (sha256, records)}。"""
+def manifest_hashes(path=None):
+    """docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv → {relative_path: row}。
 
+    同一路径出现两条记录时直接抛 CheckError：用字典覆盖会让「后一条合法」悄悄顶掉
+    「前一条可疑」，manifest 就失去可信度。
+    """
+
+    path = Path(path) if path else MANIFEST_PATH
     hashes = {}
-    if not MANIFEST_PATH.is_file():
+    if not path.is_file():
         return hashes
-    with MANIFEST_PATH.open("r", encoding="utf-8-sig", newline="") as handle:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
         for row in csv.DictReader(handle):
             relative = (row.get("relative_path") or "").strip().replace("\\", "/")
             if relative:
-                hashes[relative] = (row.get("sha256"), row.get("records"))
+                if relative in hashes:
+                    raise CheckError(
+                        f"manifest 中 {relative} 出现重复条目，拒绝静默覆盖："
+                        "请先确认哪一条才是被冻结的版本"
+                    )
+                hashes[relative] = row
     return hashes
 
 
-def verify_manifest(run_name, run_dir, hashes, rows_count):
-    """返回 (状态, 细节)。状态：match / missing / mismatch / no_manifest。"""
+def _manifest_number(entry, field):
+    """取 manifest 里的整数列，返回 (value, error)。空/非纯数字都算错误。"""
+
+    text = str(entry.get(field) or "").strip()
+    if not text:
+        return None, f"manifest 的 {field} 为空"
+    if not text.isdigit():
+        return None, f"manifest 的 {field} 不是合法非负整数：{text!r}"
+    return int(text), None
+
+
+def verify_manifest(run_name, run_dir, hashes, rows_count, manifest_path=None):
+    """返回 (状态, 细节)。状态：match / mismatch / manifest_missing / legacy_no_manifest / manifest_absent。
+
+    只有 match 与 legacy_no_manifest 可信；其余状态调用方必须终止，不能只记一行日志。
+    """
+
+    path = Path(manifest_path) if manifest_path else MANIFEST_PATH
+    if not path.is_file():
+        return "manifest_absent", f"manifest 清单文件缺失：{path}（不能只凭现场计算值放行）"
 
     key = f"experiments/graduation/runs/{run_name}/{RESULTS_NAME}"
-    if key not in hashes:
-        return "manifest_missing", f"manifest 未收录 {key}（legacy 目录不在清单内）"
+    entry = hashes.get(key)
+    if entry is None:
+        if run_name in LEGACY_NO_MANIFEST_RUNS:
+            return "legacy_no_manifest", f"B0 legacy run 允许缺条目（manifest 未收录 {key}）"
+        return "manifest_missing", f"manifest 未收录 {key}（该 run 不属于 B0 legacy 白名单）"
 
-    expected_sha, expected_records = hashes[key]
-    actual_sha = sha256_file(Path(run_dir) / RESULTS_NAME)
-    if actual_sha != expected_sha:
-        return "mismatch", f"SHA-256 不一致：manifest={expected_sha} 实际={actual_sha}"
+    results_path = Path(run_dir) / RESULTS_NAME
+    actual_sha = sha256_file(results_path)
+    actual_size = results_path.stat().st_size
+    problems = []
 
-    if expected_records is not None and str(expected_records).strip() != str(rows_count):
-        return "mismatch", f"记录数不一致：manifest={expected_records} 实际={rows_count}"
+    expected_sha = str(entry.get("sha256") or "").strip().lower()
+    if not expected_sha:
+        problems.append("sha256 为空")
+    elif not SHA256_HEX.match(expected_sha):
+        problems.append(f"sha256 不是 64 位十六进制：{expected_sha!r}")
+    elif actual_sha != expected_sha:
+        problems.append(f"SHA-256 不一致：manifest={expected_sha} 实际={actual_sha}")
 
-    return "match", f"SHA-256 与 manifest 一致（{actual_sha[:16]}…）"
+    expected_size, error = _manifest_number(entry, "size_bytes")
+    if error:
+        problems.append(error)
+    elif expected_size != actual_size:
+        problems.append(f"大小不一致：manifest={expected_size} 实际={actual_size}")
+
+    expected_records, error = _manifest_number(entry, "records")
+    if error:
+        problems.append(error)
+    elif expected_records != rows_count:
+        problems.append(f"记录数不一致：manifest={expected_records} 实际={rows_count}")
+
+    if problems:
+        return "mismatch", "；".join(problems)
+
+    return "match", (
+        f"SHA-256/大小/记录数与 manifest 一致（{actual_sha[:16]}…，"
+        f"{actual_size} 字节，{rows_count} 条）"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -288,16 +353,101 @@ def parse_prompt_archive(text):
     return system, user
 
 
+# 记忆条目字段白名单：与 agent_plan_draft.MEMORY_RESULT_FIELDS / agent_tools._sanitize_memory()
+# 的公开投影逐字对应。这里刻意不 import agent_tools（它会导入 database 并绑定 DATABASE_PATH，
+# 破坏 check_auto 的只读隔离），改用镜像常量，并在测试里断言两边完全一致，防止静默漂移。
+MEMORY_PAYLOAD_FIELDS = (
+    "type",
+    "subject",
+    "content",
+    "strength",
+    "evidence_count",
+    "episode",
+    "evidence_feedback_ids",
+    "updated_at",
+)
+
+# 与 agent_tools.MEMORY_TYPES 一致
+MEMORY_PAYLOAD_TYPES = ("difficulty", "task_performance", "time_pattern", "task_topic")
+
+# _memory_block() 之后固定跟随的 Prompt 片段（记忆区块是 parts 的倒数第二段）
+MEMORY_SUFFIX_MARKER = "输出契约："
+
+
+def _validate_memory_item(index, item):
+    """逐条校验一条记忆，返回错误描述或 None。"""
+
+    where = f"第 {index} 条记忆"
+    if not isinstance(item, dict):
+        return f"{where}不是 JSON 对象"
+
+    unknown = sorted(set(item) - set(MEMORY_PAYLOAD_FIELDS))
+    if unknown:
+        return f"{where}含公开投影之外的字段：{unknown}"
+
+    memory_type = item.get("type")
+    if not isinstance(memory_type, str) or memory_type not in MEMORY_PAYLOAD_TYPES:
+        return f"{where}的 type 非法：{memory_type!r}（应为 {'/'.join(MEMORY_PAYLOAD_TYPES)}）"
+
+    subject = item.get("subject")
+    if not isinstance(subject, str) or not subject.strip():
+        return f"{where}的 subject 为空或不是字符串：{subject!r}"
+
+    content = item.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return f"{where}的 content 为空或不是字符串：{content!r}"
+
+    strength = item.get("strength")
+    if isinstance(strength, bool) or not isinstance(strength, (int, float)):
+        return f"{where}的 strength 不是数字：{strength!r}"
+    if not 0.0 <= float(strength) <= 1.0:
+        return f"{where}的 strength 超出 0–1 范围：{strength!r}"
+
+    if "evidence_count" in item:
+        count = item.get("evidence_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            return f"{where}的 evidence_count 不是非负整数：{count!r}"
+
+    if "evidence_feedback_ids" in item:
+        ids = item.get("evidence_feedback_ids")
+        if not isinstance(ids, list):
+            return f"{where}的 evidence_feedback_ids 不是数组：{ids!r}"
+        if len(ids) > 5:
+            return f"{where}的 evidence_feedback_ids 超过 5 个（真实 Tool 每条最多 5 个）：{len(ids)}"
+        for value in ids:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                return f"{where}的 evidence_feedback_ids 含非法 id：{value!r}"
+
+    # episode 是内部 id，可以是字符串或整数；updated_at 是时间戳，真实归档一律是 ISO 字符串，
+    # 接受整数会让 20261101 这种"看起来像日期"的错值混过去。
+    for field, allowed in (("episode", (str, int)), ("updated_at", (str,))):
+        if field in item:
+            value = item.get(field)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, allowed)):
+                return f"{where}的 {field} 类型非法：{value!r}"
+
+    return None
+
+
 def parse_memory_payload(user_text):
     """从 USER 内容里解析记忆区块的真实记忆列表。
 
     返回 (header_present, payload, error)。payload 是 Prompt 里实际注入的记忆对象列表；
     header_present 为 True 但 payload 为空/解析失败时 error 非空 —— 这正是
     「Prompt 声称有记忆来源，却没有真实记忆内容」的情况。
+
+    每一条记忆都必须逐项合法：只要求"至少一条有效"会让夹带的伪造条目混进证据链。
+    格式问题一律返回 error（由调用方判 FAIL），绝不降级成"记忆为空"后继续 PASS。
     """
 
     if not isinstance(user_text, str) or build_prompts.MEMORY_HEADER not in user_text:
         return False, [], None
+
+    occurrences = user_text.count(build_prompts.MEMORY_HEADER)
+    if occurrences != 1:
+        return True, [], (
+            f"记忆区块头部出现 {occurrences} 次（应为 1 次），存在多份互相冲突的记忆数据"
+        )
 
     header_index = user_text.index(build_prompts.MEMORY_HEADER)
     tail = user_text[header_index + len(build_prompts.MEMORY_HEADER):]
@@ -306,25 +456,27 @@ def parse_memory_payload(user_text):
     if array_index < 0:
         return True, [], "记忆区块后找不到 JSON 数组"
 
+    decoder = json.JSONDecoder()
     try:
-        payload, _ = json.JSONDecoder().raw_decode(tail[array_index:])
+        payload, end = decoder.raw_decode(tail[array_index:])
     except json.JSONDecodeError as error:
         return True, [], f"记忆区块的 JSON 解析失败：{error}"
+
+    remainder = tail[array_index + end:]
+    if remainder.count("[") > 0:
+        return True, [], "记忆区块的 JSON 数组之后还有第二份 JSON 数据，无法判定哪一份才是注入内容"
+    allowed_prefixes = (MEMORY_SUFFIX_MARKER, "answer 与 plan.reason 不得把上面的长期学习记忆")
+    stripped = remainder.strip()
+    if stripped and not stripped.startswith(allowed_prefixes):
+        return True, [], f"记忆区块的 JSON 之后出现无法解释的残留内容：{stripped[:60]!r}"
 
     if not isinstance(payload, list) or not payload:
         return True, [], "记忆区块的 JSON 不是非空数组"
 
-    contents = [
-        str(item.get("content") or "").strip()
-        for item in payload
-        if isinstance(item, dict)
-    ]
-
-    if len(contents) != len(payload):
-        return True, [], "记忆区块里有非对象条目"
-
-    if not any(contents):
-        return True, [], "记忆区块里所有记忆的 content 都是空的"
+    for index, item in enumerate(payload, start=1):
+        problem = _validate_memory_item(index, item)
+        if problem:
+            return True, [], problem
 
     return True, payload, None
 
@@ -846,9 +998,32 @@ def collect_scope(scope, run_names, runs_dir, apis, config, sample_cache, checke
 
     hashes = manifest_hashes()
 
+    # 第一遍：读行 + 核对 manifest。任何一条 run 的 manifest 不可信就整批终止，
+    # 绝不"先把指标算出来再说" —— 不可信的源文件不配得到 PASS 结论。
+    prepared = []
+    untrusted = []
     for run_name in run_names:
         run_dir = Path(runs_dir) / run_name
         rows, problems = read_rows(run_dir)
+        status, detail = verify_manifest(run_name, run_dir, hashes, len(rows))
+        sources.append({
+            "run": run_name,
+            "rows": len(rows),
+            "manifest": f"{status}（{detail}）",
+            "sha256": sha256_file(Path(run_dir) / RESULTS_NAME),
+        })
+        if status not in ("match", "legacy_no_manifest"):
+            untrusted.append(f"{run_name}: {status}（{detail}）")
+        prepared.append((run_name, run_dir, rows, problems))
+
+    if untrusted:
+        raise CheckError(
+            "manifest 校验未通过，已在计算指标前终止（fail-closed，--strict 与否都一样）："
+            + "；".join(untrusted)
+        )
+
+    # 第二遍：manifest 与源文件可信之后才计算指标与 grounding
+    for run_name, run_dir, rows, problems in prepared:
         for number, field, detail in problems:
             failures.append({
                 "scope": scope,
@@ -861,14 +1036,6 @@ def collect_scope(scope, run_names, runs_dir, apis, config, sample_cache, checke
                 "metric": "schema",
                 "detail": f"{field}: {detail}",
             })
-
-        status, detail = verify_manifest(run_name, run_dir, hashes, len(rows))
-        sources.append({
-            "run": run_name,
-            "rows": len(rows),
-            "manifest": f"{status}（{detail}）",
-            "sha256": sha256_file(Path(run_dir) / RESULTS_NAME),
-        })
 
         for number, row in rows:
             analysis, row_failures = analyze_row(

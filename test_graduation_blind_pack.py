@@ -397,7 +397,9 @@ def test_t5_private_gate_real_git():
     with _patched_paths(sb):
         evidence = pack.ensure_private_gate(sb.private_dir)
     assert len(evidence) >= 5, evidence
-    assert sum(".gitignore" in line for line in evidence) == len(pack.PRIVATE_FILES), evidence
+    # 证据里含 .gitignore 的行 = 1 条「目录级规则」锚点 + 每条探针各一行；
+    # 探针覆盖三个私有文件，也覆盖此刻不存在的未来文件名与 archive/ 深层路径。
+    assert sum(".gitignore" in line for line in evidence) == 1 + len(pack.PRIVATE_IGNORE_PROBES), evidence
     assert "git ls-files" in evidence[-1] and "0 条" in evidence[-1], evidence
 
     # 真实 git 复核（不是 mock）：三个私有文件都被忽略，且目录内没有被跟踪的文件
@@ -408,11 +410,13 @@ def test_t5_private_gate_real_git():
     assert tracked.stdout.strip() == "", tracked.stdout
 
     # 缺忽略规则 → 真实 check-ignore 返回非 0 → 拒绝
+    # （此处 .gitignore 只忽略 blind_pack/，私有目录完全没被覆盖，
+    #   因此先触发第 1 步的「目录级规则」判定；只点名若干文件的场景由 T21 覆盖）
     (sb.root / ".gitignore").write_text("experiments/graduation/blind_pack/\n", encoding="utf-8")
     missing = _git(["check-ignore", "-v", str(sb.private_dir / "mapping.csv")], sb.root)
     assert missing.returncode != 0, "缺少忽略规则时 git check-ignore 应为非 0"
     with _patched_paths(sb):
-        _expect_pack_error(lambda: pack.ensure_private_gate(sb.private_dir), "未被 .gitignore 覆盖")
+        _expect_pack_error(lambda: pack.ensure_private_gate(sb.private_dir), "目录级 .gitignore 规则")
 
     # 已被跟踪的敏感文件：即使被忽略也必须拒绝（不能把“被忽略”当成“安全”）
     (sb.root / ".gitignore").write_text("experiments/graduation/blind_private/\n", encoding="utf-8")
@@ -916,6 +920,270 @@ def test_t20_real_data_untouched():
     print("  T20 PASS：正式 runs/feedback.db 指纹未变，正式仓库无盲评产物")
 
 
+# --------------------------------------------------------------------------
+# T21–T27 第二轮修复：私有目录硬门 / manifest 空字段 / 归档完整性
+# --------------------------------------------------------------------------
+
+
+def _git_add_all(root: Path) -> None:
+    added = _git(["add", "-f", "-A"], root)
+    assert added.returncode == 0, added.stderr
+
+
+def test_t21_private_gate_real_git():
+    """私有目录硬门必须靠真实 git 证明，任一环节不满足就拒绝写入。"""
+
+    # 1) 正常：目录级规则 → 通过，且证据里有目录级规则与 ls-files 结果
+    sb = _make_sandbox("t21-ok")
+    sb.private_dir.mkdir(parents=True, exist_ok=True)
+    evidence = pack.ensure_private_gate(sb.private_dir, repo_root=sb.root)
+    joined = "\n".join(evidence)
+    assert "目录级忽略规则" in joined, joined
+    assert "git ls-files 无私有文件" in joined, joined
+
+    # 2) 只点名若干文件名（没有整目录规则）→ 拒绝
+    sb2 = _make_sandbox("t21-nameonly", ignore_private=False)
+    (sb2.root / ".gitignore").write_text(
+        "mapping.csv\nselection_audit.csv\nMAPPING-AUDIT.md\n", encoding="utf-8", newline="\n"
+    )
+    sb2.private_dir.mkdir(parents=True, exist_ok=True)
+    _expect_pack_error(
+        lambda: pack.ensure_private_gate(sb2.private_dir, repo_root=sb2.root),
+        "目录级 .gitignore 规则",
+    )
+
+    # 3) 私有目录里有被跟踪文件 → 拒绝（.gitignore 生效前 add 过的那种）
+    sb3 = _make_sandbox("t21-tracked")
+    sb3.private_dir.mkdir(parents=True, exist_ok=True)
+    (sb3.private_dir / "mapping.csv").write_text("blind_id\n", encoding="utf-8", newline="\n")
+    _git_add_all(sb3.root)
+    _expect_pack_error(
+        lambda: pack.ensure_private_gate(sb3.private_dir, repo_root=sb3.root),
+        "已被 Git 跟踪",
+    )
+
+    # 4) 私有目录在仓库外 → 拒绝（不存在绕过开关）
+    sb4 = _make_sandbox("t21-outside")
+    outside = TMP_ROOT / "t21-outside-elsewhere"
+    outside.mkdir(parents=True, exist_ok=True)
+    _expect_pack_error(
+        lambda: pack.ensure_private_gate(outside, repo_root=sb4.root),
+        "不在仓库",
+    )
+
+    # 5) 根本不是 Git 仓库 → 拒绝，且错误里带 git 的真实输出
+    sb5 = _make_sandbox("t21-nogit", git=False)
+    sb5.private_dir.mkdir(parents=True, exist_ok=True)
+    _expect_pack_error(
+        lambda: pack.ensure_private_gate(sb5.private_dir, repo_root=sb5.root),
+        "git rev-parse 失败",
+    )
+
+    # 6) .gitignore 整个缺失 → 拒绝
+    sb6 = _make_sandbox("t21-noignore", ignore_private=False)
+    sb6.private_dir.mkdir(parents=True, exist_ok=True)
+    _expect_pack_error(
+        lambda: pack.ensure_private_gate(sb6.private_dir, repo_root=sb6.root),
+        "无法证明私有目录被忽略",
+    )
+    print("  T21 PASS：目录级规则/跟踪文件/仓库外/非 Git/缺 .gitignore 全部拒绝")
+
+
+def test_t22_manifest_empty_fields_fail():
+    """manifest 字段为空不是「没写就先放过」：空值与非法值都必须在算指标前失败。"""
+
+    cases = [
+        ("t22-sha-empty", "sha256", "", "sha256_empty"),
+        ("t22-sha-invalid", "sha256", "z" * 64, "sha256_invalid"),
+        ("t22-size-empty", "size_bytes", "", "size_bytes_empty"),
+        ("t22-size-invalid", "size_bytes", "-1", "size_bytes_invalid"),
+        ("t22-records-empty", "records", "", "records_empty"),
+        ("t22-records-invalid", "records", "abc", "records_invalid"),
+    ]
+    for name, field, value, fragment in cases:
+        sb = _make_sandbox(name)
+        _write_manifest(
+            sb,
+            _manifest_with(sb, lambda rows, f=field, v=value: _row_for(rows, pack.MAIN_RUN).update({f: v})),
+        )
+        code, out, err = _main(sb)
+        assert code == 2, (name, code, out, err)
+        assert "与 manifest 不一致" in err, (name, err)
+        assert fragment in err, (name, fragment, err)
+        # 失败必须发生在写产物之前
+        assert not sb.pack_dir.exists(), name
+        assert not (sb.private_dir / "mapping.csv").exists(), name
+    print("  T22 PASS：sha256/size_bytes/records 的空值与非法值一律 fail-closed")
+
+
+def test_t23_manifest_duplicate_entries():
+    sb = _make_sandbox("t23")
+    rows = _manifest_rows(sb)
+    rows.append(dict(_row_for(rows, pack.MAIN_RUN)))
+    _write_manifest(sb, rows)
+    _expect_pack_error(lambda: pack.manifest_hashes(sb.manifest), "重复条目")
+    code, _, err = _main(sb)
+    assert code == 2 and "重复条目" in err, (code, err)
+    assert not sb.pack_dir.exists()
+    print("  T23 PASS：manifest 同一文件重复条目 → 拒绝，不静默覆盖")
+
+
+def _build_and_snapshot(sb: Sandbox, stamp: str):
+    with _clock(stamp):
+        _build(sb)
+    mapping = (sb.private_dir / "mapping.csv").read_bytes()
+    files = sorted(
+        path.relative_to(sb.pack_dir).as_posix()
+        for path in sb.pack_dir.rglob("*")
+        if path.is_file()
+    )
+    assert len(files) == 113 + 2 * 3, len(files)
+    return mapping, files
+
+
+def test_t24_archive_verifies_copied_bytes():
+    """复制后的归档文件必须与源文件逐条 SHA256 一致，否则拒绝发布并保留旧数据。"""
+
+    sb = _make_sandbox("t24")
+    mapping_before, files_before = _build_and_snapshot(sb, "2026-11-16T14:00:00Z")
+
+    real_copy2 = shutil.copy2
+
+    def corrupting_copy(src, dst, *args, **kwargs):
+        result = real_copy2(src, dst, *args, **kwargs)
+        if str(src).endswith("selection_audit.csv"):
+            with open(dst, "ab") as handle:
+                handle.write(b"\n")  # 模拟复制过程把内容写坏
+        return result
+
+    pack.shutil.copy2 = corrupting_copy
+    try:
+        with _patched_paths(sb), _clock("2026-11-16T14:00:01Z"):
+            _expect_pack_error(
+                lambda: pack.run_pack(_args(sb, ["--repack"])),
+                "步骤 4/归档文件 SHA256 与清单不一致",
+            )
+    finally:
+        pack.shutil.copy2 = real_copy2
+
+    archive = sb.private_dir / "archive"
+    assert (sb.private_dir / "mapping.csv").read_bytes() == mapping_before
+    files_after = sorted(
+        path.relative_to(sb.pack_dir).as_posix()
+        for path in sb.pack_dir.rglob("*")
+        if path.is_file()
+    )
+    assert files_after == files_before
+    assert not list(archive.glob("pack-*")), "失败的归档不得占住归档名"
+    assert not list(archive.glob(".*staging")), "失败的 staging 必须清理干净"
+    print("  T24 PASS：复制内容被改坏 → 步骤 4 拒绝发布，旧映射与活动包原样保留")
+
+
+def test_t25_archive_copy_failure_keeps_old():
+    sb = _make_sandbox("t25")
+    mapping_before, files_before = _build_and_snapshot(sb, "2026-11-16T15:00:00Z")
+
+    real_copy2 = shutil.copy2
+    calls = {"n": 0}
+
+    def failing_copy(src, dst, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("模拟磁盘写满")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    pack.shutil.copy2 = failing_copy
+    try:
+        with _patched_paths(sb), _clock("2026-11-16T15:00:01Z"):
+            _expect_pack_error(
+                lambda: pack.run_pack(_args(sb, ["--repack"])),
+                "步骤 3/复制旧产物到 staging 失败",
+            )
+    finally:
+        pack.shutil.copy2 = real_copy2
+
+    archive = sb.private_dir / "archive"
+    assert (sb.private_dir / "mapping.csv").read_bytes() == mapping_before
+    assert sorted(
+        path.relative_to(sb.pack_dir).as_posix() for path in sb.pack_dir.rglob("*") if path.is_file()
+    ) == files_before
+    assert not list(archive.glob(".*staging")), "OSError 路径必须清掉 staging"
+    print("  T25 PASS：复制中途 OSError → 步骤 3 失败、staging 清理、旧数据不动")
+
+
+def test_t26_repack_refuses_incomplete_old_output():
+    """旧产物不完整时必须拒绝重打包，不能把不完整的旧东西静默归档。"""
+
+    # 1) 旧 mapping 被删 → 步骤 1 拒绝
+    sb = _make_sandbox("t26-nomapping")
+    _build_and_snapshot(sb, "2026-11-16T16:00:00Z")
+    (sb.private_dir / "mapping.csv").unlink()
+    with _patched_paths(sb), _clock("2026-11-16T16:00:01Z"):
+        _expect_pack_error(
+            lambda: pack.run_pack(_args(sb, ["--repack"])),
+            "步骤 1/旧私有文件缺失",
+        )
+    assert not list((sb.private_dir / "archive").glob("pack-*"))
+
+    # 2) 旧盲审包被删（只剩私有文件）→ 步骤 1 拒绝
+    sb2 = _make_sandbox("t26-nopack")
+    mapping_before, _ = _build_and_snapshot(sb2, "2026-11-16T17:00:00Z")
+    _force_rmtree(sb2.pack_dir)
+    with _patched_paths(sb2), _clock("2026-11-16T17:00:01Z"):
+        _expect_pack_error(
+            lambda: pack.run_pack(_args(sb2, ["--repack"])),
+            "步骤 1/旧盲审包不存在",
+        )
+    assert (sb2.private_dir / "mapping.csv").read_bytes() == mapping_before
+    assert not list((sb2.private_dir / "archive").glob("pack-*"))
+
+    # 3) 旧包缺一个材料文件 → 步骤 1 拒绝
+    sb3 = _make_sandbox("t26-shortpack")
+    _build_and_snapshot(sb3, "2026-11-16T18:00:00Z")
+    victim = sorted((sb3.pack_dir / "formal").glob("*.md"))[0]
+    victim.unlink()
+    with _patched_paths(sb3), _clock("2026-11-16T18:00:01Z"):
+        _expect_pack_error(
+            lambda: pack.run_pack(_args(sb3, ["--repack"])),
+            "步骤 1/",
+        )
+    assert not list((sb3.private_dir / "archive").glob("pack-*"))
+    print("  T26 PASS：旧 mapping/旧包/旧材料任一缺失都拒绝重打包，归档目录保持干净")
+
+
+def test_t27_publish_failure_keeps_active_pack():
+    """发布后复核失败时，归档目录与活动包都必须保留，不能删了旧包又没有可用的归档。"""
+
+    sb = _make_sandbox("t27")
+    _build_and_snapshot(sb, "2026-11-16T19:00:00Z")
+
+    real_verify = pack._verify_archive_tree
+    seen = {"n": 0}
+
+    def flaky_verify(root, step="归档复核"):
+        seen["n"] += 1
+        if seen["n"] == 2:  # 第二次调用是步骤 6 的发布后复核
+            raise pack.PackError("步骤 6/发布后复核/归档文件与清单不一致：缺少 ['private/x']")
+        return real_verify(root, step)
+
+    pack._verify_archive_tree = flaky_verify
+    try:
+        with _patched_paths(sb), _clock("2026-11-16T19:00:01Z"):
+            _expect_pack_error(
+                lambda: pack.run_pack(_args(sb, ["--repack"])),
+                "活动包未被清理",
+            )
+    finally:
+        pack._verify_archive_tree = real_verify
+
+    assert seen["n"] >= 2, seen
+    assert sb.pack_dir.is_dir(), "活动包不能被清掉"
+    assert len(list(sb.pack_dir.glob("formal/*.md"))) >= 1
+    archived = [path for path in (sb.private_dir / "archive").glob("pack-*") if path.is_dir()]
+    assert archived, "已发布的归档目录必须保留"
+    print("  T27 PASS：发布后复核失败 → 归档与活动包都保留，并提示人工核对")
+
+
 TESTS = [
     ("T1", test_t1_private_outside_repo),
     ("T2", test_t2_pack_equals_private),
@@ -937,6 +1205,13 @@ TESTS = [
     ("T18", test_t18_rater_orders_guaranteed_different),
     ("T19", test_t19_config_frozen),
     ("T20", test_t20_real_data_untouched),
+    ("T21", test_t21_private_gate_real_git),
+    ("T22", test_t22_manifest_empty_fields_fail),
+    ("T23", test_t23_manifest_duplicate_entries),
+    ("T24", test_t24_archive_verifies_copied_bytes),
+    ("T25", test_t25_archive_copy_failure_keeps_old),
+    ("T26", test_t26_repack_refuses_incomplete_old_output),
+    ("T27", test_t27_publish_failure_keeps_active_pack),
 ]
 
 

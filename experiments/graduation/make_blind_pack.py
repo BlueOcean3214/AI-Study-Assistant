@@ -128,6 +128,12 @@ AUDIT_COLUMNS = [
     "selection_hash",
 ]
 PRIVATE_FILES = ["mapping.csv", "selection_audit.csv", "MAPPING-AUDIT.md"]
+PHASE_COUNTS = {PHASE_FORMAL: 84, PHASE_CALIBRATION: 6, PHASE_SUPPLEMENTARY: 23}
+TOTAL_BLIND_IDS = sum(PHASE_COUNTS.values())
+ORDER_COLUMNS = ["position", "blind_id"]
+ORDER_FILES = ("order_rater_a.csv", "order_rater_b.csv")
+ARCHIVE_MANIFEST_NAME = "ARCHIVE-MANIFEST.md"
+BLIND_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class PackError(RuntimeError):
@@ -651,6 +657,32 @@ def _git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     )
 
 
+# 私有目录的忽略保护必须覆盖「整个目录」，而不是只覆盖当下写到的几个文件名：
+# 将来新增的归档、清单、临时子目录一旦落在这个目录里，同样不能被提交。
+# 这些探针路径（相对 private_dir，多数文件此刻并不存在）就是用来证明
+# 「目录级规则生效」而不是「恰好三个文件名被点名忽略」。
+PRIVATE_IGNORE_PROBES = (
+    "mapping.csv",
+    "selection_audit.csv",
+    "MAPPING-AUDIT.md",
+    "archive/ARCHIVE-MANIFEST.md",
+    "archive/pack-test/private/mapping.csv",
+    "archive/pack-test/blind_pack/formal/example.md",
+    ".staging-test/ARCHIVE-MANIFEST.md",
+    # 未来才会出现的文件名：只有目录级规则能覆盖它
+    ".gate-probe/未来新文件.md",
+)
+
+
+def _check_ignore(repo_root: Path, target: Path) -> subprocess.CompletedProcess:
+    """git check-ignore -v --no-index；老版本 git 不认 --no-index 时退回普通调用。"""
+
+    result = _git(["check-ignore", "-v", "--no-index", str(target)], repo_root)
+    if result.returncode != 0 and "unknown option" in result.stderr:
+        result = _git(["check-ignore", "-v", str(target)], repo_root)
+    return result
+
+
 def ensure_private_gate(private_dir: Path, repo_root: Path | None = None) -> list[str]:
     """返回证据行；失败抛 PackError（绝不创建/写入私有文件）。
 
@@ -680,23 +712,42 @@ def ensure_private_gate(private_dir: Path, repo_root: Path | None = None) -> lis
     if not ignore_file.is_file():
         raise PackError(f"仓库缺少 .gitignore（{ignore_file}），无法证明私有目录被忽略")
 
-    for name in PRIVATE_FILES:
+    # 1) 目录本身必须被一条「目录规则」（以 / 结尾）忽略：这才是覆盖未来文件的前提。
+    #    探针用一个此刻不存在的深层文件名，命中的规则就应该是那条目录规则。
+    future_probe = resolved / PRIVATE_IGNORE_PROBES[-1]
+    future_result = _check_ignore(repo_root, future_probe)
+    # git check-ignore -v 的一行是「来源:行号:规则<TAB>路径」；
+    # 规则必须从第一列取，第二列是路径（本任务里恰好也是不以 / 结尾的文件名）。
+    future_pattern = ""
+    if future_result.returncode == 0 and future_result.stdout.strip():
+        source_line = future_result.stdout.strip().split("\t", 1)[0]
+        parts = source_line.split(":", 2)
+        if len(parts) == 3:
+            future_pattern = parts[2]
+    if not future_pattern.endswith("/"):
+        raise PackError(
+            "私有目录没有被目录级 .gitignore 规则覆盖（只忽略了若干固定文件名不够），拒绝写入。"
+            "请把 experiments/graduation/blind_private/ 整目录加入 .gitignore 并验证 "
+            f"git check-ignore -v {future_probe}\n"
+            f"git 退出码={future_result.returncode} 输出={future_result.stdout.strip()!r} "
+            f"stderr={future_result.stderr.strip()!r}"
+        )
+    evidence.append(f"[gate] 目录级忽略规则：{future_result.stdout.strip()}")
+
+    # 2) 代表性路径（含 archive/ 深层文件与此刻不存在的未来文件名）必须逐条被忽略。
+    for name in PRIVATE_IGNORE_PROBES:
         target = resolved / name
-        # --no-index 让「已被跟踪」的文件也照常报出忽略规则：Git 默认对已跟踪路径
-        # 返回 1，会把「已跟踪」误报成「未被忽略」，掩盖真正需要清理的危险状态。
-        result = _git(["check-ignore", "-v", "--no-index", str(target)], repo_root)
-        if result.returncode != 0 and "unknown option" in result.stderr:
-            result = _git(["check-ignore", "-v", str(target)], repo_root)
+        result = _check_ignore(repo_root, target)
         if result.returncode != 0 or ".gitignore" not in result.stdout:
             raise PackError(
-                "私有目录未被 .gitignore 覆盖，拒绝写入。请先在 .gitignore 添加 "
-                "experiments/graduation/blind_private/ 并验证 "
-                f"git check-ignore -v {target}\n"
+                "私有目录内的路径未被 .gitignore 覆盖，拒绝写入（忽略规则必须覆盖整个目录，"
+                f"不能只点名若干文件）：{name}\n"
                 f"git 退出码={result.returncode} 输出={result.stdout.strip()!r} "
                 f"stderr={result.stderr.strip()!r}"
             )
         evidence.append(result.stdout.strip())
 
+    # 3) 目录里不能藏着已被跟踪的文件（在 .gitignore 生效前就被 add 过的那些）
     tracked = _git(["ls-files", "--", str(resolved)], repo_root)
     if tracked.returncode != 0:
         raise PackError(f"git ls-files 失败：{tracked.stderr.strip()}")
@@ -757,16 +808,48 @@ def write_csv_atomic(path: Path, columns: list[str], rows: list[dict]) -> None:
     os.replace(tmp, path)
 
 
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
 def manifest_hashes(path: Path | None = None) -> dict[tuple[str, str], dict]:
+    """读取执行报告附录 A 的清单。
+
+    同一个 relative_path 出现两条记录时直接报错：字典会把前一条悄悄覆盖掉，
+    「后一条刚好合法」就能掩盖「清单被改过」这件事。
+    """
+
     path = Path(path) if path else MANIFEST_PATH
     table: dict[tuple[str, str], dict] = {}
     if not path.is_file():
         return table
+    seen: set[str] = set()
     with path.open("r", encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
             relative = (row.get("relative_path") or "").replace("\\", "/").strip("/")
+            if not relative:
+                continue
+            if relative in seen:
+                raise PackError(
+                    f"manifest 中 {relative} 出现重复条目，拒绝静默覆盖："
+                    "请先确认哪一条才是被冻结的版本"
+                )
+            seen.add(relative)
             table[(relative, (row.get("file") or "").strip())] = row
     return table
+
+
+def _manifest_int(entry: dict, field: str, allow_zero: bool) -> tuple[int | None, str]:
+    """取清单里的整数列，返回 (值, 错误描述)。空、非数字、越界都算错误。"""
+
+    text = str(entry.get(field) or "").strip()
+    if not text:
+        return None, f"{field} 为空"
+    if not text.isdigit():
+        return None, f"{field} 不是合法非负整数：{text!r}"
+    value = int(text)
+    if value == 0 and not allow_zero:
+        return None, f"{field} 必须为正整数：{text!r}"
+    return value, ""
 
 
 # B0 是基线提交之前的 legacy 结果，manifest 允许没有条目；主实验与新补充批次不允许缺。
@@ -840,14 +923,29 @@ def verify_snapshot(snapshot: dict[str, dict], manifest: dict) -> list[dict]:
             continue
         row["expected"] = (entry.get("sha256") or "").strip().lower()
         problems = []
-        if row["expected"] != actual["sha256"]:
+        # 有清单条目就必须逐字段完整核对：空字段不是「没写就先放过」，
+        # 而是「无法证明源文件没被改过」，一样要停下来。
+        if not row["expected"]:
+            problems.append("sha256_empty")
+        elif not SHA256_HEX.match(row["expected"]):
+            problems.append("sha256_invalid")
+        elif row["expected"] != actual["sha256"]:
             problems.append("sha256")
+
+        expected_size, error = _manifest_int(entry, "size_bytes", allow_zero=True)
         row["expected_size_bytes"] = (entry.get("size_bytes") or "").strip()
-        if row["expected_size_bytes"] and row["expected_size_bytes"] != str(actual["size_bytes"]):
+        if error:
+            problems.append("size_bytes_" + ("empty" if not row["expected_size_bytes"] else "invalid"))
+        elif expected_size != actual["size_bytes"]:
             problems.append("size_bytes")
+
+        expected_records, error = _manifest_int(entry, "records", allow_zero=False)
         row["expected_records"] = (entry.get("records") or "").strip()
-        if row["expected_records"] and row["expected_records"] != str(actual["records"]):
+        if error:
+            problems.append("records_" + ("empty" if not row["expected_records"] else "invalid"))
+        elif expected_records != actual["records"]:
             problems.append("records")
+
         row["status"] = "match" if not problems else "mismatch:" + ",".join(problems)
         report.append(row)
 
@@ -1085,6 +1183,226 @@ def render_audit(
     return "\n".join(lines)
 
 
+def _read_csv_table(path: Path, columns: list[str], what: str) -> list[dict]:
+    """按既定列读一张旧 CSV；缺失、空表、表头不符都直接拒绝。"""
+
+    if not path.is_file():
+        raise PackError(f"步骤 1/缺少{what}：{path}")
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        header = [(name or "").strip() for name in (reader.fieldnames or [])]
+        if header != columns:
+            raise PackError(
+                f"步骤 1/{what}表头不符：期望 {columns}，实际 {header}"
+            )
+        rows = [dict(row) for row in reader]
+    if not rows:
+        raise PackError(f"步骤 1/{what}没有任何记录：{path}")
+    return rows
+
+
+def _require_count(actual: int, expected: int, what: str) -> None:
+    if actual != expected:
+        raise PackError(f"步骤 1/{what}数量应为 {expected}，实际 {actual}")
+
+
+def verify_previous_outputs(pack_dir: Path, private_dir: Path) -> dict:
+    """重打包前置检查：旧私有文件与旧盲审包必须成套、结构符合协议、数量可核对。
+
+    任何一项不满足都在创建 staging / 移动文件之前抛 PackError；这里只读，不改动旧数据。
+    """
+
+    pack_dir = Path(pack_dir)
+    private_dir = Path(private_dir)
+    if not pack_dir.is_dir():
+        raise PackError(f"步骤 1/旧盲审包不存在，没有可归档的版本：{pack_dir}")
+
+    for name in PRIVATE_FILES:
+        path = private_dir / name
+        if not path.is_file():
+            raise PackError(f"步骤 1/旧私有文件缺失：{path}")
+        if path.stat().st_size == 0:
+            raise PackError(f"步骤 1/旧私有文件为空：{path}")
+
+    # ---- 旧 mapping.csv：113 个唯一 blind_id，phase 计数 84/6/23 ----
+    mapping_rows = _read_csv_table(
+        private_dir / "mapping.csv", MAPPING_COLUMNS, "旧 mapping.csv"
+    )
+    _require_count(len(mapping_rows), TOTAL_BLIND_IDS, "旧 mapping.csv 行")
+    phase_ids: dict[str, set[str]] = {phase: set() for phase in PHASE_COUNTS}
+    seen_ids: set[str] = set()
+    for line_no, row in enumerate(mapping_rows, start=2):
+        blind_id = (row.get("blind_id") or "").strip()
+        phase = (row.get("phase") or "").strip()
+        if not BLIND_ID_RE.match(blind_id):
+            raise PackError(
+                f"步骤 1/旧 mapping.csv 第 {line_no} 行 blind_id 非法：{blind_id!r}"
+            )
+        if blind_id in seen_ids:
+            raise PackError(
+                f"步骤 1/旧 mapping.csv 第 {line_no} 行 blind_id 重复：{blind_id}"
+            )
+        seen_ids.add(blind_id)
+        if phase not in phase_ids:
+            raise PackError(
+                f"步骤 1/旧 mapping.csv 第 {line_no} 行 phase 非法：{phase!r}"
+            )
+        phase_ids[phase].add(blind_id)
+    for phase, expected in PHASE_COUNTS.items():
+        _require_count(len(phase_ids[phase]), expected, f"旧 mapping.csv 的 {phase}")
+
+    # ---- 旧 selection_audit.csv：只含正式 84，键唯一 ----
+    audit_rows = _read_csv_table(
+        private_dir / "selection_audit.csv", AUDIT_COLUMNS, "旧 selection_audit.csv"
+    )
+    _require_count(len(audit_rows), PHASE_COUNTS[PHASE_FORMAL], "旧 selection_audit.csv 行")
+    audit_keys = {
+        (
+            (row.get("sample_id") or "").strip(),
+            (row.get("group") or "").strip(),
+            (row.get("repeat_index") or "").strip(),
+        )
+        for row in audit_rows
+    }
+    if len(audit_keys) != len(audit_rows):
+        raise PackError("步骤 1/旧 selection_audit.csv 存在重复的 (sample_id, group, repeat_index)")
+
+    # ---- 旧盲审包：三个 phase 目录、材料数、评分者顺序文件齐全且与 mapping 对齐 ----
+    top_entries = sorted(entry.name for entry in pack_dir.iterdir())
+    unexpected_top = sorted(set(top_entries) - set(PHASE_COUNTS))
+    if unexpected_top:
+        raise PackError(
+            f"步骤 1/旧盲审包存在协议外条目：{unexpected_top}；"
+            "无法确认它们该不该归档，拒绝继续"
+        )
+    packed_ids: set[str] = set()
+    phase_summary: dict[str, dict] = {}
+    for phase, expected in PHASE_COUNTS.items():
+        phase_dir = pack_dir / phase
+        if not phase_dir.is_dir():
+            raise PackError(f"步骤 1/旧盲审包缺少 phase 目录：{phase_dir}")
+        files = {entry.name: entry for entry in phase_dir.iterdir()}
+        if any(entry.is_dir() for entry in files.values()):
+            raise PackError(f"步骤 1/旧盲审包 {phase} 目录不应包含子目录：{phase_dir}")
+        markdown = {name for name in files if name.endswith(".md")}
+        _require_count(len(markdown), expected, f"旧盲审包 {phase} 的 .md 材料")
+        unexpected = sorted(set(files) - markdown - set(ORDER_FILES))
+        if unexpected:
+            raise PackError(
+                f"步骤 1/旧盲审包 {phase} 存在协议外文件：{unexpected}"
+            )
+        expected_ids = phase_ids[phase]
+        if markdown != {f"{blind_id}.md" for blind_id in expected_ids}:
+            missing = sorted(expected_ids - {name[: -len('.md')] for name in markdown})
+            extra = sorted({name[: -len('.md')] for name in markdown} - expected_ids)[:5]
+            raise PackError(
+                f"步骤 1/旧盲审包 {phase} 材料与旧 mapping.csv 不一致："
+                f"缺少 {missing[:5]}；多出 {extra}"
+            )
+        if packed_ids & expected_ids:
+            raise PackError(f"步骤 1/旧盲审包 {phase} 与其它 phase 的 blind_id 有交集")
+        packed_ids |= expected_ids
+
+        for order_name in ORDER_FILES:
+            order_path = files.get(order_name)
+            if order_path is None or not order_path.is_file():
+                raise PackError(f"步骤 1/旧盲审包 {phase} 缺少评分者顺序文件：{order_name}")
+            order_rows = _read_csv_table(
+                order_path, ORDER_COLUMNS, f"旧盲审包 {phase}/{order_name}"
+            )
+            _require_count(len(order_rows), expected, f"旧盲审包 {phase}/{order_name} 行")
+            positions = []
+            order_ids = []
+            for line_no, row in enumerate(order_rows, start=2):
+                text = (row.get("position") or "").strip()
+                if not text.isdigit():
+                    raise PackError(
+                        f"步骤 1/旧盲审包 {phase}/{order_name} 第 {line_no} 行 position 非法：{text!r}"
+                    )
+                positions.append(int(text))
+                order_ids.append((row.get("blind_id") or "").strip())
+            if sorted(positions) != list(range(1, expected + 1)):
+                raise PackError(
+                    f"步骤 1/旧盲审包 {phase}/{order_name} 的 position 必须是 1..{expected}"
+                )
+            if len(set(order_ids)) != expected or set(order_ids) != expected_ids:
+                raise PackError(
+                    f"步骤 1/旧盲审包 {phase}/{order_name} 的 blind_id 与本 phase 材料不一一对应"
+                )
+
+        phase_summary[phase] = {"materials": len(markdown), "orders": len(ORDER_FILES)}
+
+    if packed_ids != seen_ids:
+        raise PackError("步骤 1/旧盲审包材料集合与旧 mapping.csv 的 blind_id 集合不一致")
+
+    return {
+        "mapping_rows": len(mapping_rows),
+        "selection_audit_rows": len(audit_rows),
+        "blind_ids": len(seen_ids),
+        "phases": phase_summary,
+        "expected_files": len(PRIVATE_FILES) + TOTAL_BLIND_IDS + len(ORDER_FILES) * len(PHASE_COUNTS),
+    }
+
+
+def _archive_manifest_entries(path: Path) -> list[tuple[str, str]]:
+    """读回 ARCHIVE-MANIFEST.md 的表格，返回 (相对路径, SHA256) 列表。"""
+
+    if not path.is_file():
+        raise PackError(f"缺少归档清单：{path}")
+    entries: list[tuple[str, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text.startswith("|"):
+            continue
+        if set(text) <= set("|-: "):
+            continue
+        cells = [cell.strip() for cell in text.strip("|").split("|")]
+        if len(cells) != 2 or cells[0] == "归档路径":
+            continue
+        relative, digest = cells[0], cells[1].lower()
+        if not relative or not SHA256_HEX.match(digest):
+            raise PackError(f"归档清单记录非法：{line!r}")
+        entries.append((relative, digest))
+    return entries
+
+
+def _actual_files(root: Path) -> dict[str, str]:
+    return {
+        path.relative_to(root).as_posix(): sha256_file(path)
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _verify_entries_against(root: Path, entries: list[tuple[str, str]], step: str) -> None:
+    """核对目录里实际的文件集合与每个文件的 SHA256 是否与清单条目一致。"""
+
+    recorded: dict[str, str] = {}
+    for relative, digest in entries:
+        if relative in recorded:
+            raise PackError(f"{step}/归档清单存在重复路径：{relative}")
+        recorded[relative] = digest
+    actual = _actual_files(root)
+    actual.pop(ARCHIVE_MANIFEST_NAME, None)
+    missing = sorted(set(recorded) - set(actual))
+    extra = sorted(set(actual) - set(recorded))
+    if missing or extra:
+        raise PackError(f"{step}/归档文件与清单不一致：缺少 {missing[:5]}；多出 {extra[:5]}")
+    bad = sorted(relative for relative, digest in recorded.items() if actual[relative] != digest)
+    if bad:
+        raise PackError(f"{step}/归档文件 SHA256 与清单不一致：{bad[:5]}")
+
+
+def _verify_archive_tree(root: Path, step: str = "归档复核") -> int:
+    """核对归档目录：清单条数、路径集合与每个文件的 SHA256 都必须与磁盘一致。"""
+
+    entries = _archive_manifest_entries(root / ARCHIVE_MANIFEST_NAME)
+    if not entries:
+        raise PackError(f"{step}/归档清单没有任何条目：{root / ARCHIVE_MANIFEST_NAME}")
+    _verify_entries_against(root, entries, step)
+    return len(entries)
+
+
 def archive_previous_outputs(
     pack_dir: Path, private_dir: Path, generated_utc: str
 ) -> tuple[str, str, int]:
@@ -1092,22 +1410,22 @@ def archive_previous_outputs(
 
     旧材料（含旧 blind_id）必须成套留档，之后再清空活动包目录，避免新旧 blind_id 混在
     同一个可分发目录里。归档目录带逐文件 SHA256 清单，不能静默覆盖。
+    旧产物先整体校验，再复制到 staging 并逐文件重算 SHA256，清单复核通过才发布；
+    只有确认归档完整之后才清理旧活动包。
     """
 
     pack_dir = Path(pack_dir)
     private_dir = Path(private_dir)
+    # 步骤 1：先校验旧产物完整性；这里只读，任何失败都不会移动或删除任何旧文件
+    evidence = verify_previous_outputs(pack_dir, private_dir)
     old_mapping = private_dir / "mapping.csv"
-    if not old_mapping.is_file():
-        raise PackError(
-            f"--repack 需要已存在的 {old_mapping}；没有旧映射就没有可归档的版本关系"
-        )
 
     stamp = generated_utc.replace(":", "").replace("-", "")
     archive_root = private_dir / "archive"
     target = archive_root / f"pack-{stamp}"
     if target.exists():
-        raise PackError(f"归档目标已存在，拒绝覆盖：{target}")
-    # 先写到 staging，全部复制成功后再原子改名为正式的 pack-<stamp>/：
+        raise PackError(f"步骤 2/归档目标已存在，拒绝覆盖：{target}")
+    # 先写到 staging，全部校验通过后再原子改名为正式的 pack-<stamp>/：
     # 复制中途失败只会留下可清理的 staging，不会出现“半个归档”占住归档名。
     staging = archive_root / f".pack-{stamp}.staging"
     if staging.exists():
@@ -1117,53 +1435,103 @@ def archive_previous_outputs(
 
     entries: list[tuple[str, str]] = []
     try:
+        # 步骤 3：复制旧私有文件与旧盲审包（旧文件保持原样，不移动、不删除）
+        # 清单里的哈希必须先算源文件：拿复制后的文件自己算哈希，复制坏了一样对得上，
+        # 步骤 4 就成了自证。先记源哈希，再由步骤 4 拿 staging 逐条比对。
         for name in PRIVATE_FILES:
             source = private_dir / name
-            if not source.is_file():
-                continue
             destination = staging / "private" / name
             destination.parent.mkdir(parents=True, exist_ok=True)
+            entries.append((f"private/{name}", sha256_file(source)))
             shutil.copy2(source, destination)
-            entries.append((f"private/{name}", sha256_file(destination)))
 
-        if pack_dir.is_dir():
-            for path in sorted(pack_dir.rglob("*")):
-                if not path.is_file():
-                    continue
-                relative = path.relative_to(pack_dir).as_posix()
-                destination = staging / "blind_pack" / relative
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, destination)
-                entries.append((f"blind_pack/{relative}", sha256_file(destination)))
+        for path in sorted(pack_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(pack_dir).as_posix()
+            destination = staging / "blind_pack" / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            entries.append((f"blind_pack/{relative}", sha256_file(path)))
+            shutil.copy2(path, destination)
     except OSError as exc:
         shutil.rmtree(staging, ignore_errors=True)
-        raise PackError(f"归档旧产物失败，已放弃本次归档并保留活动包原状：{exc}") from exc
+        raise PackError(
+            f"步骤 3/复制旧产物到 staging 失败，已放弃本次归档并保留旧私有文件与活动包原状：{exc}"
+        ) from exc
 
+    # 步骤 4：复制后的文件必须逐条重算 SHA256，并与应有数量一致
+    if len(entries) != evidence["expected_files"]:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise PackError(
+            f"步骤 4/staging 文件数 {len(entries)} 与校验得到的应有数量 "
+            f"{evidence['expected_files']} 不一致，拒绝发布归档"
+        )
+    try:
+        _verify_entries_against(staging, entries, "步骤 4")
+    except PackError:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    phase_counts = " / ".join(
+        f"{phase}={evidence['phases'][phase]['materials']}" for phase in PHASE_COUNTS
+    )
     lines = [
         "# ARCHIVE-MANIFEST（私有留档，禁止分发 / 禁止提交 Git）",
         "",
         f"- 归档时间 (UTC)：{generated_utc}",
         f"- 生成器版本：{VERSION}",
         f"- 被替换旧 mapping.csv SHA256：{old_mapping_sha}",
+        f"- 旧包阶段计数：{phase_counts}",
         f"- 归档文件数：{len(entries)}",
         "",
         "| 归档路径 | SHA256 |",
         "| --- | --- |",
     ]
     lines += [f"| {relative} | {digest} |" for relative, digest in entries]
-    (staging / "ARCHIVE-MANIFEST.md").write_text(
+    (staging / ARCHIVE_MANIFEST_NAME).write_text(
         "\n".join(lines) + "\n", encoding="utf-8", newline="\n"
     )
-    os.replace(staging, target)
 
-    if pack_dir.is_dir():
-        try:
-            shutil.rmtree(pack_dir)
-        except OSError as exc:
-            raise PackError(
-                f"旧产物已完整归档到 {target.relative_to(private_dir)}，但清空活动包目录失败：{exc}；"
-                "请不要删除该归档，手动清理活动包后重试"
-            ) from exc
+    # 步骤 5：清单落盘后再读回，条目数与 SHA256 全部复核一致才发布归档
+    try:
+        archived_count = _verify_archive_tree(staging, "步骤 5")
+    except PackError:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    if archived_count != len(entries):
+        shutil.rmtree(staging, ignore_errors=True)
+        raise PackError(
+            f"步骤 5/归档清单条目数 {len(entries)} 与读回核对数 {archived_count} 不一致，拒绝发布归档"
+        )
+    try:
+        os.replace(staging, target)
+    except OSError as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise PackError(
+            f"步骤 6/发布归档目录失败，活动包与私有文件保持原状：{exc}"
+        ) from exc
+
+    # 步骤 6：发布后再核对一次归档目录，确认完整才允许清理旧活动包
+    try:
+        published = _verify_archive_tree(target, "步骤 6/发布后复核")
+    except PackError as exc:
+        raise PackError(
+            f"{exc}；归档目录 {target.relative_to(private_dir)} 已保留，"
+            "活动包未被清理，请人工核对"
+        ) from exc
+    if published != len(entries):
+        raise PackError(
+            f"步骤 6/发布后归档文件数 {published} 与清单 {len(entries)} 不一致；"
+            f"归档目录 {target.relative_to(private_dir)} 已保留，活动包未被清理"
+        )
+
+    try:
+        shutil.rmtree(pack_dir)
+    except OSError as exc:
+        raise PackError(
+            f"步骤 7/旧产物已完整归档到 {target.relative_to(private_dir)}，但清空活动包目录失败：{exc}；"
+            "请不要删除该归档，手动清理活动包后重试"
+        ) from exc
     return str(target.relative_to(private_dir)), old_mapping_sha, len(entries)
 
 
@@ -1219,7 +1587,11 @@ def run_pack(args) -> int:
 
     generated_utc = utc_now()
     repack_notes = []
-    if args.repack and (private_dir / "mapping.csv").exists():
+    # 重打包时只要磁盘上还留着任何旧产物（旧私有文件或旧包），就必须先过归档完整性校验。
+    # 不能以 mapping.csv 是否存在为前提：mapping 被删而旧包还在，正是必须拒绝的情况。
+    old_private_left = private_dir.is_dir() and any(private_dir.iterdir())
+    old_pack_left = pack_dir.is_dir() and any(pack_dir.iterdir())
+    if args.repack and (old_private_left or old_pack_left):
         archive_rel, old_sha, archived_count = archive_previous_outputs(
             pack_dir, private_dir, generated_utc
         )
