@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """check_memory.py（M1–M4）与 check_auto.py 的自写回归测试（无 pytest，直接 python 运行）。
 
@@ -17,6 +17,10 @@ T9  check_auto.analyze_row / metric_rows_for_scope：无夹具时 Y1=N/A、无 P
     且不把 N/A 写成 PASS；write_csv 可回读。
 T11 check_auto 的 Prompt 归档：parse_prompt_archive / parse_memory_payload / verify_prompt_hash /
     grounding_for_row 的 PASS / FAIL / UNVERIFIABLE 分支，调用真实 agent_plan_draft.check_grounding。
+T15 记忆公开投影：镜像常量与 agent_tools._sanitize_memory() 源码一致；8 字段缺键/None/越界/错类型/
+    非法时间一律整包失败（逐字段矩阵）。
+T16 grounding 的记忆预期：C/D/C-subj/D-subj 缺区块 FAIL；S7-empty 缺区块不 FAIL；无法确认 UNVERIFIABLE；
+    归档零记忆却出现区块 FAIL；只判有无区块、不比较条数。
 """
 
 import contextlib
@@ -735,7 +739,15 @@ def _write_prompt(run_dir, sample_id, group, system, user):
 
 
 def _samples(*sample_ids):
-    return {sid: {"sample_id": sid, "feedbacks": []} for sid in sample_ids}
+    return {
+        sample_id: {
+            "sample_id": sample_id,
+            "feedbacks": [],
+            # 与真实 samples/<id>.json 同构：记忆预期只能从归档里读。
+            "gold_standard": {"memories": [{"injected": True}]},
+        }
+        for sample_id in sample_ids
+    }
 
 
 def test_grounding():
@@ -753,7 +765,7 @@ def test_grounding():
         "content": "条件概率掌握薄弱",
         "strength": 0.6,
         "evidence_count": 2,
-        "episode": "ep-1",
+        "episode": 1,
         "evidence_feedback_ids": [1, 2],
         "updated_at": "2026-11-01T00:00:00Z",
     }]
@@ -1054,7 +1066,7 @@ def _memory_item(**overrides):
         "content": "在条件概率上反复出错",
         "strength": 0.6,
         "evidence_count": 2,
-        "episode": "ep-1",
+        "episode": 1,
         "evidence_feedback_ids": [1, 2],
         "updated_at": "2026-11-01T00:00:00Z",
     }
@@ -1089,7 +1101,8 @@ def test_memory_payload_item_validation():
          "的 evidence_feedback_ids 不是数组"),
         ("证据 id 超过 5 个", _memory_item(evidence_feedback_ids=[1, 2, 3, 4, 5, 6]), "超过 5 个"),
         ("证据 id 非法", _memory_item(evidence_feedback_ids=[1, "x"]), "含非法 id"),
-        ("updated_at 类型非法", _memory_item(updated_at=20261101), "的 updated_at 类型非法"),
+        ("updated_at 不是时间", _memory_item(updated_at=20261101),
+         "的 updated_at 不是可解析的 ISO 8601 时间"),
     ]
     for label, item, fragment in cases:
         present, items, error = ca.parse_memory_payload(payload(item))
@@ -1101,6 +1114,170 @@ def test_memory_payload_item_validation():
     # 无记忆区块时不冒充「校验通过」
     check("T13 无记忆区块 → present=False 且无 payload",
           ca.parse_memory_payload("纯用户请求") == (False, [], None))
+
+
+# ---------------------------------------------------------------------------
+# T15 记忆公开投影：8 字段必须全存在，且逐字段严格校验（第三轮问题 3）
+# ---------------------------------------------------------------------------
+
+def _projection_keys_from_source():
+    """从 agent_tools.py 源码读出 `_sanitize_memory()` 返回 dict 的键（按出现顺序）。
+
+    故意不 import agent_tools：它会 import database/memory_service，绑定 DATABASE_PATH，
+    在只读核查里制造副作用。解析源码足以锁住「镜像常量 == 真实公开投影」。
+    """
+
+    import ast
+
+    tree = ast.parse((PROJECT_DIR / "agent_tools.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_sanitize_memory":
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Return) and isinstance(inner.value, ast.Dict):
+                    return tuple(
+                        key.value
+                        for key in inner.value.keys
+                        if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                    )
+    return None
+
+
+def _module_string_tuple(path, name):
+    """读模块级 `NAME = ("a","b")` 形式的字符串元组，避免 import 目标模块。"""
+
+    import ast
+
+    tree = ast.parse(Path(path).read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and target.id == name
+                    and isinstance(node.value, (ast.Tuple, ast.List))
+                ):
+                    return tuple(
+                        elt.value
+                        for elt in node.value.elts
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                    )
+    return None
+
+
+def test_memory_payload_field_contract():
+    """逐字段契约：缺键、None、越界、错类型、非法时间都必须让整个 payload 失败。"""
+
+    import agent_plan_draft as apd
+
+    keys = _projection_keys_from_source()
+    check("T15 镜像字段 == agent_tools._sanitize_memory() 返回键",
+          keys is not None and keys == ca.MEMORY_PAYLOAD_FIELDS,
+          (keys, ca.MEMORY_PAYLOAD_FIELDS))
+    check("T15 镜像字段 == agent_plan_draft.MEMORY_RESULT_FIELDS",
+          tuple(apd.MEMORY_RESULT_FIELDS) == ca.MEMORY_PAYLOAD_FIELDS,
+          apd.MEMORY_RESULT_FIELDS)
+    memory_types = _module_string_tuple(PROJECT_DIR / "agent_tools.py", "MEMORY_TYPES")
+    check("T15 镜像类型 == agent_tools.MEMORY_TYPES",
+          memory_types is not None and memory_types == ca.MEMORY_PAYLOAD_TYPES, memory_types)
+
+    def payload_of(items):
+        return (
+            bp.MEMORY_HEADER
+            + "\n"
+            + json.dumps(items, ensure_ascii=False)
+            + "\n"
+            + ca.MEMORY_SUFFIX_MARKER
+            + "\n答案"
+        )
+
+    def accept(item):
+        present, items, error = ca.parse_memory_payload(payload_of([item]))
+        return present is True and error is None and items == [item], (items, error)
+
+    def reject(items, fragment=None):
+        if isinstance(items, dict):
+            items = [items]
+        present, got, error = ca.parse_memory_payload(payload_of(items))
+        ok = present is True and got == [] and error is not None
+        if fragment is not None:
+            ok = ok and fragment in error
+        return ok, error
+
+    # ① 8 个字段逐个删除：全部失败，且错误指名缺哪个字段
+    for field in ca.MEMORY_PAYLOAD_FIELDS:
+        item = _memory_item()
+        item.pop(field)
+        ok, error = reject(item, "缺少公开投影字段")
+        check(f"T15 缺少字段 {field} → 整包失败", ok and field in (error or ""), error)
+
+    # ② 8 个字段都不允许 None（learning_memories 对应列全 NOT NULL）
+    for field in ca.MEMORY_PAYLOAD_FIELDS:
+        ok, error = reject(_memory_item(**{field: None}))
+        check(f"T15 字段 {field}=None → 失败", ok, error)
+
+    # ③ strength：0–1 边界接受，越界/布尔/字符串/数组拒绝
+    for value in (0, 1, 0.0, 1.0, 0.5):
+        ok, detail = accept(_memory_item(strength=value))
+        check(f"T15 strength={value!r} 合法", ok, detail)
+    for value in (-0.01, 1.01, 2, True, False, "0.5", [0.5]):
+        ok, error = reject(_memory_item(strength=value))
+        check(f"T15 strength={value!r} 被拒绝", ok, error)
+
+    # ④ evidence_count：非负整数，排除 bool/float/字符串
+    for value in (0, 1, 5):
+        ok, detail = accept(_memory_item(evidence_count=value))
+        check(f"T15 evidence_count={value!r} 合法", ok, detail)
+    for value in (-1, True, False, 1.0, "2", None):
+        ok, error = reject(_memory_item(evidence_count=value))
+        check(f"T15 evidence_count={value!r} 被拒绝", ok, error)
+
+    # ⑤ evidence_feedback_ids：数组、每个是正整数、最多 5 个
+    for value in ([], [1], [1, 2, 3, 4, 5]):
+        ok, detail = accept(_memory_item(evidence_feedback_ids=value))
+        check(f"T15 evidence_feedback_ids={value!r} 合法", ok, detail)
+    for value, fragment in (
+        ("1,2", "不是数组"),
+        (None, "不是数组"),
+        ({"id": 1}, "不是数组"),
+        ([1, 2, 3, 4, 5, 6], "超过 5 个"),
+        ([0], "含非法 id"),
+        ([True], "含非法 id"),
+        (["1"], "含非法 id"),
+        ([1.5], "含非法 id"),
+    ):
+        ok, error = reject(_memory_item(evidence_feedback_ids=value), fragment)
+        check(f"T15 evidence_feedback_ids={value!r} 被拒绝", ok, error)
+
+    # ⑥ episode：正整数；bool/0/负数/字符串/浮点都不行
+    ok, detail = accept(_memory_item(episode=1))
+    check("T15 episode=1 合法", ok, detail)
+    for value in (0, -2, True, False, "1", 1.0, None):
+        ok, error = reject(_memory_item(episode=value))
+        check(f"T15 episode={value!r} 被拒绝", ok, error)
+
+    # ⑦ updated_at：ISO 8601（含 Z 与带偏移），空串与无法解析的日期必须失败
+    for value in (
+        "2026-11-01T00:00:00",
+        "2026-11-01T00:00:00Z",
+        "2026-11-01T08:00:00+08:00",
+    ):
+        ok, detail = accept(_memory_item(updated_at=value))
+        check(f"T15 updated_at={value!r} 合法", ok, detail)
+    for value in ("", "   ", "not-a-date", "20261101", "2026-13-45T00:00:00", 20261101, None):
+        ok, error = reject(_memory_item(updated_at=value), "不是可解析的 ISO 8601 时间")
+        check(f"T15 updated_at={value!r} 被拒绝", ok, error)
+
+    # ⑧ 任意一条非法 → 整包失败，且错误定位到具体第几条
+    ok, error = reject([_memory_item(), _memory_item(evidence_count=-1)])
+    check("T15 多条中第二条非法 → 整包失败并定位第 2 条",
+          ok and "第 2 条" in (error or ""), error)
+    ok, error = reject([_memory_item(evidence_count=-1)])
+    check("T15 单条非法 → 定位第 1 条", ok and "第 1 条" in (error or ""), error)
+
+    # ⑨ 合法条目仍被原样还原（不做静默改写）
+    present, items, error = ca.parse_memory_payload(payload_of([_memory_item()]))
+    check("T15 合法投影被原样还原", present and error is None and items == [_memory_item()],
+          (items, error))
 
 
 # ---------------------------------------------------------------------------
@@ -1176,6 +1353,118 @@ def test_overview_status_unified():
           cm.tool_verdict_label(tool_ok) == "通过", cm.tool_verdict_label(tool_ok))
 
 
+# ---------------------------------------------------------------------------
+# T16 grounding：记忆区块有无必须按样本归档的预期判定（第三轮问题 4）
+# ---------------------------------------------------------------------------
+
+def _gold_sample(sample_id, injected=None, memories=None):
+    fixture = {"sample_id": sample_id, "feedbacks": []}
+    if memories is not None:
+        fixture["gold_standard"] = {"memories": memories}
+    elif injected is not None:
+        fixture["gold_standard"] = {"memories": [{"injected": flag} for flag in injected]}
+    return fixture
+
+
+def _grounding_case(run_name, sample_id, group, prompt_user, sample):
+    import agent_plan_draft as apd
+
+    system = "你是学习规划助手。"
+    run_dir = TMP_ROOT / run_name
+    _write_prompt(run_dir, sample_id, group, system, prompt_user)
+    row = _row(
+        sample_id=sample_id,
+        group=group,
+        prompt_sha256=bp.prompt_sha256(system, prompt_user),
+        final_output={"answer": "好的", "plan": {"reason": "按当前情况", "steps": []}},
+    )
+    cache = {sample_id: sample}
+    return ca.grounding_for_row(row, run_dir, cache, apd.check_grounding, apd.MEMORY_CLAIM_MARKERS)
+
+
+def test_grounding_memory_expectation():
+    """预期状态只能来自 samples/<id>.json 的 gold_standard.memories[].injected。"""
+
+    plain_user = "请为学习者制定计划。"
+    with_memory = (
+        "请为学习者制定计划。\n\n"
+        + bp.MEMORY_HEADER
+        + "\n"
+        + json.dumps([_memory_item()], ensure_ascii=False)
+    )
+    empty_array_user = "请为学习者制定计划。\n\n" + bp.MEMORY_HEADER + "\n[]"
+
+    # ① C / D / C-subj / D-subj：归档预期非空却缺记忆区块 → FAIL
+    for group in ("C", "D", "C-subj", "D-subj"):
+        status, detail = _grounding_case(
+            f"gr-{group}", "S5", group, plain_user, _gold_sample("S5", injected=[True])
+        )
+        check(f"T16 {group} 预期非空却缺记忆区块 → FAIL",
+              status == "FAIL" and "应注入长期记忆" in detail, (status, detail))
+
+    # ② S7-empty：归档确认零记忆，缺区块不算 FAIL，其余检查照常
+    status, detail = _grounding_case(
+        "gr-s7empty", "S7-empty", "D", plain_user,
+        _gold_sample("S7-empty", memories=[]),
+    )
+    check("T16 S7-empty 归档零记忆 + 缺区块 → 不判 FAIL",
+          status == "PASS" and "记忆 0 条" in detail, (status, detail))
+
+    # ③ 无法确认预期 → UNVERIFIABLE，不能默认放行
+    status, detail = _grounding_case(
+        "gr-nogold", "S3", "C", plain_user, {"sample_id": "S3", "feedbacks": []}
+    )
+    check("T16 样本缺 gold_standard → UNVERIFIABLE",
+          status == "UNVERIFIABLE" and "无法确认" in detail, (status, detail))
+
+    status, detail = _grounding_case(
+        "gr-badgold", "S4", "C", plain_user,
+        {
+            "sample_id": "S4",
+            "feedbacks": [],
+            "gold_standard": {"memories": [{"key": "difficulty"}]},
+        },
+    )
+    check("T16 gold_standard.memories 缺 injected → UNVERIFIABLE",
+          status == "UNVERIFIABLE" and "无法确认" in detail, (status, detail))
+
+    # ④ 归档确认零记忆却出现记忆区块 → FAIL
+    status, detail = _grounding_case(
+        "gr-empty-block", "S7-empty", "D", with_memory, _gold_sample("S7-empty", memories=[])
+    )
+    check("T16 归档零记忆却出现记忆区块 → FAIL",
+          status == "FAIL" and "预期零记忆" in detail, (status, detail))
+
+    # ⑤ 预期非空 + 区块里是空数组 → 仍然 FAIL（空数组不等于有记忆）
+    status, detail = _grounding_case(
+        "gr-empty-array", "S5", "C", empty_array_user, _gold_sample("S5", injected=[True])
+    )
+    check("T16 预期非空但区块为空数组 → FAIL",
+          status == "FAIL" and "取不到真实记忆内容" in detail, (status, detail))
+
+    # ⑥ 预期非空 + 真实记忆区块 → PASS
+    status, detail = _grounding_case(
+        "gr-ok", "S5", "C", with_memory, _gold_sample("S5", injected=[True])
+    )
+    check("T16 预期非空且区块存在 → PASS",
+          status == "PASS" and "记忆 1 条" in detail, (status, detail))
+
+    # ⑦ 归档 injected 条数多于 Prompt 实际注入条数时，只判「有无区块」不比较条数
+    status, detail = _grounding_case(
+        "gr-count", "S5", "C-subj", with_memory,
+        _gold_sample("S5", injected=[True, True, True]),
+    )
+    check("T16 injected 数多于实际注入条数不误判（只判有无区块）",
+          status == "PASS", (status, detail))
+
+    # ⑧ 本就不注入记忆的组出现记忆区块仍是 FAIL（原规则不被放宽）
+    status, detail = _grounding_case(
+        "gr-a", "S5", "A", with_memory, _gold_sample("S5", injected=[True])
+    )
+    check("T16 A 组出现记忆区块 → FAIL",
+          status == "FAIL" and "不应注入长期记忆" in detail, (status, detail))
+
+
 def _force_rmtree(target):
     """Windows 上临时目录里的只读文件会让 rmtree 静默失败，先解除只读再重试。"""
 
@@ -1204,8 +1493,10 @@ def main():
         test_auto_analysis()
         test_status_accounting()
         test_grounding()
+        test_grounding_memory_expectation()
         test_auto_manifest_failclosed()
         test_memory_payload_item_validation()
+        test_memory_payload_field_contract()
         test_overview_status_unified()
 
         print()

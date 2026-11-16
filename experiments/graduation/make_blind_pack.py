@@ -43,6 +43,7 @@ import hashlib
 import io
 import json
 import os
+import posixpath
 import re
 import secrets
 import shutil
@@ -133,6 +134,8 @@ TOTAL_BLIND_IDS = sum(PHASE_COUNTS.values())
 ORDER_COLUMNS = ["position", "blind_id"]
 ORDER_FILES = ("order_rater_a.csv", "order_rater_b.csv")
 ARCHIVE_MANIFEST_NAME = "ARCHIVE-MANIFEST.md"
+# 历史归档放在私有目录内的这个子目录：它不代表「有未归档的活动旧产物」。
+ARCHIVE_DIRNAME = "archive"
 BLIND_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -811,21 +814,43 @@ def write_csv_atomic(path: Path, columns: list[str], rows: list[dict]) -> None:
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
-def manifest_hashes(path: Path | None = None) -> dict[tuple[str, str], dict]:
-    """读取执行报告附录 A 的清单。
+def normalize_manifest_path(value: str) -> str:
+    """把 manifest 的 relative_path 规范化成唯一形式，作为条目存在性的主键。
+
+    只 `strip("/")` 不够：`a\\b`、`a//b`、`./a/b`、`a/./b` 指向的是同一个文件，
+    规范化不彻底就能用另一种写法绕过「同一路径重复出现」的检查，条目缺失也就重新可辩称。
+    """
+
+    text = (value or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    normalized = posixpath.normpath(text)
+    if normalized in (".", "..") or normalized.startswith(("/", "../")):
+        raise PackError(
+            f"manifest 的 relative_path 不是仓库内相对路径，拒绝使用：{value!r}"
+        )
+    return normalized.strip("/")
+
+
+def manifest_hashes(path: Path | None = None) -> dict[str, dict]:
+    """读取执行报告附录 A 的清单 → {规范化 relative_path: row}。
+
+    键只能是 relative_path 本身。早先以 `(relative_path, file)` 为键，`file` 列被清空或
+    写错时同一路径就查不到条目，B0 记录会被误判成「manifest 未收录」而走 legacy 放行；
+    现在路径存在即必须按条目校验，`file` 列的问题由 `verify_snapshot()` 单独判失败。
 
     同一个 relative_path 出现两条记录时直接报错：字典会把前一条悄悄覆盖掉，
     「后一条刚好合法」就能掩盖「清单被改过」这件事。
     """
 
     path = Path(path) if path else MANIFEST_PATH
-    table: dict[tuple[str, str], dict] = {}
+    table: dict[str, dict] = {}
     if not path.is_file():
         return table
     seen: set[str] = set()
     with path.open("r", encoding="utf-8", newline="") as handle:
         for row in csv.DictReader(handle):
-            relative = (row.get("relative_path") or "").replace("\\", "/").strip("/")
+            relative = normalize_manifest_path(row.get("relative_path") or "")
             if not relative:
                 continue
             if relative in seen:
@@ -834,7 +859,7 @@ def manifest_hashes(path: Path | None = None) -> dict[tuple[str, str], dict]:
                     "请先确认哪一条才是被冻结的版本"
                 )
             seen.add(relative)
-            table[(relative, (row.get("file") or "").strip())] = row
+            table[relative] = row
     return table
 
 
@@ -895,6 +920,9 @@ def _describe_mismatch(row: dict) -> str:
     if "records" in row["status"]:
         parts.append(f"expected_records={row['expected_records']}")
         parts.append(f"actual_records={row['records']}")
+    if "file" in row["status"]:
+        parts.append(f"manifest_file={row.get('manifest_file', '')!r}")
+        parts.append(f"expected_file={SOURCE_FILE!r}")
     return " ".join(parts)
 
 
@@ -903,8 +931,8 @@ def verify_snapshot(snapshot: dict[str, dict], manifest: dict) -> list[dict]:
 
     report: list[dict] = []
     for run_dir, actual in sorted(snapshot.items()):
-        relative = f"experiments/graduation/runs/{run_dir}/{SOURCE_FILE}"
-        entry = manifest.get((relative, SOURCE_FILE))
+        relative = normalize_manifest_path(f"experiments/graduation/runs/{run_dir}/{SOURCE_FILE}")
+        entry = manifest.get(relative)
         row = {
             "run_dir": run_dir,
             "expected": "",
@@ -913,6 +941,7 @@ def verify_snapshot(snapshot: dict[str, dict], manifest: dict) -> list[dict]:
             "records": actual["records"],
             "expected_size_bytes": "",
             "expected_records": "",
+            "manifest_file": "",
             "status": "",
         }
         if entry is None:
@@ -921,8 +950,15 @@ def verify_snapshot(snapshot: dict[str, dict], manifest: dict) -> list[dict]:
             )
             report.append(row)
             continue
+        # 条目存在就说明该路径被 manifest 收录过，此时 `file` 列空掉或写错意味着清单本身不可信，
+        # 必须判失败——不能因为按 (路径, file) 查不到就把 B0 记录当成「条目缺失」放行。
+        row["manifest_file"] = str(entry.get("file") or "").strip()
         row["expected"] = (entry.get("sha256") or "").strip().lower()
         problems = []
+        if not row["manifest_file"]:
+            problems.append("file_empty")
+        elif row["manifest_file"] != SOURCE_FILE:
+            problems.append("file")
         # 有清单条目就必须逐字段完整核对：空字段不是「没写就先放过」，
         # 而是「无法证明源文件没被改过」，一样要停下来。
         if not row["expected"]:
@@ -1421,7 +1457,7 @@ def archive_previous_outputs(
     old_mapping = private_dir / "mapping.csv"
 
     stamp = generated_utc.replace(":", "").replace("-", "")
-    archive_root = private_dir / "archive"
+    archive_root = private_dir / ARCHIVE_DIRNAME
     target = archive_root / f"pack-{stamp}"
     if target.exists():
         raise PackError(f"步骤 2/归档目标已存在，拒绝覆盖：{target}")
@@ -1535,6 +1571,44 @@ def archive_previous_outputs(
     return str(target.relative_to(private_dir)), old_mapping_sha, len(entries)
 
 
+def stale_output_paths(pack_dir: Path, private_dir: Path) -> list[Path]:
+    """列出仍留在活动位置上的旧运行产物（历史归档目录不算）。
+
+    三个私有文件任一存在，或 `pack_dir` 里还有任何条目，都说明上一次运行留下了一整套
+    可分发材料；`private_dir/archive/` 是 `--repack` 的正常留档结果，不能算作活动旧产物，
+    否则合法的历史归档会让后续打包永远无法开始。
+    """
+
+    pack_dir = Path(pack_dir)
+    private_dir = Path(private_dir)
+    found: list[Path] = []
+    for name in PRIVATE_FILES:
+        path = private_dir / name
+        if path.exists() or path.is_symlink():
+            found.append(path)
+    if pack_dir.is_dir():
+        found.extend(sorted(pack_dir.iterdir()))
+    return found
+
+
+def ensure_no_stale_outputs(pack_dir: Path, private_dir: Path, repack: bool) -> list[Path]:
+    """无 `--repack` 时，任何旧产物都必须在写入之前拒绝。
+
+    早先只检查 `mapping.csv`：mapping 被删、旧包与旧审计文件还在时，脚本会先覆盖私有文件，
+    直到发布阶段才因为活动包目录非空而失败——旧包配上新 mapping，正是最坏的混合状态。
+    """
+
+    stale = stale_output_paths(pack_dir, private_dir)
+    if not stale or repack:
+        return stale
+    shown = "、".join(str(path) for path in stale[:10])
+    more = f"（另有 {len(stale) - 10} 项）" if len(stale) > 10 else ""
+    raise PackError(
+        f"发现未归档的旧运行产物：{shown}{more}。拒绝覆盖，本次未写入或删除任何文件："
+        "重打包必须显式 --repack（旧产物会先完整校验再成套归档），或先人工清理"
+    )
+
+
 # --------------------------------------------------------------------------
 # 主流程
 # --------------------------------------------------------------------------
@@ -1557,11 +1631,9 @@ def run_pack(args) -> int:
 
     ensure_path_layout(pack_dir, private_dir)
     gate_evidence = ensure_private_gate(private_dir)
-    if private_dir.joinpath("mapping.csv").exists() and not args.repack:
-        raise PackError(
-            f"{private_dir / 'mapping.csv'} 已存在：重打包必须显式 --repack，"
-            "并会在 MAPPING-AUDIT.md 记录被替换旧映射的 SHA256（不得静默覆盖）"
-        )
+    # 统一前置检查：三个私有文件与活动包目录都必须在写入任何文件之前判掉，
+    # 不能只查 mapping.csv（mapping 被删而旧包还在时，旧包会被新私有文件配上）。
+    stale_before = ensure_no_stale_outputs(pack_dir, private_dir, bool(args.repack))
 
     built = build_items(seed, runs_dir)
     items = built["items"]
@@ -1587,11 +1659,10 @@ def run_pack(args) -> int:
 
     generated_utc = utc_now()
     repack_notes = []
-    # 重打包时只要磁盘上还留着任何旧产物（旧私有文件或旧包），就必须先过归档完整性校验。
-    # 不能以 mapping.csv 是否存在为前提：mapping 被删而旧包还在，正是必须拒绝的情况。
-    old_private_left = private_dir.is_dir() and any(private_dir.iterdir())
-    old_pack_left = pack_dir.is_dir() and any(pack_dir.iterdir())
-    if args.repack and (old_private_left or old_pack_left):
+    # 重打包时只要磁盘上还留着任何旧产物（旧私有文件或旧包，不含 archive/ 历史归档），
+    # 就必须先过归档完整性校验。不能以 mapping.csv 是否存在为前提：mapping 被删而旧包还在，
+    # 正是必须拒绝（而不是静默覆盖）的情况。
+    if args.repack and stale_before:
         archive_rel, old_sha, archived_count = archive_previous_outputs(
             pack_dir, private_dir, generated_utc
         )

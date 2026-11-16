@@ -374,8 +374,57 @@ MEMORY_PAYLOAD_TYPES = ("difficulty", "task_performance", "time_pattern", "task_
 MEMORY_SUFFIX_MARKER = "输出契约："
 
 
+def _parse_memory_timestamp(value):
+    """按 memory_service._parse_ts() 的同一规则解析记忆时间戳。
+
+    真实记忆的 updated_at 一律来自 `datetime.now().isoformat()`（本地无时区字符串），
+    这里额外接受 `Z` 与带偏移的写法（按墙钟时间丢 tzinfo），与记忆服务的解析口径一致；
+    空串、`not-a-date`、`20261108` 这类"看起来像日期"的值一律解析失败。
+    只读镜像，不 import memory_service（它会绑定 DATABASE_PATH，破坏 check_auto 的只读隔离）。
+
+    注意：Python 3.11+ 的 `fromisoformat()` 会接受纯日期基本格式（`20261108`、`2026-11-08`），
+    而本项目的真实时间戳必然带 `T` 或空格加时分。这里先用形状校验把这些值挡掉，
+    否则"看起来像日期"的伪造值会被当成合法时间。
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    text = value.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", text) is None:
+        return None
+
+    # 与模块内其他时间用法一致：局部导入，不在顶层扩大 import 面。
+    from datetime import datetime
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+
+    return parsed
+
+
+def _memory_int(value, minimum):
+    """非负/下界整数（排除 bool）：True 在 Python 里是 int，必须单独排掉。"""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < minimum:
+        return None
+    return value
+
+
 def _validate_memory_item(index, item):
-    """逐条校验一条记忆，返回错误描述或 None。"""
+    """逐条严格校验一条记忆，返回错误描述或 None。
+
+    8 个字段必须全部出现。`_sanitize_memory()` 对每条记忆都无条件产出这 8 个键
+    （来源是 learning_memories 的 NOT NULL 列），所以「字段缺失」只可能是 Prompt 被改过；
+    「值允许为 None」与「字段本身缺失」是两件事，后者绝不能当成「这一项不用查」放过去。
+    """
 
     where = f"第 {index} 条记忆"
     if not isinstance(item, dict):
@@ -384,6 +433,10 @@ def _validate_memory_item(index, item):
     unknown = sorted(set(item) - set(MEMORY_PAYLOAD_FIELDS))
     if unknown:
         return f"{where}含公开投影之外的字段：{unknown}"
+
+    missing = [field for field in MEMORY_PAYLOAD_FIELDS if field not in item]
+    if missing:
+        return f"{where}缺少公开投影字段：{missing}（8 个字段必须全部存在，键缺失即判失败）"
 
     memory_type = item.get("type")
     if not isinstance(memory_type, str) or memory_type not in MEMORY_PAYLOAD_TYPES:
@@ -403,28 +456,26 @@ def _validate_memory_item(index, item):
     if not 0.0 <= float(strength) <= 1.0:
         return f"{where}的 strength 超出 0–1 范围：{strength!r}"
 
-    if "evidence_count" in item:
-        count = item.get("evidence_count")
-        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-            return f"{where}的 evidence_count 不是非负整数：{count!r}"
+    count = item.get("evidence_count")
+    if _memory_int(count, 0) is None:
+        return f"{where}的 evidence_count 不是非负整数：{count!r}"
 
-    if "evidence_feedback_ids" in item:
-        ids = item.get("evidence_feedback_ids")
-        if not isinstance(ids, list):
-            return f"{where}的 evidence_feedback_ids 不是数组：{ids!r}"
-        if len(ids) > 5:
-            return f"{where}的 evidence_feedback_ids 超过 5 个（真实 Tool 每条最多 5 个）：{len(ids)}"
-        for value in ids:
-            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-                return f"{where}的 evidence_feedback_ids 含非法 id：{value!r}"
+    episode = item.get("episode")
+    if _memory_int(episode, 1) is None:
+        return f"{where}的 episode 不是正整数：{episode!r}"
 
-    # episode 是内部 id，可以是字符串或整数；updated_at 是时间戳，真实归档一律是 ISO 字符串，
-    # 接受整数会让 20261101 这种"看起来像日期"的错值混过去。
-    for field, allowed in (("episode", (str, int)), ("updated_at", (str,))):
-        if field in item:
-            value = item.get(field)
-            if value is not None and (isinstance(value, bool) or not isinstance(value, allowed)):
-                return f"{where}的 {field} 类型非法：{value!r}"
+    ids = item.get("evidence_feedback_ids")
+    if not isinstance(ids, list):
+        return f"{where}的 evidence_feedback_ids 不是数组：{ids!r}"
+    if len(ids) > 5:
+        return f"{where}的 evidence_feedback_ids 超过 5 个（真实 Tool 每条最多 5 个）：{len(ids)}"
+    for value in ids:
+        if _memory_int(value, 1) is None:
+            return f"{where}的 evidence_feedback_ids 含非法 id：{value!r}"
+
+    updated_at = item.get("updated_at")
+    if _parse_memory_timestamp(updated_at) is None:
+        return f"{where}的 updated_at 不是可解析的 ISO 8601 时间：{updated_at!r}"
 
     return None
 
@@ -536,6 +587,37 @@ def reconstruct_steps(group, feedback_count, memory_count):
     return steps
 
 
+def expected_memory_state(sample):
+    """从设计冻结的样本夹具推断「实验时预期注入的记忆」。
+
+    可信归档是 `samples/<sample>.json` 的 `gold_standard.memories[]`：每一项带
+    `injected`，由同一份夹具经 build_prompts 的注入规则算出，已与全部归档 Prompt 逐条核对一致
+    （S7-empty 为 `memories: []`）。这里只读归档，绝不用实时数据库状态冒充实验时的预期。
+
+    返回 (state, count)：
+      "required"     —— 预期至少一条记忆（缺记忆区块即 FAIL）
+      "empty"        —— 经归档确认的零记忆（缺区块不算 FAIL，其余检查照旧）
+      "unverifiable" —— 夹具缺失或结构不足以判断（不得默认放行）
+    """
+
+    gold = sample.get("gold_standard") if isinstance(sample, dict) else None
+    if not isinstance(gold, dict):
+        return "unverifiable", 0
+
+    memories = gold.get("memories")
+    if not isinstance(memories, list):
+        return "unverifiable", 0
+
+    count = 0
+    for item in memories:
+        if not isinstance(item, dict) or not isinstance(item.get("injected"), bool):
+            return "unverifiable", 0
+        if item["injected"]:
+            count += 1
+
+    return ("required", count) if count else ("empty", 0)
+
+
 def grounding_for_row(row, run_dir, sample_cache, checker, memory_markers):
     """返回 (status, detail)。status ∈ PASS / FAIL / UNVERIFIABLE。
 
@@ -580,8 +662,28 @@ def grounding_for_row(row, run_dir, sample_cache, checker, memory_markers):
     if header_present and not slots["memory"]:
         return "FAIL", f"该组（{group}）不应注入长期记忆，但 Prompt 出现记忆区块"
 
-    if not header_present and slots["memory"] and slots.get("memory_required") is True:
-        return "FAIL", f"该组（{group}）应注入长期记忆，但 Prompt 没有记忆区块"
+    # 预期状态只能来自样本归档（gold_standard.memories[].injected），不能从组名硬编码、
+    # 也不能看当前数据库：S7-empty 这类零记忆样本缺区块是正确结果，其他 C/D 缺区块才是 FAIL。
+    memory_state, expected_count = ("unverifiable", 0)
+    if slots["memory"]:
+        memory_state, expected_count = expected_memory_state(sample)
+
+        if memory_state == "unverifiable":
+            return "UNVERIFIABLE", (
+                f"样本 {sample_id} 的归档缺少 gold_standard.memories[].injected，"
+                "无法确认实验时是否应注入记忆"
+            )
+
+        if not header_present and memory_state == "required":
+            return "FAIL", (
+                f"该组（{group}）按样本归档应注入长期记忆（预期 {expected_count} 条），"
+                "但 Prompt 没有记忆区块"
+            )
+
+        if header_present and memory_state == "empty":
+            return "FAIL", (
+                f"样本 {sample_id} 的归档确认预期零记忆，但 Prompt 出现了记忆区块"
+            )
 
     feedback_count = len(sample.get("feedbacks") or [])
     memory_count = len(payload) if header_present else 0

@@ -1184,6 +1184,222 @@ def test_t27_publish_failure_keeps_active_pack():
     print("  T27 PASS：发布后复核失败 → 归档与活动包都保留，并提示人工核对")
 
 
+def _tree_hashes(root: Path) -> dict[str, str]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): _sha(path)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _active_tree_hashes(sb: Sandbox) -> dict[str, str]:
+    """活动位置上的旧产物指纹（不含 `archive/` 历史归档）：伪造前缀 + 相对路径。"""
+
+    result: dict[str, str] = {}
+    for name in pack.PRIVATE_FILES:
+        path = sb.private_dir / name
+        if path.is_file():
+            result[f"private/{name}"] = _sha(path)
+    for rel, digest in _tree_hashes(sb.pack_dir).items():
+        result[f"pack/{rel}"] = digest
+    return result
+
+
+def _relative_to(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def test_t28_no_repack_refuses_full_old_output():
+    """不带 --repack 时，完整旧产物必须在写入任何文件之前被拒绝。"""
+
+    sb = _make_sandbox("t28")
+    _build_and_snapshot(sb, "2026-11-16T20:00:00Z")
+    before = _active_tree_hashes(sb)
+    assert "private/mapping.csv" in before and len(before) > 100, len(before)
+
+    code, out, err = _main(sb)
+    assert code == 2, (code, out, err)
+    assert "发现未归档的旧运行产物" in err, err
+    assert "未写入或删除任何文件" in err, err
+    assert "--repack" in err, err
+    # 拒绝之后旧材料逐字节不变，也没有悄悄写出新的私有文件
+    assert _active_tree_hashes(sb) == before
+    assert not list((sb.private_dir / pack.ARCHIVE_DIRNAME).glob("pack-*"))
+    print("  T28 PASS：不带 --repack 时完整旧产物在写入前拒绝，旧文件逐字节不变")
+
+
+def test_t29_no_repack_refuses_old_pack_without_mapping():
+    """mapping 被删、旧盲审包还在：旧包不能被新私有文件配上（必须在写入前拒绝）。"""
+
+    sb = _make_sandbox("t29")
+    _build_and_snapshot(sb, "2026-11-16T20:30:00Z")
+    (sb.private_dir / "mapping.csv").unlink()
+    before = _active_tree_hashes(sb)
+    assert "private/mapping.csv" not in before and before
+
+    code, out, err = _main(sb)
+    assert code == 2, (code, out, err)
+    assert "发现未归档的旧运行产物" in err, err
+    assert str(sb.pack_dir) in err, err
+    assert _active_tree_hashes(sb) == before
+    existing = {name for name in pack.PRIVATE_FILES if (sb.private_dir / name).exists()}
+    assert existing == {"selection_audit.csv", "MAPPING-AUDIT.md"}, existing
+    print("  T29 PASS：mapping 被删但旧包还在 → 写入前拒绝，不产生新 mapping")
+
+
+def test_t30_no_repack_refuses_audit_files_without_mapping():
+    """只剩 selection_audit.csv 或 MAPPING-AUDIT.md 也必须拒绝（不只认 mapping）。"""
+
+    for index, keep in enumerate(("selection_audit.csv", "MAPPING-AUDIT.md")):
+        name = f"t30-{index}"
+        sb = _make_sandbox(name)
+        _build_and_snapshot(sb, f"2026-11-16T21:0{index}:00Z")
+        _force_rmtree(sb.pack_dir)
+        for other in pack.PRIVATE_FILES:
+            path = sb.private_dir / other
+            if other != keep and path.exists():
+                path.unlink()
+        before = _active_tree_hashes(sb)
+        assert list(before) == [f"private/{keep}"], before
+
+        code, out, err = _main(sb)
+        assert code == 2, (keep, code, out, err)
+        assert "发现未归档的旧运行产物" in err and keep in err, (keep, err)
+        assert _active_tree_hashes(sb) == before
+        assert not (sb.private_dir / "mapping.csv").exists()
+    print("  T30 PASS：只剩审计文件时同样在写入前拒绝，mapping 不会被重新写出来")
+
+
+def test_t31_repack_still_archives_complete_old_output():
+    """--repack 下完整旧产物仍走成套归档，且 archive/ 不会被当成活动旧产物。"""
+
+    sb = _make_sandbox("t31")
+    _build_and_snapshot(sb, "2026-11-16T22:00:00Z")
+    with _patched_paths(sb), _clock("2026-11-16T22:30:00Z"):
+        _run_pack(sb, ["--repack"])
+
+    archives = [
+        path
+        for path in (sb.private_dir / pack.ARCHIVE_DIRNAME).glob("pack-*")
+        if path.is_dir()
+    ]
+    assert len(archives) == 1, archives
+    assert (archives[0] / pack.ARCHIVE_MANIFEST_NAME).is_file()
+    assert len(list(sb.pack_dir.glob("formal/*.md"))) == 84
+
+    stale = pack.stale_output_paths(sb.pack_dir, sb.private_dir)
+    rels = [_relative_to(path, sb.private_dir) for path in stale]
+    assert "mapping.csv" in rels, rels
+    assert not any(rel.startswith(pack.ARCHIVE_DIRNAME) for rel in rels), rels
+    print("  T31 PASS：--repack 完整旧产物成功归档，archive/ 不参与活动旧产物判定")
+
+
+def test_t32_archive_dir_is_not_active_output():
+    """只有历史归档目录时，不带 --repack 也必须能正常打包（第 7 条误判防线）。"""
+
+    sb = _make_sandbox("t32")
+    archive = sb.private_dir / pack.ARCHIVE_DIRNAME / "pack-20261116T225959Z"
+    archive.mkdir(parents=True)
+    (archive / pack.ARCHIVE_MANIFEST_NAME).write_text("# 合成历史归档\n", encoding="utf-8")
+
+    assert pack.stale_output_paths(sb.pack_dir, sb.private_dir) == []
+    _build(sb)
+    assert (sb.private_dir / "mapping.csv").is_file()
+    assert archive.is_dir() and (archive / pack.ARCHIVE_MANIFEST_NAME).is_file()
+    print("  T32 PASS：历史归档不被误判成未归档旧产物，正常打包不受影响")
+
+
+def test_t33_manifest_entry_presence_and_file_column():
+    """条目存在性只看规范化路径；条目在但 `file` 列空/错，B0 不得再走 legacy 放行。"""
+
+    b0 = pack.B0_RUNS[0]
+
+    # 1) B0 条目真的不存在 → 白名单 legacy
+    sb = _make_sandbox("t33-legacy")
+    with _patched_paths(sb):
+        snapshot = pack.snapshot_sources([b0], runs_dir=sb.runs_dir)
+        report = pack.verify_snapshot(snapshot, {})
+    assert [row["status"] for row in report] == ["legacy_no_manifest"], report
+
+    # 2) 条目在、但 file 或其余字段不可信 → 一律失败
+    cases = [
+        ("t33-file-empty", {"file": ""}, "file_empty"),
+        ("t33-file-wrong", {"file": "plan.json"}, "manifest_file"),
+        ("t33-sha-wrong", {"sha256": "0" * 64}, "sha256"),
+        ("t33-size-wrong", {"size_bytes": "1"}, "size_bytes"),
+        ("t33-records-wrong", {"records": "1"}, "records"),
+    ]
+    for name, patch, fragment in cases:
+        box = _make_sandbox(name)
+        rows = _manifest_rows(box)
+        _row_for(rows, b0).update(patch)
+        _write_manifest(box, rows)
+        with _patched_paths(box):
+            snapshot = pack.snapshot_sources([b0], runs_dir=box.runs_dir)
+            manifest = pack.manifest_hashes(box.manifest)
+            text = _expect_pack_error(
+                lambda: pack.verify_snapshot(snapshot, manifest),
+                "与 manifest 不一致",
+                fragment,
+            )
+        assert "legacy" not in text, (name, text)
+        if name.endswith("file-wrong"):
+            assert "manifest_file='plan.json'" in text, text
+
+    # 3) 非 B0 条目缺失 → manifest_missing（B0 才允许 legacy）
+    box = _make_sandbox("t33-missing")
+    rows = [
+        row
+        for row in _manifest_rows(box)
+        if not row["relative_path"].endswith(pack.MAIN_RUN + "/" + pack.SOURCE_FILE)
+    ]
+    _write_manifest(box, rows)
+    with _patched_paths(box):
+        snapshot = pack.snapshot_sources([pack.MAIN_RUN], runs_dir=box.runs_dir)
+        _expect_pack_error(
+            lambda: pack.verify_snapshot(snapshot, pack.manifest_hashes(box.manifest)),
+            "在 manifest 中缺失",
+            pack.MAIN_RUN,
+        )
+    print("  T33 PASS：manifest 条目缺失与 file 列错误分开判定，B0 不再被误放行")
+
+
+def test_t34_manifest_path_normalization_blocks_duplicates():
+    """同一路径的其它写法必须被规范化后判重复，不能绕过清单改写检查。"""
+
+    assert pack.normalize_manifest_path("experiments//graduation/./runs/a.jsonl") == (
+        "experiments/graduation/runs/a.jsonl"
+    )
+    assert pack.normalize_manifest_path("experiments\\graduation\\runs\\a.jsonl") == (
+        "experiments/graduation/runs/a.jsonl"
+    )
+    _expect_pack_error(lambda: pack.normalize_manifest_path("../outside.jsonl"), "不是仓库内相对路径")
+    _expect_pack_error(lambda: pack.normalize_manifest_path("/abs/path.jsonl"), "不是仓库内相对路径")
+
+    variants = [
+        lambda value: value.replace("/", "\\"),
+        lambda value: value.replace("/runs/", "//runs/./"),
+    ]
+    for index, mutate in enumerate(variants):
+        sb = _make_sandbox(f"t34-{index}")
+        rows = _manifest_rows(sb)
+        duplicate = dict(_row_for(rows, pack.MAIN_RUN))
+        duplicate["relative_path"] = mutate(duplicate["relative_path"])
+        assert duplicate["relative_path"] != _row_for(rows, pack.MAIN_RUN)["relative_path"]
+        rows.append(duplicate)
+        _write_manifest(sb, rows)
+        _expect_pack_error(lambda s=sb: pack.manifest_hashes(s.manifest), "重复条目")
+        code, _, err = _main(sb)
+        assert code == 2 and "重复条目" in err, (code, err)
+        assert not sb.pack_dir.exists()
+    print("  T34 PASS：反斜杠与重复分隔符写法规范化后判重复，无法绕过清单检查")
+
+
 TESTS = [
     ("T1", test_t1_private_outside_repo),
     ("T2", test_t2_pack_equals_private),
@@ -1212,6 +1428,13 @@ TESTS = [
     ("T25", test_t25_archive_copy_failure_keeps_old),
     ("T26", test_t26_repack_refuses_incomplete_old_output),
     ("T27", test_t27_publish_failure_keeps_active_pack),
+    ("T28", test_t28_no_repack_refuses_full_old_output),
+    ("T29", test_t29_no_repack_refuses_old_pack_without_mapping),
+    ("T30", test_t30_no_repack_refuses_audit_files_without_mapping),
+    ("T31", test_t31_repack_still_archives_complete_old_output),
+    ("T32", test_t32_archive_dir_is_not_active_output),
+    ("T33", test_t33_manifest_entry_presence_and_file_column),
+    ("T34", test_t34_manifest_path_normalization_blocks_duplicates),
 ]
 
 
