@@ -941,6 +941,7 @@ def _manifest_entry(run_dir, run_name):
     results = run_dir / "results.jsonl"
     return {
         "relative_path": f"experiments/graduation/runs/{run_name}/results.jsonl",
+        "file": "results.jsonl",
         "sha256": hashlib.sha256(results.read_bytes()).hexdigest(),
         "size_bytes": str(results.stat().st_size),
         "records": "2",
@@ -968,7 +969,7 @@ def test_auto_manifest_failclosed():
     )
     before = hashlib.sha256((run_dir / "results.jsonl").read_bytes()).hexdigest()
     config = seed_fixture.load_config(None)
-    columns = ["relative_path", "sha256", "size_bytes", "records"]
+    columns = ["relative_path", "file", "sha256", "size_bytes", "records"]
     manifest = TMP_ROOT / "manifest.csv"
 
     # 指标计算必须完全没被调用：manifest 不可信时不能先算再说
@@ -995,12 +996,35 @@ def test_auto_manifest_failclosed():
         assert good_status == "reached-metrics", good_status
 
         empty_sha = dict(good, sha256="")
-        ca.write_csv(manifest, columns, [empty_sha])
+        empty_sha_manifest = TMP_ROOT / "manifest-empty-sha.csv"
+        ca.write_csv(empty_sha_manifest, columns, [empty_sha])
 
         invalid_size = dict(good, size_bytes="")
         # 另一个 path 用来放这一份，避免和后一条互相覆盖
         size_manifest = TMP_ROOT / "manifest-bad-size.csv"
         ca.write_csv(size_manifest, columns, [invalid_size])
+
+        # file 列必须指向这一行真正描述的文件；空着或用 plan.json 都该拦在清单层
+        empty_file = dict(good, file="")
+        empty_file_manifest = TMP_ROOT / "manifest-empty-file.csv"
+        ca.write_csv(empty_file_manifest, columns, [empty_file])
+
+        wrong_file = dict(good, file="plan.json")
+        wrong_file_manifest = TMP_ROOT / "manifest-wrong-file.csv"
+        ca.write_csv(wrong_file_manifest, columns, [wrong_file])
+
+        # 路径列空着但同行 sha256/size 都有内容：这行无法定位到任何文件，不能当空行跳过
+        blank_path = dict(good, relative_path="")
+        blank_path_manifest = TMP_ROOT / "manifest-blank-path.csv"
+        ca.write_csv(blank_path_manifest, columns, [blank_path])
+
+        # 等价写法（./ 与反斜杠）规范化后必须仍然命中同一条，不能因为写法不同就判缺失
+        dotted = dict(good)
+        dotted["relative_path"] = (
+            "experiments\\graduation\\.\\runs\\" + run_name + "\\results.jsonl"
+        )
+        dotted_manifest = TMP_ROOT / "manifest-dotted.csv"
+        ca.write_csv(dotted_manifest, columns, [dotted])
 
         dup_manifest = TMP_ROOT / "manifest-dup.csv"
         ca.write_csv(dup_manifest, columns, [good, dict(good)])
@@ -1010,12 +1034,28 @@ def test_auto_manifest_failclosed():
 
         missing = TMP_ROOT / "no-such-manifest.csv"
         cases = [
-            ("空 sha256", manifest, "sha256 为空"),
+            ("空 sha256", empty_sha_manifest, "sha256 为空"),
             ("空 size_bytes", size_manifest, "size_bytes 为空"),
+            ("空 file", empty_file_manifest, "file 列为空"),
+            ("错误 file", wrong_file_manifest, "与路径不符"),
+            ("空 relative_path 但有内容", blank_path_manifest, "relative_path 为空"),
             ("重复条目", dup_manifest, "重复条目"),
             ("缺条目", empty_manifest, "manifest 未收录"),
             ("manifest 缺失", missing, "清单文件缺失"),
         ]
+
+        # 等价写法要先证明它真的能通过清单层（否则「规范化」只是空话）
+        ca.write_csv(manifest, columns, [dotted])
+        with _patched_manifest(manifest):
+            try:
+                ca.collect_scope("main", [run_name], runs_dir, None, config, {}, None, ())
+                dotted_status = "no-error"
+            except AssertionError:
+                dotted_status = "reached-metrics"
+            except ca.CheckError as error:
+                dotted_status = str(error)
+        check("T12 ./ 与反斜杠写法规范化后仍匹配同一条", dotted_status == "reached-metrics",
+              dotted_status)
 
         for label, manifest_path, fragment in cases:
             raised = None

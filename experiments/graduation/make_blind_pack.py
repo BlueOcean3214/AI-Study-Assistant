@@ -47,11 +47,21 @@ import posixpath
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+_GRADUATION_DIR_FOR_IMPORT = Path(__file__).resolve().parent
+if str(_GRADUATION_DIR_FOR_IMPORT) not in sys.path:
+    # 允许从仓库根 import 本模块（测试就是这样导入的），manifest_rules 是同级文件
+    sys.path.insert(0, str(_GRADUATION_DIR_FOR_IMPORT))
+
+import manifest_rules  # noqa: E402  （清单解析规则必须与 check_auto.py 共用）
+
+ManifestError = manifest_rules.ManifestError
 
 VERSION = "1.1.0"
 
@@ -819,17 +829,15 @@ def normalize_manifest_path(value: str) -> str:
 
     只 `strip("/")` 不够：`a\\b`、`a//b`、`./a/b`、`a/./b` 指向的是同一个文件，
     规范化不彻底就能用另一种写法绕过「同一路径重复出现」的检查，条目缺失也就重新可辩称。
+
+    规则本体在 `manifest_rules.normalize_relative_path()`：核查器 `check_auto.py`
+    使用同一份实现，否则同一份清单会得到两种「可信」结论。
     """
 
-    text = (value or "").strip().replace("\\", "/")
-    if not text:
-        return ""
-    normalized = posixpath.normpath(text)
-    if normalized in (".", "..") or normalized.startswith(("/", "../")):
-        raise PackError(
-            f"manifest 的 relative_path 不是仓库内相对路径，拒绝使用：{value!r}"
-        )
-    return normalized.strip("/")
+    try:
+        return manifest_rules.normalize_relative_path(value)
+    except ManifestError as exc:
+        raise PackError(str(exc)) from exc
 
 
 def manifest_hashes(path: Path | None = None) -> dict[str, dict]:
@@ -837,30 +845,17 @@ def manifest_hashes(path: Path | None = None) -> dict[str, dict]:
 
     键只能是 relative_path 本身。早先以 `(relative_path, file)` 为键，`file` 列被清空或
     写错时同一路径就查不到条目，B0 记录会被误判成「manifest 未收录」而走 legacy 放行；
-    现在路径存在即必须按条目校验，`file` 列的问题由 `verify_snapshot()` 单独判失败。
+    现在路径存在即必须按条目校验，`file` 列的问题由 `manifest_rules.load_manifest()`
+    在读取阶段就判失败（`file` 空、`file` 与路径不符、空路径但同行有内容、规范后重复）。
 
-    同一个 relative_path 出现两条记录时直接报错：字典会把前一条悄悄覆盖掉，
-    「后一条刚好合法」就能掩盖「清单被改过」这件事。
+    解析与失败规则全部由 `manifest_rules` 承担，与核查器共用同一份实现。
     """
 
     path = Path(path) if path else MANIFEST_PATH
-    table: dict[str, dict] = {}
-    if not path.is_file():
-        return table
-    seen: set[str] = set()
-    with path.open("r", encoding="utf-8", newline="") as handle:
-        for row in csv.DictReader(handle):
-            relative = normalize_manifest_path(row.get("relative_path") or "")
-            if not relative:
-                continue
-            if relative in seen:
-                raise PackError(
-                    f"manifest 中 {relative} 出现重复条目，拒绝静默覆盖："
-                    "请先确认哪一条才是被冻结的版本"
-                )
-            seen.add(relative)
-            table[relative] = row
-    return table
+    try:
+        return manifest_rules.load_manifest(path)
+    except ManifestError as exc:
+        raise PackError(str(exc)) from exc
 
 
 def _manifest_int(entry: dict, field: str, allow_zero: bool) -> tuple[int | None, str]:
@@ -952,13 +947,14 @@ def verify_snapshot(snapshot: dict[str, dict], manifest: dict) -> list[dict]:
             continue
         # 条目存在就说明该路径被 manifest 收录过，此时 `file` 列空掉或写错意味着清单本身不可信，
         # 必须判失败——不能因为按 (路径, file) 查不到就把 B0 记录当成「条目缺失」放行。
-        row["manifest_file"] = str(entry.get("file") or "").strip()
+        # `manifest_hashes()` 已在读取阶段拦下这类清单；这里再判一次，是因为本函数也可能
+        # 直接收到手工构造的条目表（测试与将来的调用方），留一层独立防线。
+        file_problem, _file_detail = manifest_rules.entry_file_problem(relative, entry, SOURCE_FILE)
+        row["manifest_file"] = str(entry.get(manifest_rules.FILE_COLUMN) or "").strip()
         row["expected"] = (entry.get("sha256") or "").strip().lower()
         problems = []
-        if not row["manifest_file"]:
-            problems.append("file_empty")
-        elif row["manifest_file"] != SOURCE_FILE:
-            problems.append("file")
+        if file_problem:
+            problems.append(file_problem)
         # 有清单条目就必须逐字段完整核对：空字段不是「没写就先放过」，
         # 而是「无法证明源文件没被改过」，一样要停下来。
         if not row["expected"]:
@@ -1439,6 +1435,130 @@ def _verify_archive_tree(root: Path, step: str = "归档复核") -> int:
     return len(entries)
 
 
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+def _is_link_like(path: Path) -> bool:
+    """路径本身是否是符号链接 / junction（含悬空链接）。不跟随最后一级。
+
+    Windows 上目录 junction 的 `lstat().st_mode` 不一定带 S_ISLNK，必须同时看
+    `st_file_attributes` 的 reparse point 位；只看 is_symlink() 会漏掉 junction，
+    归档目录就能被指到 Git 忽略范围之外，私有材料（mapping.csv 等）随之写出保护目录。
+    悬空链接也必须算：`lstat` 成功而 `exists()` 为 False，复制时会把材料写到它指向的位置。
+    """
+
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PackError(f"无法确认路径类型（拒绝继续）：{path}（{exc}）") from exc
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    attributes = getattr(info, "st_file_attributes", 0) or 0
+    return bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _verified_dir_inside(path: Path, parent_real: Path, label: str) -> Path:
+    """要求 path 是已存在、非链接、真实路径落在 parent_real 内的目录，返回真实路径。"""
+
+    if _is_link_like(path):
+        raise PackError(
+            f"{label} {path} 是符号链接/junction（或悬空链接），拒绝使用："
+            "真实写入位置可能落到 Git 忽略的私有目录之外；本次未写入或删除任何文件"
+        )
+    try:
+        real = path.resolve(strict=True)
+    except OSError as exc:
+        raise PackError(f"{label} 无法解析真实路径：{path}（{exc}）") from exc
+    if not real.is_dir():
+        raise PackError(f"{label} 不是目录：{real}")
+    if real == parent_real:
+        raise PackError(f"{label} 的真实路径与父目录相同，拒绝使用：{real}")
+    try:
+        real.relative_to(parent_real)
+    except ValueError as exc:
+        raise PackError(
+            f"{label} 的真实路径 {real} 不在 {parent_real} 内，拒绝写入"
+            "（私有材料只能落在盲评私有目录里）"
+        ) from exc
+    return real
+
+
+def ensure_archive_root(private_dir: Path) -> tuple[Path, Path]:
+    """在读写任何旧私有文件之前，确认归档目录真实落在私有目录内。
+
+    返回 (私有目录真实路径, 归档目录真实路径)。归档目录不存在就建一个普通目录，
+    但建之前也要先看它是不是悬空链接——否则 `mkdir(exist_ok=True)` 会顺着链接建到别处。
+    """
+
+    private_dir = Path(private_dir)
+    if _is_link_like(private_dir):
+        raise PackError(
+            f"私有目录本身是符号链接/junction（或悬空链接），拒绝归档：{private_dir}"
+        )
+    try:
+        private_real = private_dir.resolve(strict=True)
+    except OSError as exc:
+        raise PackError(f"私有目录无法解析真实路径：{private_dir}（{exc}）") from exc
+    if not private_real.is_dir():
+        raise PackError(f"私有目录不是目录：{private_real}")
+    archive_root = private_dir / ARCHIVE_DIRNAME
+    if _is_link_like(archive_root):
+        raise PackError(
+            f"归档目录 {archive_root} 是符号链接/junction（或悬空链接），拒绝归档："
+            "私有材料可能被写到 Git 忽略的私有目录之外；本次未写入或删除任何文件"
+        )
+    if not archive_root.exists():
+        try:
+            archive_root.mkdir()
+        except OSError as exc:
+            raise PackError(f"创建归档目录失败：{archive_root}（{exc}）") from exc
+    archive_real = _verified_dir_inside(archive_root, private_real, "归档目录")
+    return private_real, archive_real
+
+
+def _sane_child_path(path: Path, parent_real: Path, label: str) -> Path:
+    """归档目标 / staging 必须是已校验目录下的普通直接子路径，不能是链接。"""
+
+    path = Path(path)
+    if _is_link_like(path):
+        raise PackError(
+            f"{label} {path} 是符号链接/junction（或悬空链接），拒绝写入："
+            "本次未写入或删除任何文件"
+        )
+    try:
+        resolved = path.resolve(strict=False)
+    except OSError as exc:
+        raise PackError(f"{label} 无法解析真实路径：{path}（{exc}）") from exc
+    if resolved.parent != parent_real:
+        raise PackError(
+            f"{label} 的真实路径 {resolved} 不在已校验的归档目录 {parent_real} 下，拒绝写入"
+        )
+    return resolved
+
+
+def _require_sane_pack_dir(pack_dir: Path) -> None:
+    """活动包目录不能是普通文件，也不能是（悬空的）符号链接。
+
+    以前只在 `pack_dir.is_dir()` 为真时才枚举旧产物：把它换成一个普通文件或悬空链接，
+    旧产物检查与「必须成套替换」都会被跳过，新文件却照样写进去。这里要在写入任何
+    私有文件、删除任何目录之前就拒绝。
+    """
+
+    pack_dir = Path(pack_dir)
+    if _is_link_like(pack_dir):
+        raise PackError(
+            f"活动包目录 {pack_dir} 是符号链接/junction（或悬空链接），拒绝写入："
+            "本次未写入或删除任何文件；请人工确认后改用普通目录或不存在的路径重跑"
+        )
+    if pack_dir.exists() and not pack_dir.is_dir():
+        raise PackError(
+            f"活动包目录 {pack_dir} 已存在但不是目录（普通文件等），拒绝写入："
+            "本次未写入或删除任何文件；请人工确认或换 --pack-dir"
+        )
+
+
 def archive_previous_outputs(
     pack_dir: Path, private_dir: Path, generated_utc: str
 ) -> tuple[str, str, int]:
@@ -1452,21 +1572,34 @@ def archive_previous_outputs(
 
     pack_dir = Path(pack_dir)
     private_dir = Path(private_dir)
+    # 步骤 0：真实路径校验放在最前面——任何读取/复制旧私有文件之前就要确认活动包目录
+    # 与归档目录不是符号链接/junction，且归档目录真实落点仍在私有目录内。
+    _require_sane_pack_dir(pack_dir)
+    private_real, archive_real = ensure_archive_root(private_dir)
     # 步骤 1：先校验旧产物完整性；这里只读，任何失败都不会移动或删除任何旧文件
     evidence = verify_previous_outputs(pack_dir, private_dir)
     old_mapping = private_dir / "mapping.csv"
 
     stamp = generated_utc.replace(":", "").replace("-", "")
-    archive_root = private_dir / ARCHIVE_DIRNAME
-    target = archive_root / f"pack-{stamp}"
-    if target.exists():
+    target = _sane_child_path(archive_real / f"pack-{stamp}", archive_real, "归档目标")
+    if target.exists() or target.is_symlink():
         raise PackError(f"步骤 2/归档目标已存在，拒绝覆盖：{target}")
     # 先写到 staging，全部校验通过后再原子改名为正式的 pack-<stamp>/：
     # 复制中途失败只会留下可清理的 staging，不会出现“半个归档”占住归档名。
-    staging = archive_root / f".pack-{stamp}.staging"
+    staging = _sane_child_path(
+        archive_real / f".pack-{stamp}.staging", archive_real, "归档 staging"
+    )
+    if staging.is_symlink():
+        raise PackError(f"步骤 2/{staging} 是符号链接，拒绝写入，请人工确认后清理")
     if staging.exists():
         shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+    staging.mkdir()
+    staging_real = staging.resolve(strict=True)
+    if staging_real.parent != archive_real:
+        raise PackError(
+            f"步骤 2/staging {staging_real} 的真实父目录不是已校验的归档目录 "
+            f"{archive_real}，拒绝写入"
+        )
     old_mapping_sha = sha256_file(old_mapping)
 
     entries: list[tuple[str, str]] = []
@@ -1552,23 +1685,23 @@ def archive_previous_outputs(
         published = _verify_archive_tree(target, "步骤 6/发布后复核")
     except PackError as exc:
         raise PackError(
-            f"{exc}；归档目录 {target.relative_to(private_dir)} 已保留，"
+            f"{exc}；归档目录 {target.relative_to(private_real)} 已保留，"
             "活动包未被清理，请人工核对"
         ) from exc
     if published != len(entries):
         raise PackError(
             f"步骤 6/发布后归档文件数 {published} 与清单 {len(entries)} 不一致；"
-            f"归档目录 {target.relative_to(private_dir)} 已保留，活动包未被清理"
+            f"归档目录 {target.relative_to(private_real)} 已保留，活动包未被清理"
         )
 
     try:
         shutil.rmtree(pack_dir)
     except OSError as exc:
         raise PackError(
-            f"步骤 7/旧产物已完整归档到 {target.relative_to(private_dir)}，但清空活动包目录失败：{exc}；"
+            f"步骤 7/旧产物已完整归档到 {target.relative_to(private_real)}，但清空活动包目录失败：{exc}；"
             "请不要删除该归档，手动清理活动包后重试"
         ) from exc
-    return str(target.relative_to(private_dir)), old_mapping_sha, len(entries)
+    return str(target.relative_to(private_real)), old_mapping_sha, len(entries)
 
 
 def stale_output_paths(pack_dir: Path, private_dir: Path) -> list[Path]:
@@ -1581,6 +1714,8 @@ def stale_output_paths(pack_dir: Path, private_dir: Path) -> list[Path]:
 
     pack_dir = Path(pack_dir)
     private_dir = Path(private_dir)
+    # 先判类型：普通文件/悬空链接不是「空目录」，不能当成没有旧产物直接放行。
+    _require_sane_pack_dir(pack_dir)
     found: list[Path] = []
     for name in PRIVATE_FILES:
         path = private_dir / name
@@ -1614,10 +1749,30 @@ def ensure_no_stale_outputs(pack_dir: Path, private_dir: Path, repack: bool) -> 
 # --------------------------------------------------------------------------
 
 
+def _resolve_workdir(raw: Path, label: str) -> Path:
+    """先判类型、再解析真实路径。
+
+    顺序不能反：`Path.resolve()` 会把悬空的符号链接/junction 直接解析成它指向的（不存在的）
+    目标，链接身份随之消失，后续的 `lstat` 检查就再也看不到它是链接了——那样「先建个悬空
+    链接占住目录名」就能绕过全部写入保护。
+    """
+
+    if _is_link_like(raw):
+        raise PackError(
+            f"{label} {raw} 是符号链接/junction（或悬空链接），拒绝使用："
+            "本次未写入或删除任何文件；请人工确认后改用普通目录或不存在的路径重跑"
+        )
+    return raw.resolve()
+
+
 def run_pack(args) -> int:
     runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
-    private_dir = Path(args.private_dir).resolve() if args.private_dir else DEFAULT_PRIVATE_DIR
-    pack_dir = Path(args.pack_dir).resolve() if args.pack_dir else DEFAULT_PACK_DIR
+    private_dir = _resolve_workdir(
+        Path(args.private_dir) if args.private_dir else DEFAULT_PRIVATE_DIR, "私有目录"
+    )
+    pack_dir = _resolve_workdir(
+        Path(args.pack_dir) if args.pack_dir else DEFAULT_PACK_DIR, "活动包目录"
+    )
 
     config = load_blind_config(Path(args.config) if args.config else CONFIG_PATH)
     config_sha = sha256_file(Path(args.config) if args.config else CONFIG_PATH)

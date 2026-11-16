@@ -44,6 +44,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import build_prompts  # noqa: E402
+import manifest_rules  # noqa: E402
 import seed_fixture  # noqa: E402
 
 RESULTS_NAME = "results.jsonl"
@@ -223,25 +224,18 @@ def read_rows(run_dir):
 def manifest_hashes(path=None):
     """docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv → {relative_path: row}。
 
-    同一路径出现两条记录时直接抛 CheckError：用字典覆盖会让「后一条合法」悄悄顶掉
-    「前一条可疑」，manifest 就失去可信度。
+    解析规则与 make_blind_pack.py 共用 manifest_rules，避免两处口径不一致：
+    路径规范化、file 列必须指向该行真正描述的文件、同一路径重复、空路径行，
+    全部由同一套规则判定；任何一条不成立都直接抛 CheckError，不允许「静默跳过」。
     """
 
     path = Path(path) if path else MANIFEST_PATH
-    hashes = {}
     if not path.is_file():
-        return hashes
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        for row in csv.DictReader(handle):
-            relative = (row.get("relative_path") or "").strip().replace("\\", "/")
-            if relative:
-                if relative in hashes:
-                    raise CheckError(
-                        f"manifest 中 {relative} 出现重复条目，拒绝静默覆盖："
-                        "请先确认哪一条才是被冻结的版本"
-                    )
-                hashes[relative] = row
-    return hashes
+        return {}
+    try:
+        return manifest_rules.load_manifest(path)
+    except manifest_rules.ManifestError as exc:
+        raise CheckError(str(exc)) from exc
 
 
 def _manifest_number(entry, field):
@@ -276,6 +270,12 @@ def verify_manifest(run_name, run_dir, hashes, rows_count, manifest_path=None):
     actual_sha = sha256_file(results_path)
     actual_size = results_path.stat().st_size
     problems = []
+
+    # file 列必须描述这一条路径真正指向的文件；空着或写成 plan.json 都说明这行不可信，
+    # 不能只靠 sha256/size 通过就放行。
+    file_problem, file_detail = manifest_rules.entry_file_problem(key, entry, RESULTS_NAME)
+    if file_problem:
+        problems.append(file_detail)
 
     expected_sha = str(entry.get("sha256") or "").strip().lower()
     if not expected_sha:

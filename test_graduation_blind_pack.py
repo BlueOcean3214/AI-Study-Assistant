@@ -1184,6 +1184,35 @@ def test_t27_publish_failure_keeps_active_pack():
     print("  T27 PASS：发布后复核失败 → 归档与活动包都保留，并提示人工核对")
 
 
+def _make_dir_link(link: Path, target: Path) -> None:
+    """在临时仓库里造一个目录链接（junction / symlink 均可）。
+
+    优先用 os.symlink；Windows 未开启开发者模式时会失败，退回 `mklink /J`（junction
+    不需要管理员权限）。两种都失败就直接判失败——这类测试不能因为「造不出链接」就静默通过。
+    """
+
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError) as exc:
+        first_error = exc
+    done = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # 悬空目标时 link.exists() 必然为 False，所以只能看 mklink 的返回码；
+    # 真正的「是不是链接」由被测代码自己用 lstat 判断。
+    if done.returncode == 0:
+        return
+    raise AssertionError(
+        f"无法在临时目录创建目录链接（symlink: {first_error}; mklink: {done.stdout.strip()} "
+        f"{done.stderr.strip()}）——归档链接防护无法验证"
+    )
+
+
 def _tree_hashes(root: Path) -> dict[str, str]:
     if not root.exists():
         return {}
@@ -1315,21 +1344,61 @@ def test_t32_archive_dir_is_not_active_output():
 
 
 def test_t33_manifest_entry_presence_and_file_column():
-    """条目存在性只看规范化路径；条目在但 `file` 列空/错，B0 不得再走 legacy 放行。"""
+    """条目存在性只看规范化路径；`file` 列空/错必须在清单解析层就失败，B0 不得再走 legacy 放行。"""
 
     b0 = pack.B0_RUNS[0]
 
-    # 1) B0 条目真的不存在 → 白名单 legacy
+    # 1) B0 条目真的不存在 → 白名单 legacy（只有「真的没有这条记录」才允许）
     sb = _make_sandbox("t33-legacy")
     with _patched_paths(sb):
         snapshot = pack.snapshot_sources([b0], runs_dir=sb.runs_dir)
         report = pack.verify_snapshot(snapshot, {})
     assert [row["status"] for row in report] == ["legacy_no_manifest"], report
 
-    # 2) 条目在、但 file 或其余字段不可信 → 一律失败
+    # 2) `file` 列空/错：清单本身就不可信，load_manifest 阶段就抛，不会走到 verify_snapshot
+    file_cases = [
+        ("t33-file-empty", {"file": ""}, "file 列为空"),
+        ("t33-file-wrong", {"file": "plan.json"}, "与路径不符"),
+    ]
+    for name, patch, fragment in file_cases:
+        box = _make_sandbox(name)
+        rows = _manifest_rows(box)
+        _row_for(rows, b0).update(patch)
+        _write_manifest(box, rows)
+        with _patched_paths(box):
+            _expect_pack_error(lambda b=box: pack.manifest_hashes(b.manifest), fragment)
+        code, _, err = _main(box)
+        assert code == 2, (name, code, err)
+        assert fragment in err, (name, err)
+        assert "legacy" not in err, (name, err)
+        assert not box.pack_dir.exists(), name
+
+    # 3) 第二层防线：即使有人绕过清单解析、直接把 dict 交给 verify_snapshot，file 空/错仍判失败
+    box = _make_sandbox("t33-second-layer")
+    rows = _manifest_rows(box)
+    good_entry = dict(_row_for(rows, b0))
+    with _patched_paths(box):
+        snapshot = pack.snapshot_sources([b0], runs_dir=box.runs_dir)
+        for patch, fragment in (
+            ({"file": ""}, "file_empty"),
+            ({"file": "plan.json"}, "manifest_file"),
+        ):
+            entry = dict(good_entry, **patch)
+            _expect_pack_error(
+                lambda e=entry: pack.verify_snapshot(snapshot, {entry["relative_path"]: e}),
+                "与 manifest 不一致",
+                fragment,
+            )
+        wrong = dict(good_entry, file="plan.json")
+        text = _expect_pack_error(
+            lambda: pack.verify_snapshot(snapshot, {wrong["relative_path"]: wrong}),
+            "与 manifest 不一致",
+        )
+        assert "legacy" not in text, text
+        assert "manifest_file='plan.json'" in text, text
+
+    # 4) sha256 / size_bytes / records 仍由 verify_snapshot 判定（file 列此时是对的）
     cases = [
-        ("t33-file-empty", {"file": ""}, "file_empty"),
-        ("t33-file-wrong", {"file": "plan.json"}, "manifest_file"),
         ("t33-sha-wrong", {"sha256": "0" * 64}, "sha256"),
         ("t33-size-wrong", {"size_bytes": "1"}, "size_bytes"),
         ("t33-records-wrong", {"records": "1"}, "records"),
@@ -1348,10 +1417,8 @@ def test_t33_manifest_entry_presence_and_file_column():
                 fragment,
             )
         assert "legacy" not in text, (name, text)
-        if name.endswith("file-wrong"):
-            assert "manifest_file='plan.json'" in text, text
 
-    # 3) 非 B0 条目缺失 → manifest_missing（B0 才允许 legacy）
+    # 5) 非 B0 条目缺失 → manifest_missing（B0 才允许 legacy）
     box = _make_sandbox("t33-missing")
     rows = [
         row
@@ -1367,6 +1434,117 @@ def test_t33_manifest_entry_presence_and_file_column():
             pack.MAIN_RUN,
         )
     print("  T33 PASS：manifest 条目缺失与 file 列错误分开判定，B0 不再被误放行")
+
+
+def test_t35_blank_path_row_fails_both_tools():
+    """路径列空着但同行有内容：打包器与核查器都必须判整份清单不可信，不能当空行跳过。"""
+
+    import check_auto as ca  # noqa: PLC0415 - 只在一致性测试里需要
+
+    sb = _make_sandbox("t35-blank-path")
+    rows = _manifest_rows(sb)
+    blank = dict(_row_for(rows, pack.MAIN_RUN))
+    blank["relative_path"] = ""
+    rows.append(blank)
+    _write_manifest(sb, rows)
+
+    with _patched_paths(sb):
+        pack_text = _expect_pack_error(lambda: pack.manifest_hashes(sb.manifest), "relative_path 为空")
+        saved = ca.MANIFEST_PATH
+        ca.MANIFEST_PATH = sb.manifest
+        try:
+            check_text = None
+            try:
+                ca.manifest_hashes(sb.manifest)
+            except ca.CheckError as error:
+                check_text = str(error)
+        finally:
+            ca.MANIFEST_PATH = saved
+        assert check_text is not None, "核查器必须拒绝空路径行"
+        assert "relative_path 为空" in check_text, check_text
+
+    # 两个工具的结论必须一致：都拒绝，且都指出是空路径行
+    assert "清单不可信" in pack_text, pack_text
+    assert "清单不可信" in check_text, check_text
+    code, _, err = _main(sb)
+    assert code == 2, (code, err)
+    assert "relative_path 为空" in err, err
+    assert not sb.pack_dir.exists()
+    assert not sb.private_dir.exists(), "失败时不得写出任何私有文件"
+    print("  T35 PASS：空路径行在打包器与核查器两侧都 fail-closed，且未写任何产物")
+
+
+def test_t36_archive_symlink_never_escapes_private_dir():
+    """导出目录被换成链接时，归档必须拒绝，且旧私有文件逐字节不变。"""
+
+    # 1) archive/ 本身是指向仓库外的链接 → 复制前就拒绝
+    sb = _make_sandbox("t36-archive-link")
+    _build(sb)
+    sb.private_dir.mkdir(parents=True, exist_ok=True)
+    outside = TMP_ROOT / "t36-outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    archive = sb.private_dir / pack.ARCHIVE_DIRNAME
+    _make_dir_link(archive, outside)
+    before = _tree_hashes(sb.private_dir)
+    with _patched_paths(sb):
+        _expect_pack_error(
+            lambda: pack.ensure_archive_root(sb.private_dir),
+            "符号链接",
+            "拒绝",
+        )
+    assert _tree_hashes(sb.private_dir) == before, "拒绝时不得动任何旧文件"
+    assert not any(outside.iterdir()), "仓库外目录不得出现任何私有材料"
+
+    # 2) 归档目标名被预先做成链接（含指向仓库外）→ 拒绝覆盖，旧文件不动
+    sb2 = _make_sandbox("t36-target-link")
+    with _clock("2026-11-16T00:00:00Z"):
+        _build(sb2)
+        stamp = "20261116T000000Z"
+        archive2 = sb2.private_dir / pack.ARCHIVE_DIRNAME
+        archive2.mkdir(parents=True, exist_ok=True)
+        outer = TMP_ROOT / "t36-target-outside"
+        outer.mkdir(parents=True, exist_ok=True)
+        _make_dir_link(archive2 / f"pack-{stamp}", outer)
+        before2 = _tree_hashes(sb2.private_dir)
+        with _patched_paths(sb2):
+            _expect_pack_error(
+                lambda: pack.archive_previous_outputs(sb2.pack_dir, sb2.private_dir, "2026-11-16T00:00:00Z"),
+                "符号链接",
+            )
+        assert _tree_hashes(sb2.private_dir) == before2, "拒绝时不得改动旧归档与旧私有文件"
+        assert not any(outer.iterdir()), "仓库外目录不得出现任何归档内容"
+    print("  T36 PASS：归档目录/目标为链接时拒绝，旧文件指纹不变，仓库外目录保持空")
+
+
+def test_t37_pack_dir_type_checked_before_writing():
+    """pack_dir 是普通文件或悬空链接时，必须在写任何私有文件之前拒绝。"""
+
+    # 1) 普通文件占用 pack_dir
+    sb = _make_sandbox("t37-file")
+    sb.pack_dir.parent.mkdir(parents=True, exist_ok=True)
+    sb.pack_dir.write_text("not a dir\n", encoding="utf-8", newline="\n")
+    code, _, err = _main(sb)
+    assert code == 2, (code, err)
+    assert "不是目录" in err, err
+    assert sb.pack_dir.read_text(encoding="utf-8") == "not a dir\n", "占用文件不得被改写"
+    assert not sb.private_dir.exists(), "被拒绝时不得写私有文件"
+
+    # 2) 悬空链接占用 pack_dir
+    sb2 = _make_sandbox("t37-dangling")
+    sb2.pack_dir.parent.mkdir(parents=True, exist_ok=True)
+    _make_dir_link(sb2.pack_dir, TMP_ROOT / "t37-no-such-target")
+    code, _, err = _main(sb2)
+    assert code == 2, (code, err)
+    assert "符号链接" in err, err
+    assert not sb2.private_dir.exists(), "被拒绝时不得写私有文件"
+
+    # 3) 正常空目录仍然合法（不能把上面的规则误伤成「目录必须不存在」）
+    sb3 = _make_sandbox("t37-empty-dir")
+    sb3.pack_dir.mkdir(parents=True, exist_ok=True)
+    _build(sb3)
+    assert any(sb3.pack_dir.iterdir()), "空目录应能正常打包"
+    print("  T37 PASS：pack_dir 普通文件/悬空链接提前拒绝且无副作用，正常空目录不受影响")
+
 
 
 def test_t34_manifest_path_normalization_blocks_duplicates():
@@ -1435,6 +1613,9 @@ TESTS = [
     ("T32", test_t32_archive_dir_is_not_active_output),
     ("T33", test_t33_manifest_entry_presence_and_file_column),
     ("T34", test_t34_manifest_path_normalization_blocks_duplicates),
+    ("T35", test_t35_blank_path_row_fails_both_tools),
+    ("T36", test_t36_archive_symlink_never_escapes_private_dir),
+    ("T37", test_t37_pack_dir_type_checked_before_writing),
 ]
 
 
