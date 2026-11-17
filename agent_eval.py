@@ -245,6 +245,13 @@ def isolated_environment(case, isolate=True):
     # 每个用例开始前清空确认凭证：P5 在夹具内自行创建并确认自己的凭证
     confirmation_service.reset_confirmations()
 
+    # 退出时必须恢复"进入前的真实值"，不能硬编码成仓库默认路径：
+    # database.DATABASE_PATH / vector_cache.CACHE_DIR 都允许被 FEEDBACK_DB_PATH /
+    # RAG_CACHE_DIR 覆盖，写死成 PROJECT_DIR/feedback.db 会让隔离库被悄悄换回
+    # 真实开发库（前后不是同一个数据库）。
+    previous_database_path = database.DATABASE_PATH
+    previous_cache_dir = vector_cache.CACHE_DIR
+
     if isolate:
         # 不在用例之间删除数据库文件：sqlite 连接靠 GC 释放，
         # Windows 上立刻 unlink 会因文件仍被占用而失败。
@@ -261,8 +268,8 @@ def isolated_environment(case, isolate=True):
             yield
     finally:
         if isolate:
-            database.DATABASE_PATH = PROJECT_DIR / "feedback.db"
-            vector_cache.CACHE_DIR = PROJECT_DIR / ".rag_cache"
+            database.DATABASE_PATH = previous_database_path
+            vector_cache.CACHE_DIR = previous_cache_dir
             rag_service.reset_cache()
 
 
