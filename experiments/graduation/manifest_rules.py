@@ -30,6 +30,7 @@ from pathlib import Path
 
 RELATIVE_PATH_COLUMN = "relative_path"
 FILE_COLUMN = "file"
+REQUIRED_COLUMNS = (RELATIVE_PATH_COLUMN, FILE_COLUMN)
 
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _FORBIDDEN_CHARS = ("\r", "\n", "\x00")
@@ -52,6 +53,29 @@ def row_has_content(row) -> bool:
     return False
 
 
+def _reject_not_relative(text: str, original, when: str) -> None:
+    """`text` 必须是仓库内相对路径；盘符、绝对路径、`..` 上跳一律失败。
+
+    规范化前后各调用一次，`when` 用于说明是在哪一步发现的（便于定位原始写法）。
+    """
+
+    if _DRIVE_PREFIX.match(text):
+        raise ManifestError(
+            f"manifest 的 {RELATIVE_PATH_COLUMN} 不是仓库内相对路径（{when}带盘符），"
+            f"拒绝使用：{original!r}"
+        )
+    if text.startswith("/") or posixpath.isabs(text):
+        raise ManifestError(
+            f"manifest 的 {RELATIVE_PATH_COLUMN} 不是仓库内相对路径（{when}是绝对路径），"
+            f"拒绝使用：{original!r}"
+        )
+    if text in (".", "..") or text.startswith("../"):
+        raise ManifestError(
+            f"manifest 的 {RELATIVE_PATH_COLUMN} 不是仓库内相对路径（{when}仍指向仓库外），"
+            f"拒绝使用：{original!r}"
+        )
+
+
 def normalize_relative_path(value) -> str:
     """把 `relative_path` 规范化成唯一形式，作为条目存在性的主键。
 
@@ -68,19 +92,12 @@ def normalize_relative_path(value) -> str:
             raise ManifestError(
                 f"manifest 的 {RELATIVE_PATH_COLUMN} 含有控制字符，拒绝使用：{value!r}"
             )
-    if _DRIVE_PREFIX.match(text):
-        raise ManifestError(
-            f"manifest 的 {RELATIVE_PATH_COLUMN} 不是仓库内相对路径（带盘符），拒绝使用：{value!r}"
-        )
-    if text.startswith("/"):
-        raise ManifestError(
-            f"manifest 的 {RELATIVE_PATH_COLUMN} 不是仓库内相对路径（绝对路径），拒绝使用：{value!r}"
-        )
+    _reject_not_relative(text, value, "规范化前")
     normalized = posixpath.normpath(text)
-    if normalized in (".", "..") or normalized.startswith("../") or posixpath.isabs(normalized):
-        raise ManifestError(
-            f"manifest 的 {RELATIVE_PATH_COLUMN} 不是仓库内相对路径，拒绝使用：{value!r}"
-        )
+    # 规范化会把 `./C:/outside/results.jsonl`、`a/../C:/outside/results.jsonl` 变成
+    # `C:/outside/results.jsonl`：盘符在规范化之后才露出来，只在规范化前查一次就能绕过。
+    # 因此规范化后整组再查一遍（盘符 / 绝对路径 / `..` 上跳）。
+    _reject_not_relative(normalized, value, "规范化后")
     return normalized.strip("/")
 
 
@@ -106,6 +123,40 @@ def entry_file_problem(relative, entry, expected_file=None) -> tuple[str, str]:
     return "", raw
 
 
+def validate_header(fieldnames) -> None:
+    """表头必须自洽：含 `relative_path` 与 `file` 各一次，且不得有空列名或重复列名。
+
+    `csv.DictReader` 遇到重复列名**不报错**：同名列互相覆盖，字典里只留最后一列的值，
+    读出来的行看起来完全正常。清单若带着重复的 `relative_path`/`file`，
+    「哪一列才是被冻结的版本」在读取阶段就已经丢失，所以必须在迭代任何数据行之前拒绝。
+    """
+
+    names = ["" if name is None else str(name) for name in (fieldnames or [])]
+    if not names:
+        raise ManifestError(
+            "manifest 缺少表头（文件为空或第一行为空行），拒绝使用：无法确认清单包含哪些列"
+        )
+    blank = [str(index + 1) for index, name in enumerate(names) if not name.strip()]
+    if blank:
+        raise ManifestError(f"manifest 表头第 {'、'.join(blank)} 列为空列名，清单不可信")
+    duplicates = []
+    seen = set()
+    for name in names:
+        if name in seen and name not in duplicates:
+            duplicates.append(name)
+        seen.add(name)
+    if duplicates:
+        raise ManifestError(
+            f"manifest 表头出现重复列名：{'、'.join(duplicates)}，拒绝使用"
+            "（同名列会被 csv 静默覆盖，读到的值不可信）"
+        )
+    missing = [column for column in REQUIRED_COLUMNS if column not in names]
+    if missing:
+        raise ManifestError(
+            f"manifest 表头缺少必需列：{'、'.join(missing)}（实际表头：{'、'.join(names)}）"
+        )
+
+
 def load_manifest(path) -> dict[str, dict]:
     """读取 manifest → {规范化 relative_path: row}；不可信时整份抛错，不返回半份表。
 
@@ -119,6 +170,9 @@ def load_manifest(path) -> dict[str, dict]:
     first_lines: dict[str, int] = {}
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
+        # 读取表头就校验：空文件、无表头、缺列、重复列都在解析第一行数据之前失败，
+        # 不让 DictReader 把重复列悄悄合并成一行看似正常的数据。
+        validate_header(reader.fieldnames)
         for row in reader:
             # DictReader.line_num 是最近一次读取的行号；行号从 2 开始（第 1 行是表头）
             line_no = reader.line_num

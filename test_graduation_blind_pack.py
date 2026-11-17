@@ -1578,6 +1578,156 @@ def test_t34_manifest_path_normalization_blocks_duplicates():
     print("  T34 PASS：反斜杠与重复分隔符写法规范化后判重复，无法绕过清单检查")
 
 
+def _both_manifest_errors(manifest_path: Path, *fragments) -> tuple[str, str]:
+    """同一份清单：打包器与核查器都必须拒绝，且都点出同一处问题。"""
+
+    import check_auto as ca  # noqa: PLC0415 - 只在一致性测试里需要
+
+    pack_text = _expect_pack_error(lambda: pack.manifest_hashes(manifest_path), *fragments)
+    saved = ca.MANIFEST_PATH
+    ca.MANIFEST_PATH = manifest_path
+    try:
+        try:
+            ca.manifest_hashes(manifest_path)
+        except ca.CheckError as error:
+            check_text = str(error)
+        else:
+            raise AssertionError(f"核查器必须拒绝该清单（期望包含 {fragments}），实际成功")
+    finally:
+        ca.MANIFEST_PATH = saved
+    for fragment in fragments:
+        assert fragment in check_text, f"核查器错误信息缺 {fragment!r}：{check_text}"
+    # 两侧都只是把同一份 ManifestError 原样包成自己的异常类型：文案必须逐字一致
+    assert pack_text == check_text, (pack_text, check_text)
+    return pack_text, check_text
+
+
+def test_t38_manifest_drive_letter_survives_normalization():
+    """`./C:/...`、`a/../C:/...` 规范化后才露出盘符：必须整组复查后仍拒绝。"""
+
+    # 1) 正常仓库内相对路径（含 `./` 与可消解的 `..`）必须继续合法
+    for value, expected in [
+        ("./experiments/graduation/runs/a.jsonl", "experiments/graduation/runs/a.jsonl"),
+        ("experiments/../experiments/runs/a.jsonl", "experiments/runs/a.jsonl"),
+        ("experiments\\graduation\\runs\\a.jsonl", "experiments/graduation/runs/a.jsonl"),
+    ]:
+        assert pack.normalize_manifest_path(value) == expected, value
+
+    # 2) 规范化后仍是盘符 / 绝对路径 / 仓库外上跳 → 一律拒绝
+    bad = [
+        "./C:/outside/results.jsonl",                      # 规范化前没有盘符
+        "a/../C:/outside/results.jsonl",                   # 上跳 + 盘符
+        ".\\C:\\outside\\results.jsonl",                    # 反斜杠写法
+        "experiments/../../C:/outside/results.jsonl",      # 规范化后是 ../C:/...
+        "C:relative.jsonl",                                # Windows 盘符相对路径
+        "//server/share/results.jsonl",                    # UNC 绝对路径
+        "/abs/path.jsonl",
+        "a/../..",                                         # 规范化成 ..
+    ]
+    for value in bad:
+        _expect_pack_error(
+            lambda v=value: pack.normalize_manifest_path(v), "不是仓库内相对路径"
+        )
+
+    # 3) 清单里写这种路径 → 整份清单不可信，两侧工具一致，且不写出任何产物
+    sb = _make_sandbox("t38-drive")
+    rows = _manifest_rows(sb)
+    rows[0]["relative_path"] = "./C:/outside/results.jsonl"
+    _write_manifest(sb, rows)
+    pack_text, check_text = _both_manifest_errors(sb.manifest, "不是仓库内相对路径")
+    assert "盘符" in pack_text, pack_text
+    code, _, err = _main(sb)
+    assert code == 2 and "不是仓库内相对路径" in err, (code, err)
+    assert not sb.pack_dir.exists(), "被拒绝时不得写出盲评包"
+    assert not sb.private_dir.exists(), "被拒绝时不得写出私有文件"
+    print("  T38 PASS：盘符在规范化后才出现的路径两侧都拒绝，正常路径不受影响")
+
+
+def test_t39_manifest_header_is_validated_before_rows():
+    """重复列名、缺必需列、空文件都必须在读数据行之前拒绝；纯表头空清单仍合法。"""
+
+    sb = _make_sandbox("t39-header")
+    rows = _manifest_rows(sb)
+    base = {column: rows[0].get(column, "") for column in MANIFEST_COLUMNS}
+
+    def render(columns, with_row=True):
+        buffer = io.StringIO()
+        writer = csv.writer(buffer, lineterminator="\n")
+        writer.writerow(columns)
+        if with_row:
+            writer.writerow([base.get(column, "") for column in columns])
+        return buffer.getvalue()
+
+    cases = [
+        ("空文件", "", "缺少表头"),
+        ("只有一个空行", "\n", "缺少表头"),
+        (
+            "重复 relative_path 列",
+            render(
+                [
+                    "batch",
+                    "batch_desc",
+                    "relative_path",
+                    "file",
+                    "relative_path",
+                    "size_bytes",
+                    "sha256",
+                    "records",
+                ]
+            ),
+            "重复列名",
+        ),
+        (
+            "重复 file 列",
+            render(
+                [
+                    "batch",
+                    "batch_desc",
+                    "relative_path",
+                    "file",
+                    "size_bytes",
+                    "sha256",
+                    "records",
+                    "file",
+                ]
+            ),
+            "重复列名",
+        ),
+        (
+            "缺 file 列",
+            render(["batch", "batch_desc", "relative_path", "size_bytes", "sha256", "records"]),
+            "缺少必需列",
+        ),
+        (
+            "缺 relative_path 列",
+            render(["batch", "batch_desc", "file", "size_bytes", "sha256", "records"]),
+            "缺少必需列",
+        ),
+        (
+            "空列名",
+            render(["batch", "", "relative_path", "file", "size_bytes", "sha256", "records"]),
+            "空列名",
+        ),
+    ]
+    for name, text, fragment in cases:
+        sb.manifest.write_text(text, encoding="utf-8", newline="\n")
+        pack_text, check_text = _both_manifest_errors(sb.manifest, fragment)
+        assert pack_text, name
+        code, _, err = _main(sb)
+        assert code == 2 and fragment in err, (name, code, err)
+        assert not sb.pack_dir.exists(), name
+        assert not sb.private_dir.exists(), name
+
+    # 只有表头、没有数据行：空清单是「没有条目」，不是「清单不可信」，必须继续合法
+    sb.manifest.write_text(render(MANIFEST_COLUMNS, with_row=False), encoding="utf-8", newline="\n")
+    with _patched_paths(sb):
+        assert pack.manifest_hashes(sb.manifest) == {}
+        import check_auto as ca  # noqa: PLC0415
+
+        assert ca.manifest_hashes(sb.manifest) == {}
+    print("  T39 PASS：表头重复/缺列/空文件两侧都 fail-closed，纯表头空清单仍合法")
+
+
 TESTS = [
     ("T1", test_t1_private_outside_repo),
     ("T2", test_t2_pack_equals_private),
@@ -1616,6 +1766,8 @@ TESTS = [
     ("T35", test_t35_blank_path_row_fails_both_tools),
     ("T36", test_t36_archive_symlink_never_escapes_private_dir),
     ("T37", test_t37_pack_dir_type_checked_before_writing),
+    ("T38", test_t38_manifest_drive_letter_survives_normalization),
+    ("T39", test_t39_manifest_header_is_validated_before_rows),
 ]
 
 
