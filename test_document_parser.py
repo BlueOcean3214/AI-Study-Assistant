@@ -6,13 +6,19 @@
 
 覆盖：
 1. TXT：解析结果、document_id / document_hash、chunk_id 可复现
-2. PDF：物理页码、印刷页码、跨页片段来源范围
-3. DOCX：标题路径、段落序号、表格行、不虚构页码
-4. 解析失败：不支持的格式、空文件、编码错误、坏 PDF、无文本层、坏 DOCX
-5. 上传落盘：PDF / DOCX 走 bytes 校验，坏文件不写盘，chunk_file 统计切片数
-6. 检索层元数据：默认返回仍是 {content, source, score}，with_metadata=True 才透出
+2. 文档身份：路径命名空间防碰撞、"#" 分隔符安全编码
+3. PDF：物理页码、印刷页码、跨页片段来源范围、整页文本真实字符偏移
+4. 混合型 PDF：部分页没有文本层时记 partial 并列出缺页，不静默成功
+5. DOCX：标题路径、段落序号、表格行、不虚构页码、块内偏移口径
+6. 解析失败：不支持的格式、空文件、编码错误、坏 PDF、无文本层、坏 DOCX
+7. 上传落盘：PDF / DOCX 走 bytes 校验，坏文件不写盘，chunk_file 统计切片数
+8. 检索层元数据：默认返回仍是 {content, source, score}，with_metadata=True 才透出；
+   Hybrid 富记录按 chunk_id 去重时，不同目录的同名同内容文件都保留
 """
 
+import hashlib
+import io
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -123,6 +129,19 @@ def build_blank_pdf():
     return buffer.getvalue()
 
 
+def extract_page_texts(raw):
+    """按 pypdf 默认抽取方式取每页规范化文本，用来核对 source_spans 偏移。"""
+
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(raw))
+
+    return [
+        (page.extract_text() or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        for page in reader.pages
+    ]
+
+
 def build_docx():
     """标题 + 正文 + 表格的 DOCX bytes。"""
 
@@ -172,10 +191,12 @@ try:
     check("TXT 识别为 txt", parsed.file_type == "txt", parsed.file_type)
     check("TXT 记录原始 SHA256", len(parsed.document_hash) == 64, parsed.document_hash[:12])
     check(
-        "TXT document_id 由文件名与哈希前缀构成",
-        parsed.document_id == f"notes-{parsed.document_hash[:8]}",
+        "TXT document_id 含规范化路径摘要与哈希前缀",
+        parsed.document_id
+        == f"notes-{hashlib.sha256(b'notes.txt').hexdigest()[:8]}-{parsed.document_hash[:8]}",
         parsed.document_id,
     )
+    check("TXT document_id 不含 # 分隔符", "#" not in parsed.document_id, parsed.document_id)
     check("TXT 解析版本号写入", parsed.parser_version == document_parser.PARSER_VERSION)
 
     txt_blocks = [block for block in parsed.blocks if block.text.strip()]
@@ -229,6 +250,34 @@ try:
     check("同定位同内容的多片 chunk_id 仍互不相同",
           len(duplicate_ids) == len(set(duplicate_ids)), duplicate_ids)
 
+    # ------------------------------------------- 1.1 文档身份：路径命名空间
+
+    same_bytes = "同名同内容的文档。\n".encode("utf-8")
+    id_dir_a = document_parser.parse_bytes(same_bytes, "甲/讲义.txt").document_id
+    id_dir_b = document_parser.parse_bytes(same_bytes, "乙/讲义.txt").document_id
+    check("不同目录同名同内容 document_id 不同", id_dir_a != id_dir_b,
+          f"{id_dir_a} / {id_dir_b}")
+    check("不同目录同名同内容 document_hash 相同",
+          document_parser.parse_bytes(same_bytes, "甲/讲义.txt").document_hash
+          == document_parser.parse_bytes(same_bytes, "乙/讲义.txt").document_hash)
+
+    id_dir_a2 = document_parser.parse_bytes(same_bytes, "甲\\讲义.txt").document_id
+    id_dir_a3 = document_parser.parse_bytes(same_bytes, "./甲//讲义.txt").document_id
+    check("同一路径的不同写法规范化后 document_id 稳定",
+          id_dir_a == id_dir_a2 == id_dir_a3, f"{id_dir_a} / {id_dir_a2} / {id_dir_a3}")
+
+    weird_name = "a#b%23#c.txt"
+    weird_parsed = document_parser.parse_bytes(b"sharp in name.\n", weird_name)
+    weird_chunks = document_parser_chunks(weird_parsed)
+    check("文件名含 # 时 document_id 仍然安全（不含 #）",
+          "#" not in weird_parsed.document_id, weird_parsed.document_id)
+    check("文件名含 # 时 chunk_id 仍恰好三段",
+          all(len(chunk.chunk_id.split("#")) == 3 for chunk in weird_chunks),
+          [chunk.chunk_id for chunk in weird_chunks])
+    check("文件名含 # 时 chunk_id 前缀就是 document_id",
+          all(chunk.chunk_id.split("#")[0] == weird_parsed.document_id
+              for chunk in weird_chunks))
+
     # ------------------------------------------------------------ 2. PDF
 
     pdf_raw = build_pdf([
@@ -270,6 +319,78 @@ try:
     check("PDF 两次解析 chunk_id 一致",
           [chunk.chunk_id for chunk in pdf_chunks] == [chunk.chunk_id for chunk in pdf_chunks_again])
 
+    # ---------------------------------------- 2.1 PDF 真实字符偏移（P2）
+
+    pdf_page_texts = extract_page_texts(pdf_raw)
+    check("PDF 页文本按页取到两页", len(pdf_page_texts) == 2, len(pdf_page_texts))
+
+    if cross_page:
+        spans = cross_page[0].source_spans
+        span_ok = True
+        detail = []
+        for span in spans:
+            if span["page_number"] is None:
+                continue
+            page_index = span["page_number"] - 1
+            block = pdf_parsed.blocks[span["block_index"]]
+            raw_slice = pdf_page_texts[page_index][span["char_start"]:span["char_end"]]
+            detail.append((span["page_number"], span["char_start"], span["char_end"], raw_slice))
+            span_ok = span_ok and raw_slice == block.text
+        check("跨页片段每个 span 用该页页文本能取回对应块", span_ok, detail)
+        check("跨页片段各 span 页码与块页码一致",
+              all(pdf_parsed.blocks[span["block_index"]].page_number == span["page_number"]
+                  for span in spans if span["page_number"] is not None))
+
+    # 单页多段：后续段落的 char_start 必须有真实偏移
+    multi_raw = build_pdf([("第一段：导数的定义。\n第二段：极限的定义。\n第三段：连续的定义。", "- 1 -")])
+    multi_parsed = document_parser.parse_bytes(multi_raw, "多段.pdf")
+    multi_page_text = extract_page_texts(multi_raw)[0]
+    multi_blocks = [block for block in multi_parsed.blocks if block.page_number == 1]
+    check("PDF 单页被切成多个块", len(multi_blocks) >= 3,
+          [block.text for block in multi_blocks])
+    check("PDF 第二段及以后 char_start 不再为 0",
+          all(block.char_start > 0 for block in multi_blocks[1:]),
+          [block.char_start for block in multi_blocks])
+    check("PDF 每个块都能用整页文本切片取回原文",
+          all(multi_page_text[block.char_start:block.char_end] == block.text
+              for block in multi_blocks),
+          [(block.char_start, block.char_end, block.text) for block in multi_blocks])
+    check("PDF 块偏移不重叠且递增",
+          all(multi_blocks[index].char_end <= multi_blocks[index + 1].char_start
+              for index in range(len(multi_blocks) - 1)),
+          [(block.char_start, block.char_end) for block in multi_blocks])
+
+    # 空行分段时同样保留真实偏移（含前导空白）
+    blank_pieces = document_parser._page_pieces("第一段\n\n  第二段  ")
+    check("空行分段保留真实字符偏移", blank_pieces == [("第一段", 0, 3), ("第二段", 7, 10)],
+          blank_pieces)
+    check("空行分段的偏移与页文本切片一致",
+          all("第一段\n\n  第二段  ".strip()[start:end] == text
+              for text, start, end in blank_pieces))
+
+    # ---------------------------------------- 2.2 混合型 PDF 记部分解析
+
+    mixed_raw = build_pdf([
+        ("第一页有文本。", "- 1 -"),
+        ("", ""),
+        ("第三页有文本。", "- 3 -"),
+    ])
+    mixed_parsed = document_parser.parse_bytes(mixed_raw, "混合.pdf")
+    check("混合型 PDF 总页数与有文本页数正确",
+          (mixed_parsed.pages_total, mixed_parsed.pages_with_text) == (3, 2),
+          (mixed_parsed.pages_total, mixed_parsed.pages_with_text))
+    check("混合型 PDF 列出缺文本页", list(mixed_parsed.missing_pages) == [2],
+          mixed_parsed.missing_pages)
+    check("混合型 PDF 标记为 partial", mixed_parsed.status == document_parser.STATUS_PARTIAL,
+          mixed_parsed.status)
+    check("混合型 PDF 仍产出有文本页的块",
+          {block.page_number for block in mixed_parsed.blocks} == {1, 3},
+          sorted({block.page_number for block in mixed_parsed.blocks}))
+    check("完整 PDF 的 status 仍是 ok", pdf_parsed.status == document_parser.STATUS_OK,
+          pdf_parsed.status)
+    check("完整 PDF 没有缺页", list(pdf_parsed.missing_pages) == [],
+          pdf_parsed.missing_pages)
+
     # ------------------------------------------------------------ 3. DOCX
 
     docx_raw = build_docx()
@@ -295,6 +416,16 @@ try:
     table_chunks = [chunk for chunk in docx_chunks if " | " in chunk.content]
     check("DOCX 表格行保留结构", len(table_chunks) >= 1,
           table_chunks[0].content if table_chunks else "无表格片段")
+    check("DOCX 偏移以块自身文本为基准（段落级 / 表格行级）",
+          all(block.char_start == 0 and block.char_end == len(block.text)
+              for block in docx_parsed.blocks),
+          [(block.char_start, block.char_end, len(block.text)) for block in docx_parsed.blocks])
+    check("DOCX 表格块的偏移覆盖含分隔符的行文本",
+          all(block.text[block.char_start:block.char_end] == block.text
+              for block in docx_parsed.blocks if block.kind == "table_row"))
+    check("DOCX 块坐标只服务块内定位，不出现在跨块合并里",
+          all(span["char_start"] >= 0 and span["char_end"] >= span["char_start"]
+              for chunk in docx_chunks for span in chunk.source_spans))
 
     # ------------------------------------------------------------ 4. 解析失败
 
@@ -428,6 +559,32 @@ try:
           bad_scan["issues"])
     check("扫描件不产出任何切片", bad_scan["chunk_count"] == 0, bad_scan["chunk_count"])
 
+    # 混合型 PDF 在扫描清单里必须是 partial + warning，而不是笼统的 ok
+    mixed_dir = workdir / "knowledge_mixed"
+    mixed_dir.mkdir()
+    (mixed_dir / "混合.pdf").write_bytes(mixed_raw)
+
+    mixed_scan = document_service.scan_knowledge(mixed_dir)
+    mixed_entry = mixed_scan["documents"][0]
+    check("scan_knowledge 不把混合型 PDF 报成 ok",
+          mixed_entry["status"] == "partial", mixed_entry["status"])
+    check("scan_knowledge 记录混合型 PDF 的缺页",
+          list(mixed_entry["missing_pages"]) == [2]
+          and (mixed_entry["pages_total"], mixed_entry["pages_with_text"]) == (3, 2),
+          (mixed_entry["pages_total"], mixed_entry["pages_with_text"],
+           mixed_entry["missing_pages"]))
+    check("scan_knowledge 为缺文本页给出 warning",
+          len(mixed_scan["warnings"]) == 1
+          and mixed_scan["warnings"][0]["source_name"] == "混合.pdf"
+          and mixed_scan["warnings"][0]["warning_code"] == "missing_pages"
+          and list(mixed_scan["warnings"][0]["page_numbers"]) == [2],
+          mixed_scan["warnings"])
+    check("partial 文档不算解析失败（不进 issues）",
+          mixed_scan["issues"] == [], mixed_scan["issues"])
+    check("partial 文档仍产出切片",
+          mixed_scan["chunk_count"] >= 1 and mixed_entry["chunk_count"] >= 1,
+          (mixed_scan["chunk_count"], mixed_entry["chunk_count"]))
+
     # ------------------------------------------------------------ 6. 检索层元数据
 
     original_load_chunks = rag_service.load_chunks
@@ -468,6 +625,78 @@ try:
         rag_service.load_chunks = original_load_chunks
         rag_service._vector_ranked = original_vector_ranked
         rag_service._log_retrieval_metrics = original_log_metrics
+
+    # ------------------------------- 6.1 跨目录同名同内容：来源不被合并（P1）
+
+    collision_dir = workdir / "knowledge_collision"
+    (collision_dir / "甲").mkdir(parents=True)
+    (collision_dir / "乙").mkdir()
+    (collision_dir / "甲" / "讲义.pdf").write_bytes(pdf_raw)
+    (collision_dir / "乙" / "讲义.pdf").write_bytes(pdf_raw)
+
+    collision_records = document_service.load_chunk_records(collision_dir)
+    collision_docs = {}
+    for record in collision_records:
+        collision_docs.setdefault(record["source"], set()).add(record["document_id"])
+
+    check("跨目录两份同名同内容 PDF 都被扫描到",
+          set(collision_docs) == {"甲/讲义.pdf", "乙/讲义.pdf"}, sorted(collision_docs))
+    check("跨目录同名同内容 document_id 不同",
+          len({next(iter(ids)) for ids in collision_docs.values()}) == 2, collision_docs)
+    check("跨目录两份文档内容哈希相同（旧实现会碰撞）",
+          len({record["document_hash"] for record in collision_records}) == 1,
+          {record["document_hash"] for record in collision_records})
+
+    ids_a = {record["chunk_id"] for record in collision_records
+             if record["source"] == "甲/讲义.pdf"}
+    ids_b = {record["chunk_id"] for record in collision_records
+             if record["source"] == "乙/讲义.pdf"}
+    check("跨目录同名同内容的 chunk_id 互不相同", ids_a.isdisjoint(ids_b),
+          sorted(ids_a & ids_b))
+    check("跨目录同一路径重复解析 chunk_id 稳定",
+          {record["chunk_id"] for record in document_service.load_chunk_records(collision_dir)}
+          == {record["chunk_id"] for record in collision_records})
+
+    original_load_chunks = rag_service.load_chunks
+    original_vector_scored = rag_service._vector_scored
+    original_bm25_ranked = rag_service._bm25_ranked
+    original_log_metrics = rag_service._log_retrieval_metrics
+    original_mode = os.environ.get("RAG_RETRIEVAL_MODE")
+
+    try:
+        rag_service.load_chunks = lambda *args, **kwargs: (
+            document_service.load_chunk_records(collision_dir)
+            if kwargs.get("with_metadata")
+            else document_service.load_chunks(collision_dir)
+        )
+        rag_service._vector_scored = lambda query, chunks: [(chunk, 0.9) for chunk in chunks]
+        rag_service._bm25_ranked = lambda query, chunks, limit: [
+            (chunk, 1.0) for chunk in chunks[:limit]
+        ]
+        rag_service._log_retrieval_metrics = lambda *args, **kwargs: None
+        os.environ["RAG_RETRIEVAL_MODE"] = "hybrid"
+
+        hybrid = rag_service.retrieve_chunks("定义", top_k=10, with_metadata=True)
+        hybrid_sources = {result["source"] for result in hybrid}
+        hybrid_ids = [result["chunk_id"] for result in hybrid]
+
+        check("Hybrid 富记录不把两个来源合并成一条",
+              hybrid_sources == {"甲/讲义.pdf", "乙/讲义.pdf"}, sorted(hybrid_sources))
+        check("Hybrid 结果份数等于两文档全部切片且 chunk_id 不重复",
+              len(hybrid) == len(collision_records) and len(hybrid_ids) == len(set(hybrid_ids)),
+              f"{len(hybrid)} vs {len(collision_records)}")
+        check("Hybrid 每条结果都带各自 document_id",
+              len({result["document_id"] for result in hybrid}) == 2,
+              [result["document_id"] for result in hybrid])
+    finally:
+        rag_service.load_chunks = original_load_chunks
+        rag_service._vector_scored = original_vector_scored
+        rag_service._bm25_ranked = original_bm25_ranked
+        rag_service._log_retrieval_metrics = original_log_metrics
+        if original_mode is None:
+            os.environ.pop("RAG_RETRIEVAL_MODE", None)
+        else:
+            os.environ["RAG_RETRIEVAL_MODE"] = original_mode
 
 finally:
     shutil.rmtree(workdir, ignore_errors=True)

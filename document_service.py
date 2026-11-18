@@ -25,6 +25,7 @@ from pathlib import Path
 from document_chunker import CHUNKER_VERSION, chunk_document
 from document_parser import (
     PARSER_VERSION,
+    STATUS_PARTIAL,
     ParseError,
     SUPPORTED_SUFFIXES,
     parse_bytes,
@@ -335,17 +336,25 @@ def chunk_file(source, directory=None):
 def scan_knowledge(directory=None):
     """扫描知识库，返回文档清单、切片数与结构化问题清单。
 
-    返回 {"documents": [...], "issues": [...], "chunk_count": int}：
+    返回 {"documents": [...], "issues": [...], "warnings": [...], "chunk_count": int}：
         documents 覆盖扫描到的每个文件（含解析失败的），每条含
             source / source_name / file_type / status / document_id / document_hash /
-            chunk_count / bytes / error_code / error_message / parser_version / chunker_version
+            chunk_count / bytes / error_code / error_message / parser_version /
+            chunker_version / pages_total / pages_with_text / missing_pages
+            status: ok = 完整解析；partial = 部分页没有文本层（PDF 混合型）；
+                    failed / no_text_layer / empty / skipped_* = 解析失败或跳过
         issues 只保留解析失败的文件（source_name / error_code / error_message / file_type），
             方便调用方单独报警；两者不重复叙事，status 一律以此为准。
+        warnings 记录“解析出来了但不完整”的情况（目前只有 PDF 缺文本页），
+            每条含 source_name / warning_code / page_numbers / message；
+            partial 文档一定会同时出现在 documents（status=partial）和 warnings 里，
+            不允许把缺页静默忽略后仍报告完整解析成功。
     """
 
     root = Path(directory) if directory is not None else KNOWLEDGE_PATH
     documents = []
     issues = []
+    warnings = []
     chunk_count = 0
 
     for parsed, issue in _iter_parsed(root):
@@ -367,6 +376,9 @@ def scan_knowledge(directory=None):
                     "error_message": issue.get("error_message"),
                     "parser_version": PARSER_VERSION,
                     "chunker_version": CHUNKER_VERSION,
+                    "pages_total": None,
+                    "pages_with_text": None,
+                    "missing_pages": [],
                 }
             )
             continue
@@ -375,12 +387,28 @@ def scan_knowledge(directory=None):
         chunks = chunk_document(parsed, CHUNK_MAX_CHARS, txt_splitter)
         file = root / parsed.source_name
         chunk_count += len(chunks)
+
+        if parsed.status == STATUS_PARTIAL:
+            warnings.append(
+                {
+                    "source_name": parsed.source_name,
+                    "warning_code": "missing_pages",
+                    "page_numbers": list(parsed.missing_pages),
+                    "message": (
+                        f"PDF 共 {parsed.pages_total} 页，其中 "
+                        f"{len(parsed.missing_pages)} 页没有可提取的文本层"
+                        f"（第 {', '.join(str(page) for page in parsed.missing_pages)} 页），"
+                        "本阶段不做 OCR"
+                    ),
+                }
+            )
+
         documents.append(
             {
                 "source": parsed.source_name,
                 "source_name": parsed.source_name,
                 "file_type": parsed.file_type,
-                "status": "ok",
+                "status": parsed.status,
                 "document_id": parsed.document_id,
                 "document_hash": parsed.document_hash,
                 "chunk_count": len(chunks),
@@ -389,10 +417,18 @@ def scan_knowledge(directory=None):
                 "error_message": None,
                 "parser_version": parsed.parser_version,
                 "chunker_version": CHUNKER_VERSION,
+                "pages_total": parsed.pages_total,
+                "pages_with_text": parsed.pages_with_text,
+                "missing_pages": list(parsed.missing_pages),
             }
         )
 
-    return {"documents": documents, "issues": issues, "chunk_count": chunk_count}
+    return {
+        "documents": documents,
+        "issues": issues,
+        "warnings": warnings,
+        "chunk_count": chunk_count,
+    }
 
 
 def save_document(filename, content, directory=None, overwrite=False):

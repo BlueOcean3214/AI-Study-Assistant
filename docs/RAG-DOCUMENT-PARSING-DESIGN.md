@@ -1,6 +1,6 @@
 # S1 文档解析与来源定位设计说明
 
-> 版本：v1.1（2026-11-18）｜分支：`rag/document-parsing-s1`（基线 `origin/main` = `c0c425b`）
+> 版本：v1.2（2026-11-18，第一轮独立审查 P1/P2 修复后修订：document_id 加路径命名空间、chunk_id 分隔符安全编码、PDF 真实字符偏移、混合型 PDF partial 状态）｜分支：`rag/document-parsing-s1`（基线 `origin/main` = `c0c425b`）
 > 范围：TXT / 可提取文本的 PDF / DOCX 的解析、切片、chunk_id 与来源定位。不含 OCR、不含 Rerank、不改长期记忆逻辑。
 > 本文档先落数据契约，再描述实现；所有描述均对应当前分支已提交的代码，未实现的内容集中在 §11「后续工作」，不写成本阶段已具备。
 
@@ -33,7 +33,7 @@
 
 | # | 字段 | 类型 | 含义 | 生成规则 |
 |---|---|---|---|---|
-| 1 | `document_id` | str | 文档稳定标识（含版本） | `f"{文件主名}-{document_hash[:8]}"`（`document_parser.document_id_for`）；源文件内容一变即变 |
+| 1 | `document_id` | str | 文档稳定标识（含路径命名空间与版本） | `f"{安全文件名}-{路径摘要}-{document_hash[:8]}"`（`document_parser.document_id_for`）；路径摘要 = `sha256(规范化相对路径)[:8]`；内容或相对路径任一变化即变 |
 | 2 | `document_hash` | str | 源文件字节 SHA-256（64 位小写十六进制） | `hashlib.sha256(raw_bytes).hexdigest()`，按原始字节算，与编码无关 |
 | 3 | `source_name` | str | 知识库内相对路径（正斜杠） | 如 `probability/条件概率.pdf` |
 | 4 | `file_type` | str | `txt` / `pdf` / `docx` | 由后缀小写决定 |
@@ -51,8 +51,11 @@
 
 补充约束：
 
+- **`document_id` 必须带路径命名空间**：只靠「文件名 + 内容哈希」会让两个不同目录下的同名同内容文件碰撞成同一 ID，进而让 `chunk_id` 也碰撞、让 `rag_service` 的按 `chunk_id` 去重把两个来源合并掉。因此 ID 里必须有规范化相对路径（`normalize_source_name`：反斜杠→`/`、`posixpath.normpath`、首尾空白与 `./` 归一）。同一相对路径 + 同一内容 + 同一版本 → ID 稳定；不同相对路径 → ID 必不同。
+- **ID 分隔符安全编码**：`chunk_id = document_id#locator#h` 用 `#` 做分隔符，而文件名允许 `#`/`%`。`document_chunker._encode_id_component()` 对 `document_id` 与 `locator` 先 `%`→`%25`、`#`→`%23`，保证 `chunk_id.split("#")` 恒为 3 段、前缀恒等于未编码的 `document_id`。
 - **印刷页码不写进 `page_number`**：两者含义不同（PDF 物理页序 vs 书页上印的号），混用会破坏跨版本对照。
 - `source_spans` 在实现中**每片至少一条**（片由块组成，块必有定位），因此不存在「空 span 的降级路径」，也不需要额外的降级标记字段。
+- **字符偏移坐标系按文件类型固定**（`char_start`/`char_end` 只在该坐标系内可解释）：PDF = 当前页 `extract_text()` 后经 `_normalize_text` 的整页文本（`\r\n`/`\r`→`\n`、首尾 strip）；DOCX = 块自身文本内偏移（段落级 / 表格行级，恒为 `0..len(block.text)`，不跨块解释）；TXT = 整篇规范化文本。
 - 所有字段值为 JSON 可序列化类型；`to_record()` 把 `heading_path` / `source_spans` 转成 list。
 - `load_chunk_records()` / `rag_service.retrieve_chunks(with_metadata=True)` 的记录在此基础上**额外带一个历史键 `source`**（值等于 `source_name`），方便旧消费方只改字段不改读法。
 
@@ -67,7 +70,7 @@ h          = sha256(f"{CHUNKER_VERSION}|{PARSER_VERSION}|{max_chars}|{document_h
 chunk_id   = f"{document_id}#{locator}#{h}"
 ```
 
-示例：`条件概率-3f2a91bc#p12#7c1d90e3a4`
+示例：`条件概率-3f2a91bc-9d1e00aa#p12#7c1d90e3a4`（`条件概率`=安全文件名，`3f2a91bc`=路径摘要，`9d1e00aa`=`document_hash[:8]`）
 
 性质与理由：
 
@@ -91,7 +94,8 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 - 解析器：`pypdf`（惰性导入 `PdfReader`，缺失时报 `parser_unavailable`）。
 - 物理页码：`enumerate(reader.pages, start=1)`，**一律以 PDF 页对象顺序为准**。
 - 印刷页码：`_printed_page_number(page_text)` 只在页首两行、页尾两行里匹配 `^\s*[-—–]\s*(\d{1,4})\s*[-—–]\s*$` 与 `^\s*第\s*(\d{1,4})\s*页\s*$`；识别不到为 `None`，不影响解析。
-- 页内分段（`_split_page_paragraphs`）：优先按空行（`\n\s*\n`）切段；整页没有空行时，**整页作为一个段落块**（不做行长启发式合并——这是当前实现的已知限制，见 §10）。
+- 页内分段（`_page_pieces`）：优先按空行（`\n\s*\n`）切段；**pypdf 默认抽取会丢掉空行**，整页只剩一段时退化为按行切分（每个非空行一个块）。两种分支都保留段落在**整页规范化文本**中的真实起止位置，不再一律从 0 起算。
+- 字符偏移（`char_start`/`char_end`）：相对**该页 `_normalize_text(extract_text())` 后的整页文本**。校验方式：`page_text[char_start:char_end] == block.text`（有前导空白的段落，偏移指向 strip 后的正文起点）。跨页片段的每个 span 各自归属自己那一页，坐标系互不混用。
 - 标题启发式（`_looks_like_heading`）：文本 ≤ 30 字、不以「。」结尾，且命中编号型（`1.3 条件概率`）、章节型（`第三章 …`）或以「：/：」结尾，则视为标题；标题块 `kind="heading"`，后续块 `heading_path` 只记最近这一个标题。
 - 跨页：片由块贪心合并而成（§5），若相邻页的块合进同一片，`source_spans` 就有 ≥ 2 条且 `page_number` 不同，`locator` 用 `p{a}-{b}`。
 - 无文本层：全部页 `extract_text()` 去空白后皆空 → `ParseError(code="no_text_layer")`，**不产出任何 chunk**。
@@ -104,6 +108,7 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 - `paragraph_index`：body 顺序号，段落与表格**共用同一计数序列**；空段落不产出块但**仍占一个序号**（保证定位不因空行漂移）。
 - `heading_path`：`_docx_heading_level()` 先看样式名、再匹配 `style_id`，接受 `Title`（视为 1 级）与 `heading 1`~`heading 9`；命中时 `del heading_stack[level-1:]` 后压入标题文本，普通段落继承当前栈。
 - 表格：每行一个块，`cell.text` 去换行后以 `" | "` 连接，`kind="table"`，`heading_path` 继承当前标题栈；整行的 `paragraph_index` 指向该表在 body 中的位置。
+- 字符偏移：`char_start=0`、`char_end=len(block.text)`——**块内坐标**（普通段落是段落级、表格行是行级），不相对整篇文档、也不相对整页。这样切片拼装后每块的 span 仍能在「该块自身文本」内自洽；需要还原正文时按 `block_index` 取 `parsed.blocks[i].text` 切片即可。
 - 损坏文件（`BadZipFile` / `PackageNotFoundError` / XML 错误）→ `corrupted_docx`；正文全空 → `empty_file`。
 
 ### 4.3 TXT（兼容路径，逐字节不变）
@@ -146,23 +151,27 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 
 映射表实现在 `document_parser.STATUS_BY_CODE` + `status_for_code()`，未列出的码统一 `failed`。
 
+此外还有一个**非错误**状态：`partial`（`STATUS_PARTIAL`）。当 PDF **部分页面有文本、部分页面没有**（混合型，常见于正文+扫描插图页）时，解析继续产出有文本页的 chunk，但 `ParsedDocument.status="partial"`、`pages_total/pages_with_text/missing_pages` 记下缺失页，**不得无条件报告完整解析成功**。本阶段不做 OCR，也不把缺失页当失败。
+
 `scan_knowledge(directory)` 返回：
 
 ```python
 {
   "documents": [
-    {"source": ..., "source_name": ..., "file_type": ..., "status": "ok" | "empty" | "no_text_layer"
+    {"source": ..., "source_name": ..., "file_type": ..., "status": "ok" | "partial" | "empty" | "no_text_layer"
      | "failed" | "skipped_unsupported" | "skipped_oversize",
      "document_id": str | None, "document_hash": str | None, "chunk_count": int,
      "bytes": int | None, "error_code": None | str, "error_message": None | str,
+     "pages_total": int | None, "pages_with_text": int | None, "missing_pages": [int, ...],
      "parser_version": "s1.1", "chunker_version": "s1.1"}
   ],
+  "warnings": [{"source_name": ..., "warning_code": "missing_pages", "page_numbers": [int, ...], "message": str}],
   "issues": [{"source_name": ..., "file_type": ..., "error_code": ..., "error_message": ...}],
   "chunk_count": int
 }
 ```
 
-规则：**`documents` 覆盖扫描到的每个文件（含失败的）**，失败文件 `document_id/document_hash` 为 `None`、`chunk_count=0`；`issues` 只装失败文件，供调用方单独报警。任何被跳过的文件都两者可见，禁止静默 continue（`load_documents/load_chunks/load_chunk_records` 仍会 `print` 一行日志后继续处理其它文件）。
+规则：**`documents` 覆盖扫描到的每个文件（含失败的）**，失败文件 `document_id/document_hash` 为 `None`、`chunk_count=0`；`issues` 只装失败文件，供调用方单独报警；`warnings` 装「解析成功但不完整」的情况（当前只有 `missing_pages`），`partial` 文档**同时**出现在 `documents` 与 `warnings`，且不进 `issues`（它不是解析失败）。任何被跳过的文件都两者可见，禁止静默 continue（`load_documents/load_chunks/load_chunk_records` 仍会 `print` 一行日志后继续处理其它文件）。
 
 ---
 
@@ -170,6 +179,7 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 
 - `PARSER_VERSION = "s1.1"`（`document_parser`）、`CHUNKER_VERSION = "s1.1"`（`document_chunker`），均作为模块常量导出并写入每条记录。
 - 两者任一升级 → 所有 chunk_id 换代；升级必须重跑评测并记录新 manifest。
+- 说明：`document_id` 公式在第一轮审查后修正（加入路径命名空间）。本分支尚未合并、未产出任何正式产物，因此没有历史 chunk_id 需要迁移；`PARSER_VERSION`/`CHUNKER_VERSION` 仍为 `s1.1`。
 - 解析结果不做跨进程缓存：每次调用重新解析（当前知识库很小），保证「文件即真相」；向量缓存仍按 `content_hash` 复用，不受 chunk_id 变化影响。
 
 ---
@@ -217,7 +227,10 @@ Hybrid 去重键同步升级：`_chunk_key()` 有 `chunk_id` 时用 `("chunk_id"
 
 | 项 | 现状 | 处理 |
 |---|---|---|
-| PDF 无空行的页 | 整页作为一个段落块，定位粒度到页 | 记为已知限制；评测语料优先有空行的单栏教材 |
+| PDF 无空行的页 | pypdf 默认抽取丢空行 → 退回按行切分，一行一块 | 定位粒度到行；`char_start/char_end` 仍是整页文本内的真实偏移 |
+| 混合型 PDF（部分页无文本） | 有文本页正常出 chunk，`status="partial"` + `missing_pages` 记录缺失页 | 缺页**不被静默忽略**；本阶段不做 OCR，调用方需看 `warnings` |
+| PDF 偏移坐标系 | 相对「当前页 `_normalize_text(extract_text())`」，不是整个 PDF 的全局偏移 | 跨页片段的每个 span 各自归属本页；还原正文时先按 `page_number` 取页文本 |
+| DOCX 偏移坐标系 | 块内坐标（段落级 / 表格行级，恒 `0..len(block.text)`） | 不跨块解释；需要原文时用 `block_index` 取 `parsed.blocks[i].text` |
 | PDF 多栏排版 | 只保证「文本不丢」，阅读顺序由 pypdf 决定 | 同上，不在本阶段解决 |
 | PDF 标题识别 | 启发式（≤30 字、编号/章节/冒号），可能误判 | `heading_path` 只是辅助定位，不参与身份计算 |
 | DOCX 合并单元格 | 单元格按 `cell.text` 取，合并单元格会重复文本 | 依靠 `chunk_id` 的 `occurrence` 与 span 定位可追溯 |

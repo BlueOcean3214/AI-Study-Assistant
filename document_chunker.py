@@ -73,8 +73,23 @@ def compute_content_hash(content):
     return hashlib.sha256(normalized.strip().encode("utf-8")).hexdigest()
 
 
+def _encode_id_component(value):
+    """chunk_id 分段内不允许出现分隔符 "#"：百分号编码兜底。
+
+    document_id 由 document_parser 生成，本身已只含安全字符；
+    这里再编码一次是为了防止将来有人手工构造 document_id 或换掉生成规则时
+    悄悄产生 "a#b" 这种把 chunk_id 拆成四段的歧义。
+    """
+
+    return str(value).replace("%", "%25").replace("#", "%23")
+
+
 def make_chunk_id(document_id, locator, occurrence, content_hash, document_hash, parser_version, chunker_version, max_chars):
-    """chunk_id = document_id#locator#digest，digest 由全部定位要素哈希推导。"""
+    """chunk_id = document_id#locator#digest，digest 由全部定位要素哈希推导。
+
+    三段都以 "#" 分隔，任一段内部出现 "#" 都会被百分号编码，
+    因此 `chunk_id.split("#")` 恒为 3 段（见设计文档 §3）。
+    """
 
     payload = "|".join(
         [
@@ -88,7 +103,7 @@ def make_chunk_id(document_id, locator, occurrence, content_hash, document_hash,
         ]
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:10]
-    return f"{document_id}#{locator}#{digest}"
+    return f"{_encode_id_component(document_id)}#{_encode_id_component(locator)}#{digest}"
 
 
 def _page_locator(first_page, last_page):

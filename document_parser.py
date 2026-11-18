@@ -2,12 +2,17 @@
 
 职责边界：
     document_parser  只负责“把文件变成带定位信息的文本块”，不切片、不落盘、不检索
-    document_chunker 负责把文本块切成 Chunk（14 字段，含 chunk_id）
+    document_chunker 负责把文本块切成 Chunk（15 字段，含 chunk_id）
     document_service 负责文件读写、目录扫描、兼容旧 API
 
 设计要点（详见 docs/RAG-DOCUMENT-PARSING-DESIGN.md）：
     - document_hash 按原始字节算 SHA-256，编码无关
+    - document_id 由“文件主名 + 规范化相对路径摘要 + 内容哈希前缀”构成：
+      同一路径同一内容幂等，不同目录的同名同内容文件互不碰撞
     - PDF 用物理页码（1 起），印刷页码单独识别，识别不到就是 None
+    - PDF 的 char_start/char_end 以“规范化后的整页文本”为坐标系；
+      DOCX 没有跨段落的稳定文本流，偏移以“块自身文本”为坐标系（段落级 / 表格行级）
+    - 混合型 PDF（部分页没有文本层）记为 status="partial" 并列出缺文本页，不静默成功
     - DOCX 不虚构页码，用正文顺序号 + 标题栈定位
     - TXT 保持 utf-8-sig -> gbk 的解码顺序，切片规则完全交给 document_service 的旧实现
     - 解析失败一律抛 ParseError(code=...)，绝不返回空内容冒充成功
@@ -15,6 +20,7 @@
 
 import hashlib
 import io
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,7 +90,9 @@ class TextBlock:
     printed_page_number 印刷页码（PDF 页脚/页眉识别），识别不到为 None
     paragraph_index    文档内段落/表格顺序号（DOCX 与段落共用计数）
     heading_path       该块所属的标题链（DOCX 由标题样式层级推导）
-    char_start/char_end 该块在“所属页文本”或“表格拼接文本”中的字符范围
+    char_start/char_end 该块在“所属文本坐标系”中的字符范围（坐标系按文件类型固定）：
+                       PDF 以规范化后的整页文本为基准（page_text[start:end] == text）；
+                       TXT 以整篇文本为基准；DOCX 以块自身文本为基准（块内坐标，恒为 0..len）
     """
 
     text: str
@@ -99,7 +107,12 @@ class TextBlock:
 
 @dataclass(frozen=True)
 class ParsedDocument:
-    """一份文档的解析结果。source_name 是知识库内相对路径。"""
+    """一份文档的解析结果。source_name 是知识库内相对路径。
+
+    pages_total / pages_with_text / missing_pages 只对 PDF 有值（TXT/DOCX 为 None / 空）。
+    status: "ok" 表示全部页都有文本层；"partial" 表示部分页没有文本层（缺页列在 missing_pages），
+    调用方不得把 partial 当成完整解析成功。
+    """
 
     source_name: str
     file_type: str
@@ -107,6 +120,10 @@ class ParsedDocument:
     document_id: str
     blocks: tuple
     parser_version: str = PARSER_VERSION
+    pages_total: int = None
+    pages_with_text: int = None
+    missing_pages: tuple = ()
+    status: str = "ok"
 
     def text(self):
         """把全部块拼成一整段文本（块之间用空行分隔）。"""
@@ -114,15 +131,57 @@ class ParsedDocument:
         return "\n\n".join(block.text for block in self.blocks if block.text)
 
 
-def document_id_for(source_name, document_hash):
-    """文档标识：文件主名 + 内容哈希前缀。
+# 文档状态：ok = 完整解析；partial = 部分页缺文本层（PDF 混合型）
+STATUS_OK = "ok"
+STATUS_PARTIAL = "partial"
 
-    源文件内容一变，document_hash 变，document_id 随之换代，
-    这样“同一路径的两个版本”不会被当成同一份文档。
+# document_id 允许的字符：ASCII 字母数字、下划线、连字符、中文。
+# 其余字符（含 chunk_id 的分隔符 "#"、路径分隔符 "/"、空格）一律折叠成 "-"，
+# 保证 document_id 不含 "#"，chunk_id 始终能按 "#" 拆成三段。
+_ID_UNSAFE = re.compile(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+")
+
+
+def normalize_source_name(source_name):
+    """规范化知识库内相对路径：统一正斜杠、去掉 ./ 与重复分隔符、解析 .. 段。
+
+    只做字符串层面的规范化，不碰磁盘、不解析符号链接。同一路径无论用
+    "甲/讲义.pdf"、"甲\\\\讲义.pdf" 还是 "./甲//讲义.pdf" 传入，结果都相同；
+    大小写保留原样（Windows 与 Linux 的大小写语义不同，不做跨平台猜测）。
     """
 
-    stem = Path(source_name).stem or "document"
-    return f"{stem}-{document_hash[:8]}"
+    text = str(source_name or "").strip().replace("\\", "/")
+
+    if not text:
+        return ""
+
+    normalized = posixpath.normpath(text)
+
+    return "" if normalized == "." else normalized
+
+
+def _safe_id_part(text, fallback="document", limit=40):
+    """把任意文件名片段压成 document_id 安全字符，避免分隔符与路径字符歧义。"""
+
+    cleaned = _ID_UNSAFE.sub("-", str(text or ""))
+    cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-")
+
+    return cleaned[:limit] or fallback
+
+
+def document_id_for(source_name, document_hash):
+    """文档标识：文件主名 + 规范化相对路径摘要 + 内容哈希前缀。
+
+    - 同一相对路径 + 同一文件内容 + 同一解析器版本 => 同一 document_id（幂等）
+    - 不同相对路径即使文件名与内容都相同，路径摘要不同 => 不同 document_id
+    - 内容一变，document_hash 变，document_id 随之换代
+    - 结果只含安全字符、不含 "#"，chunk_id 的 "#" 分段因此无歧义
+    """
+
+    path = normalize_source_name(source_name) or "(root)"
+    stem = Path(path).stem or "document"
+    path_digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:8]
+
+    return f"{_safe_id_part(stem)}-{path_digest}-{document_hash[:8]}"
 
 
 def compute_document_hash(raw):
@@ -203,20 +262,69 @@ def _looks_like_heading(line):
     return text.endswith(("：", ":"))
 
 
-def _split_page_paragraphs(page_text):
-    """页内分段：优先按空行分；没有空行时按非空行分。"""
+def _trimmed_segment(page_text, start, end):
+    """把页文本的 [start, end) 裁掉首尾空白，返回 (text, start, end) 或 None。
+
+    偏移必须跟着裁剪一起走，否则 page_text[start:end] 会和块文本对不上。
+    """
+
+    raw = page_text[start:end]
+    stripped = raw.strip()
+
+    if not stripped:
+        return None
+
+    lead = len(raw) - len(raw.lstrip())
+
+    return stripped, start + lead, start + lead + len(stripped)
+
+
+def _page_pieces(page_text):
+    """页内分块：返回 [(text, char_start, char_end)]，偏移相对规范化后的整页文本。
+
+    - 页内有空行时按空行分段（段落是自然语义单位，段的偏移覆盖整段）
+    - 整页没有空行时退到非空行分块：pypdf 默认抽取会丢掉空行，
+      若整页仍算一个段落，多段页面的块偏移就会全部是 0；
+      退到行级后每个块都有真实偏移，块合并成片时内容仍是原文按行拼接。
+    每个块的 page_text[char_start:char_end] 恒等于块文本。
+    """
 
     page_text = page_text.strip()
 
     if not page_text:
         return []
 
-    paragraphs = [piece.strip() for piece in _BLANK_LINE_PATTERN.split(page_text) if piece.strip()]
+    spans = []
+    cursor = 0
 
-    if paragraphs:
+    for match in _BLANK_LINE_PATTERN.finditer(page_text):
+        spans.append((cursor, match.start()))
+        cursor = match.end()
+
+    spans.append((cursor, len(page_text)))
+
+    paragraphs = [
+        segment
+        for segment in (_trimmed_segment(page_text, start, end) for start, end in spans)
+        if segment
+    ]
+
+    if len(paragraphs) > 1:
         return paragraphs
 
-    return [line.strip() for line in page_text.splitlines() if line.strip()]
+    lines = []
+    offset = 0
+
+    for line in page_text.split("\n"):
+        segment = _trimmed_segment(page_text, offset, offset + len(line))
+
+        if segment:
+            lines.append(segment)
+
+        # split 掉的那一个 "\n" 也要计入偏移
+        offset += len(line) + 1
+
+    return lines
 
 
 def _parse_txt(raw, source_name, doc_hash):
@@ -282,6 +390,9 @@ def _parse_pdf(raw, source_name, doc_hash):
     heading = None
     paragraph_index = 0
     extracted_any = False
+    pages_total = len(pages)
+    pages_with_text = 0
+    missing_pages = []
 
     for page_number, page in enumerate(pages, start=1):
         try:
@@ -296,12 +407,15 @@ def _parse_pdf(raw, source_name, doc_hash):
         page_text = _normalize_text(page_text)
 
         if not page_text:
+            # 没有文本层的页必须留痕：混合型 PDF 不能当成完整解析成功
+            missing_pages.append(page_number)
             continue
 
         extracted_any = True
+        pages_with_text += 1
         printed = _printed_page_number(page_text)
 
-        for piece in _split_page_paragraphs(page_text):
+        for piece, char_start, char_end in _page_pieces(page_text):
             kind = "text"
             heading_path = (heading,) if heading else ()
 
@@ -318,8 +432,8 @@ def _parse_pdf(raw, source_name, doc_hash):
                     printed_page_number=printed,
                     paragraph_index=paragraph_index,
                     heading_path=heading_path,
-                    char_start=0,
-                    char_end=len(piece),
+                    char_start=char_start,
+                    char_end=char_end,
                 )
             )
             paragraph_index += 1
@@ -327,7 +441,7 @@ def _parse_pdf(raw, source_name, doc_hash):
     if not extracted_any:
         raise ParseError(
             "no_text_layer",
-            "PDF 没有可提取的文本层（可能是扫描件），本阶段不做 OCR",
+            f"PDF 共 {pages_total} 页，全部没有可提取的文本层（可能是扫描件），本阶段不做 OCR",
             source_name,
         )
 
@@ -337,6 +451,10 @@ def _parse_pdf(raw, source_name, doc_hash):
         document_hash=doc_hash,
         document_id=document_id_for(source_name, doc_hash),
         blocks=tuple(blocks),
+        pages_total=pages_total,
+        pages_with_text=pages_with_text,
+        missing_pages=tuple(missing_pages),
+        status=STATUS_PARTIAL if missing_pages else STATUS_OK,
     )
 
 
