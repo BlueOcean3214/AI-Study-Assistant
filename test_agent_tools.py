@@ -575,11 +575,22 @@ try:
         "POST /feedback 返回结构未改动",
         '"message": "反馈保存成功"' in main_source and '"feedback": {' in main_source,
     )
+    # S1 s1.2：/upload 保留原四个字段，并新增文档级解析状态（partial 不得伪装成完整成功）
     check(
-        "/upload 返回结构未改动",
-        '"message": "文档上传成功"' in main_source
-        and '"size_bytes": len(contents)' in main_source
-        and '"chunk_count": chunk_count' in main_source,
+        "/upload 返回结构保持兼容并新增文档级状态",
+        all(
+            token in main_source
+            for token in (
+                '"source": source',
+                '"size_bytes": len(contents)',
+                '"chunk_count": info["chunk_count"]',
+                '"status": status',
+                '"pages_total": info["pages_total"]',
+                '"missing_pages": info["missing_pages"]',
+                '"warnings": info["warnings"]',
+                '"status": "failed"',
+            )
+        ),
     )
 
     # calculate_summary 口径（移动前后必须一致）

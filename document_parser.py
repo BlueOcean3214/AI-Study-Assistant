@@ -8,7 +8,10 @@
 设计要点（详见 docs/RAG-DOCUMENT-PARSING-DESIGN.md）：
     - document_hash 按原始字节算 SHA-256，编码无关
     - document_id 由“文件主名 + 规范化相对路径摘要 + 内容哈希前缀”构成：
-      同一路径同一内容幂等，不同目录的同名同内容文件互不碰撞
+      同一路径同一内容幂等，不同目录的同名同内容文件互不碰撞；
+      路径摘要取 PATH_DIGEST_CHARS（16）位十六进制，公式变更时同步升 PARSER_VERSION
+    - 加密 PDF：先看 is_encrypted，再按 decrypt("") 的返回值判成败，
+      成功后才读取页面对象；需要密码的 PDF 抛 password_required，不伪装成 corrupted_pdf
     - PDF 用物理页码（1 起），印刷页码单独识别，识别不到就是 None
     - PDF 的 char_start/char_end 以“规范化后的整页文本”为坐标系；
       DOCX 没有跨段落的稳定文本流，偏移以“块自身文本”为坐标系（段落级 / 表格行级）
@@ -25,8 +28,13 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-# 解析器版本：解析行为（分段、页码识别、标题识别）一改就要升版
-PARSER_VERSION = "s1.1"
+# 解析器版本：解析行为（分段、页码识别、标题识别、加密处理顺序）一改就要升版
+# s1.2：加密 PDF 改成“先判断 is_encrypted、再 decrypt(\"\")、按返回值判成败”，
+#       路径摘要从 8 位扩到 16 位（document_id 换代，chunk_id 随之后代）。
+PARSER_VERSION = "s1.2"
+
+# 规范化相对路径摘要取多少位十六进制：8 位只有 32 bit，跨目录同名文件有碰撞风险
+PATH_DIGEST_CHARS = 16
 
 # 单文件大小上限：超过就不解析（避免一个巨型 PDF 把进程拖死）
 MAX_DOCUMENT_BYTES = 20 * 1024 * 1024
@@ -56,6 +64,8 @@ STATUS_BY_CODE = {
     "empty_file": "empty",
     "no_text_layer": "no_text_layer",
     "oversize": "skipped_oversize",
+    # 加密 PDF 与“文件损坏”是两件事：空密码解不开就是需要密码，不能报 corrupted_pdf
+    "password_required": "password_required",
 }
 
 
@@ -179,7 +189,7 @@ def document_id_for(source_name, document_hash):
 
     path = normalize_source_name(source_name) or "(root)"
     stem = Path(path).stem or "document"
-    path_digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:8]
+    path_digest = hashlib.sha256(path.encode("utf-8")).hexdigest()[:PATH_DIGEST_CHARS]
 
     return f"{_safe_id_part(stem)}-{path_digest}-{document_hash[:8]}"
 
@@ -374,17 +384,34 @@ def _parse_pdf(raw, source_name, doc_hash):
 
     try:
         reader = PdfReader(io.BytesIO(raw))
-        pages = list(reader.pages)
     except ParseError:
         raise
     except Exception as error:  # noqa: BLE001 - pypdf 的异常类型很杂
         raise ParseError("corrupted_pdf", f"PDF 无法读取：{error}", source_name) from error
 
+    # 加密判断必须在读取 pages 之前：未解密的 reader.pages 会抛异常或返回密文
     if getattr(reader, "is_encrypted", False):
         try:
-            reader.decrypt("")
-        except Exception as error:  # noqa: BLE001
-            raise ParseError("corrupted_pdf", f"PDF 已加密且无法解密：{error}", source_name) from error
+            decrypt_result = reader.decrypt("")
+        except Exception as error:  # noqa: BLE001 - 少见的加密算法会直接抛
+            raise ParseError(
+                "password_required",
+                f"PDF 已加密，空密码解密失败：{error}",
+                source_name,
+            ) from error
+
+        # pypdf 返回 PasswordType 枚举（NOT_DECRYPTED=0），假值即解密失败
+        if not decrypt_result:
+            raise ParseError(
+                "password_required",
+                "PDF 已加密且需要打开密码，本阶段不支持带密码的 PDF，请先解除加密后重新上传",
+                source_name,
+            )
+
+    try:
+        pages = list(reader.pages)
+    except Exception as error:  # noqa: BLE001
+        raise ParseError("corrupted_pdf", f"PDF 页面无法读取：{error}", source_name) from error
 
     blocks = []
     heading = None

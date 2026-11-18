@@ -8,12 +8,15 @@
 1. TXT：解析结果、document_id / document_hash、chunk_id 可复现
 2. 文档身份：路径命名空间防碰撞、"#" 分隔符安全编码
 3. PDF：物理页码、印刷页码、跨页片段来源范围、整页文本真实字符偏移
+3.1 版本与换代：解析器/切片器均为 s1.2，同文件可复现，升版即换 chunk_id，路径摘要 16 位
+3.2 加密 PDF：普通 PDF 仍 ok，空密码（owner-only）可解析，需要打开密码报 password_required
 4. 混合型 PDF：部分页没有文本层时记 partial 并列出缺页，不静默成功
-5. DOCX：标题路径、段落序号、表格行、不虚构页码、块内偏移口径
+5. DOCX：标题路径、段落序号、表格块来源范围、不虚构页码、块内偏移口径
 6. 解析失败：不支持的格式、空文件、编码错误、坏 PDF、无文本层、坏 DOCX
 7. 上传落盘：PDF / DOCX 走 bytes 校验，坏文件不写盘，chunk_file 统计切片数
 8. 检索层元数据：默认返回仍是 {content, source, score}，with_metadata=True 才透出；
-   Hybrid 富记录按 chunk_id 去重时，不同目录的同名同内容文件都保留
+   Hybrid 富记录按 chunk_id 去重时，不同目录的同名同内容文件都保留；
+   富记录的 document_status 会标出 partial 来源
 """
 
 import hashlib
@@ -23,6 +26,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
+import document_chunker
 import document_parser
 import document_service
 import rag_service
@@ -193,7 +197,7 @@ try:
     check(
         "TXT document_id 含规范化路径摘要与哈希前缀",
         parsed.document_id
-        == f"notes-{hashlib.sha256(b'notes.txt').hexdigest()[:8]}-{parsed.document_hash[:8]}",
+        == f"notes-{hashlib.sha256(b'notes.txt').hexdigest()[:document_parser.PATH_DIGEST_CHARS]}-{parsed.document_hash[:8]}",
         parsed.document_id,
     )
     check("TXT document_id 不含 # 分隔符", "#" not in parsed.document_id, parsed.document_id)
@@ -420,12 +424,146 @@ try:
           all(block.char_start == 0 and block.char_end == len(block.text)
               for block in docx_parsed.blocks),
           [(block.char_start, block.char_end, len(block.text)) for block in docx_parsed.blocks])
+    table_blocks = [block for block in docx_parsed.blocks if block.kind == "table"]
+    check("DOCX 至少解析出一个表格块（kind=table）", len(table_blocks) >= 1,
+          [(block.kind, block.text[:20]) for block in docx_parsed.blocks])
     check("DOCX 表格块的偏移覆盖含分隔符的行文本",
-          all(block.text[block.char_start:block.char_end] == block.text
-              for block in docx_parsed.blocks if block.kind == "table_row"))
+          len(table_blocks) >= 1
+          and all(block.char_start == 0
+                  and block.char_end == len(block.text)
+                  and block.text[block.char_start:block.char_end] == block.text
+                  for block in table_blocks),
+          [(block.char_start, block.char_end, len(block.text)) for block in table_blocks])
+    check("DOCX 表格块文本确实是表格行（含分隔符）",
+          len(table_blocks) >= 1 and all(" | " in block.text for block in table_blocks),
+          [block.text for block in table_blocks[:1]])
+
+    table_block_indexes = {index for index, block in enumerate(docx_parsed.blocks)
+                           if block.kind == "table"}
+    table_spans = [span for chunk in docx_chunks for span in chunk.source_spans
+                   if span.get("kind") == "table"]
+    check("DOCX 片段 source_spans 指向真实存在的表格块",
+          len(table_spans) >= 1
+          and all(span["block_index"] in table_block_indexes for span in table_spans),
+          [(span["block_index"], span.get("kind")) for span in table_spans])
+    check("DOCX 表格 span 的块内坐标与表格块一致",
+          len(table_spans) >= 1
+          and all(
+              span["char_start"] == docx_parsed.blocks[span["block_index"]].char_start
+              and span["char_end"] == docx_parsed.blocks[span["block_index"]].char_end
+              for span in table_spans
+          ),
+          [(span["block_index"], span["char_start"], span["char_end"]) for span in table_spans])
     check("DOCX 块坐标只服务块内定位，不出现在跨块合并里",
           all(span["char_start"] >= 0 and span["char_end"] >= span["char_start"]
               for chunk in docx_chunks for span in chunk.source_spans))
+
+    # ------------------------------------------- 3.1 版本号、可复现性与 ID 换代
+
+    check("解析器版本为 s1.2", document_parser.PARSER_VERSION == "s1.2",
+          document_parser.PARSER_VERSION)
+    check("切片器版本为 s1.2", document_chunker.CHUNKER_VERSION == "s1.2",
+          document_chunker.CHUNKER_VERSION)
+
+    version_records = document_parser_chunks(document_parser.parse_bytes(pdf_raw, "ch1.pdf"))
+    check("每个切片记录都带 s1.2 两个版本字段",
+          len(version_records) >= 1
+          and all(chunk.parser_version == "s1.2"
+                  and chunk.chunker_version == "s1.2" for chunk in version_records),
+          [(chunk.parser_version, chunk.chunker_version) for chunk in version_records[:1]])
+
+    # 同一份文件、同一版本，重复解析必须得到同一批 ID
+    repeat_parsed = document_parser.parse_bytes(pdf_raw, "ch1.pdf")
+    repeat_records = document_parser_chunks(repeat_parsed)
+    first_records = document_parser_chunks(document_parser.parse_bytes(pdf_raw, "ch1.pdf"))
+    check("同文件同版本 document_id 可复现",
+          repeat_parsed.document_id == document_parser.parse_bytes(
+              pdf_raw, "ch1.pdf").document_id,
+          repeat_parsed.document_id)
+    check("同文件同版本 chunk_id 可复现",
+          [chunk.chunk_id for chunk in repeat_records]
+          == [chunk.chunk_id for chunk in first_records])
+
+    # 升级版本必须让同一内容换一批 chunk_id，否则旧索引会和新解析混在一起
+    sample_chunk = repeat_records[0]
+    same_version_id = document_chunker.make_chunk_id(
+        sample_chunk.document_id,
+        "p1",
+        0,
+        sample_chunk.content_hash,
+        sample_chunk.document_hash,
+        "s1.2",
+        "s1.2",
+        document_service.CHUNK_MAX_CHARS,
+    )
+    old_version_id = document_chunker.make_chunk_id(
+        sample_chunk.document_id,
+        "p1",
+        0,
+        sample_chunk.content_hash,
+        sample_chunk.document_hash,
+        "s1.1",
+        "s1.1",
+        document_service.CHUNK_MAX_CHARS,
+    )
+    check("版本号是 chunk_id 的哈希输入（升版即换代）",
+          same_version_id != old_version_id,
+          (same_version_id, old_version_id))
+
+    # 路径摘要从 8 位加到 16 位：document_id 形如 名字-摘要文档哈希
+    doc_id_parts = repeat_parsed.document_id.rsplit("-", 2)
+    check("document_id 由 名称/路径摘要/内容哈希 三段组成", len(doc_id_parts) == 3,
+          repeat_parsed.document_id)
+    check("document_id 的路径摘要为 16 位十六进制",
+          len(doc_id_parts) == 3
+          and len(doc_id_parts[1]) == 16
+          and all(char in "0123456789abcdef" for char in doc_id_parts[1]),
+          doc_id_parts[1] if len(doc_id_parts) == 3 else repeat_parsed.document_id)
+
+    # ------------------------------------------- 3.2 加密 PDF：先判加密再取页面
+
+    def reencrypt_pdf(raw, password=None):
+        """把明文 PDF 重写成加密 PDF（password=None 表示只加 owner 密码）。"""
+
+        from pypdf import PdfReader, PdfWriter
+
+        source_reader = PdfReader(io.BytesIO(raw))
+        writer = PdfWriter()
+
+        for page in source_reader.pages:
+            writer.add_page(page)
+
+        if password is None:
+            writer.encrypt("")
+        else:
+            writer.encrypt(password)
+
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        return buffer.getvalue()
+
+    check("普通（未加密）PDF 仍解析为 ok",
+          pdf_parsed.status == "ok" and len(pdf_parsed.blocks) >= 1,
+          (pdf_parsed.status, len(pdf_parsed.blocks)))
+
+    empty_password_raw = reencrypt_pdf(pdf_raw)
+    check("空密码加密 PDF 确实带加密标记",
+          empty_password_raw != pdf_raw, len(empty_password_raw))
+    empty_password_parsed = document_parser.parse_bytes(empty_password_raw, "只读密码.pdf")
+    check("空密码（owner-only）加密 PDF 能正常解析",
+          empty_password_parsed.status == "ok"
+          and len(empty_password_parsed.blocks) >= 1
+          and empty_password_parsed.pages_total == pdf_parsed.pages_total,
+          (empty_password_parsed.status,
+           empty_password_parsed.pages_total,
+           len(empty_password_parsed.blocks)))
+
+    locked_raw = reencrypt_pdf(pdf_raw, "secret")
+    expect_parse_error("需要打开密码的 PDF 报 password_required", "password_required",
+                       lambda: document_parser.parse_bytes(locked_raw, "锁定.pdf"))
+    check("password_required 的状态映射不是 corrupted_pdf",
+          document_parser.status_for_code("password_required") == "password_required",
+          document_parser.status_for_code("password_required"))
 
     # ------------------------------------------------------------ 4. 解析失败
 
@@ -517,6 +655,39 @@ try:
     check("load_chunks 默认仍只有 content/source",
           all(set(chunk) == {"content", "source"} for chunk in default_chunks))
 
+    state_records, state_map = document_service.load_chunk_records_with_states(knowledge)
+    check("load_chunk_records_with_states 记录与 load_chunk_records 完全一致",
+          state_records == records)
+    check("状态表覆盖全部文档且状态为 ok",
+          set(state_map) == {"notes.txt", "讲义.pdf", "ch1.docx"}
+          and all(state["status"] == "ok" for state in state_map.values()),
+          {key: value["status"] for key, value in state_map.items()})
+    check("状态表给出页码完整性信息",
+          state_map["讲义.pdf"]["pages_total"] == 2
+          and state_map["讲义.pdf"]["pages_with_text"] == 2
+          and state_map["讲义.pdf"]["missing_pages"] == [],
+          state_map["讲义.pdf"])
+
+    pdf_info = document_service.inspect_document("讲义.pdf", knowledge)
+    check("inspect_document 返回完整状态与切片数",
+          pdf_info["status"] == "ok"
+          and pdf_info["warnings"] == []
+          and pdf_info["pages_total"] == 2
+          and pdf_info["chunk_count"] == pdf_count
+          and pdf_info["parser_version"] == "s1.2"
+          and pdf_info["chunker_version"] == "s1.2",
+          {key: pdf_info[key] for key in
+           ("status", "pages_total", "chunk_count", "parser_version", "chunker_version")})
+
+    missing_file_error = None
+    try:
+        document_service.inspect_document("不存在.pdf", knowledge)
+    except document_service.DocumentError as error:
+        missing_file_error = error
+    check("inspect_document 对不存在的文件抛 DocumentError",
+          isinstance(missing_file_error, document_service.DocumentError),
+          missing_file_error)
+
     scan = document_service.scan_knowledge(knowledge)
     check("scan_knowledge 列出三份文档", len(scan["documents"]) == 3,
           [item["source"] for item in scan["documents"]])
@@ -585,9 +756,20 @@ try:
           mixed_scan["chunk_count"] >= 1 and mixed_entry["chunk_count"] >= 1,
           (mixed_scan["chunk_count"], mixed_entry["chunk_count"]))
 
+    mixed_info = document_service.inspect_document("混合.pdf", mixed_dir)
+    check("inspect_document 把混合型 PDF 标为 partial 并列缺页",
+          mixed_info["status"] == "partial"
+          and mixed_info["missing_pages"] == [2]
+          and (mixed_info["pages_total"], mixed_info["pages_with_text"]) == (3, 2)
+          and len(mixed_info["warnings"]) == 1
+          and mixed_info["chunk_count"] >= 1,
+          {key: mixed_info[key] for key in
+           ("status", "pages_total", "pages_with_text", "missing_pages", "chunk_count")})
+
     # ------------------------------------------------------------ 6. 检索层元数据
 
     original_load_chunks = rag_service.load_chunks
+    original_load_with_states = rag_service.load_chunks_with_states
     original_vector_ranked = rag_service._vector_ranked
     original_log_metrics = rag_service._log_retrieval_metrics
 
@@ -597,6 +779,10 @@ try:
             document_service.load_chunk_records(knowledge)
             if kwargs.get("with_metadata")
             else document_service.load_chunks(knowledge)
+        )
+        # 富元数据路径会顺带取文档级状态，这里同样指到临时知识库
+        rag_service.load_chunks_with_states = lambda *args, **kwargs: (
+            document_service.load_chunk_records_with_states(knowledge)
         )
         rag_service._vector_ranked = (
             lambda query, chunks, limit: [(chunk, 0.9 - index * 0.1)
@@ -621,8 +807,32 @@ try:
                   and isinstance(result["source_spans"], list) for result in rich))
         check("检索富记录不泄露内部对象",
               all(isinstance(result["source_spans"], list) for result in rich))
+        check("完整文档的富记录标为 ok",
+              all(result.get("document_status") == "ok" for result in rich),
+              [result.get("document_status") for result in rich])
+
+        # partial 文档：来源能定位到“这份文档有页面没进索引”
+        rag_service.load_chunks = lambda *args, **kwargs: (
+            document_service.load_chunk_records(mixed_dir)
+            if kwargs.get("with_metadata")
+            else document_service.load_chunks(mixed_dir)
+        )
+        rag_service.load_chunks_with_states = lambda *args, **kwargs: (
+            document_service.load_chunk_records_with_states(mixed_dir)
+        )
+
+        partial_rich = rag_service.retrieve_chunks("第二页", top_k=5, with_metadata=True)
+        check("混合型 PDF 的富记录标为 partial",
+              len(partial_rich) >= 1
+              and all(result.get("document_status") == "partial"
+                      for result in partial_rich),
+              [result.get("document_status") for result in partial_rich])
+        check("默认检索结果不带 document_status（结构保持旧样）",
+              all("document_status" not in result
+                  for result in rag_service.retrieve_chunks("第二页", top_k=5)))
     finally:
         rag_service.load_chunks = original_load_chunks
+        rag_service.load_chunks_with_states = original_load_with_states
         rag_service._vector_ranked = original_vector_ranked
         rag_service._log_retrieval_metrics = original_log_metrics
 
@@ -658,6 +868,7 @@ try:
           == {record["chunk_id"] for record in collision_records})
 
     original_load_chunks = rag_service.load_chunks
+    original_load_with_states = rag_service.load_chunks_with_states
     original_vector_scored = rag_service._vector_scored
     original_bm25_ranked = rag_service._bm25_ranked
     original_log_metrics = rag_service._log_retrieval_metrics
@@ -668,6 +879,9 @@ try:
             document_service.load_chunk_records(collision_dir)
             if kwargs.get("with_metadata")
             else document_service.load_chunks(collision_dir)
+        )
+        rag_service.load_chunks_with_states = lambda *args, **kwargs: (
+            document_service.load_chunk_records_with_states(collision_dir)
         )
         rag_service._vector_scored = lambda query, chunks: [(chunk, 0.9) for chunk in chunks]
         rag_service._bm25_ranked = lambda query, chunks, limit: [
@@ -690,6 +904,7 @@ try:
               [result["document_id"] for result in hybrid])
     finally:
         rag_service.load_chunks = original_load_chunks
+        rag_service.load_chunks_with_states = original_load_with_states
         rag_service._vector_scored = original_vector_scored
         rag_service._bm25_ranked = original_bm25_ranked
         rag_service._log_retrieval_metrics = original_log_metrics

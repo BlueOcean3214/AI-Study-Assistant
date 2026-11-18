@@ -32,6 +32,7 @@ import requests
 from document_service import (
     CHUNK_MAX_CHARS,
     KNOWLEDGE_PATH,
+    load_chunk_records_with_states as _load_chunk_records_with_states,
     load_chunks as _load_chunks,
     load_documents as _load_documents,
     split_into_chunks as _split_into_chunks,
@@ -286,6 +287,19 @@ def load_chunk_records(directory=None):
 
     return _load_chunks(KNOWLEDGE_PATH if directory is None else directory,
                         with_metadata=True)
+
+
+def load_chunks_with_states(directory=None):
+    """一次扫描同时拿到富记录与文档级状态表。
+
+    返回 (records, states)，states 是 {source: {status, pages_total, ...}}。
+    检索层用它标注来源文档是否 partial（部分页没有文本层），
+    避免“检索到了片段就等于整份文档都解析成功了”这种误判。
+    """
+
+    return _load_chunk_records_with_states(
+        KNOWLEDGE_PATH if directory is None else directory
+    )
 
 
 def _cosine_similarity(vector_a, vector_b):
@@ -619,7 +633,9 @@ def retrieve_chunks(query, top_k=TOP_K, with_metadata=False):
     - with_metadata=True：在上面基础上追加来源定位字段
       （chunk_id / document_id / document_hash / file_type / page_number /
        printed_page_number / heading_path / paragraph_index / source_spans /
-       parser_version / chunker_version），去重也改为按 chunk_id
+       parser_version / chunker_version / document_status），去重也改为按 chunk_id
+      document_status 是文档级状态（ok / partial），partial 说明这份文档有页面
+      没有文本层、只有部分内容进了索引，调用方据此决定要不要提示来源不完整
     """
 
     started = time.perf_counter()
@@ -627,8 +643,14 @@ def retrieve_chunks(query, top_k=TOP_K, with_metadata=False):
     if not isinstance(query, str) or not query.strip():
         return []
 
-    # 默认路径用不传参的 load_chunks()，保持与历史实现完全一致的调用方式
-    chunks = load_chunks(with_metadata=True) if with_metadata else load_chunks()
+    # 默认路径用不传参的 load_chunks()，保持与历史实现完全一致的调用方式；
+    # 富元数据路径顺带取一次文档级状态，用来标注来源文档是否 partial
+    states = {}
+
+    if with_metadata:
+        chunks, states = load_chunks_with_states()
+    else:
+        chunks = load_chunks()
 
     if not chunks:
         return []
@@ -639,6 +661,13 @@ def retrieve_chunks(query, top_k=TOP_K, with_metadata=False):
         results = _retrieve_hybrid(query, chunks, top_k, with_metadata=with_metadata)
     else:
         results = _retrieve_vector(query, chunks, top_k, with_metadata=with_metadata)
+
+    if with_metadata:
+        for result in results:
+            # 文档级状态（ok / partial / 失败码），只在富元数据结果里出现，
+            # 不进 Chunk 的 15 字段契约；来源不在状态表里就给 None
+            state = states.get(result.get("source")) or {}
+            result["document_status"] = state.get("status")
 
     _log_retrieval_metrics(query, results, time.perf_counter() - started, mode)
 

@@ -317,11 +317,14 @@ def ask_stream(question):
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024
 
 
-def upload_error(message):
+def upload_error(message, error_code=None):
     return JSONResponse(
         status_code=400,
         content={
-            "message": message
+            "message": message,
+            # 上传失败一律 status=failed，error_code 尽量给出稳定错误码
+            "status": "failed",
+            "error_code": error_code,
         }
     )
 
@@ -356,27 +359,45 @@ async def upload_document(file: UploadFile = File(...)):
 
     except document_service.DocumentError as error:
 
-        return upload_error(str(error))
+        return upload_error(str(error), getattr(error, "code", None))
 
-    # 4. 复用 document_service 统计这篇文档切成了多少 chunk（TXT / PDF / DOCX 同一口径）
+    # 4. 解析一次，拿到文档级状态（完整 / partial）与切片数
+    #    partial 必须如实透出：缺文本层的页没有进索引，不能当完整解析成功
 
     try:
 
-        chunk_count = len(
-            document_service.chunk_file(source)
+        info = document_service.inspect_document(source)
+
+    except document_service.DocumentError as error:
+
+        return upload_error(str(error), getattr(error, "code", None))
+
+    status = info["status"]
+
+    if status == "partial":
+
+        missing = ", ".join(str(page) for page in info["missing_pages"])
+        message = (
+            f"文档已上传，但解析不完整：第 {missing} 页没有可提取的文本层"
+            "（本阶段不做 OCR），只有有文本的页面进入了索引"
         )
 
-    except document_service.DocumentError:
+    else:
 
-        chunk_count = 0
+        message = "文档上传成功"
 
     # 5. 返回结果；向量由 rag_service 在下次检索时按需生成
 
     return {
-        "message": "文档上传成功",
+        "message": message,
         "source": source,
         "size_bytes": len(contents),
-        "chunk_count": chunk_count
+        "chunk_count": info["chunk_count"],
+        "status": status,
+        "pages_total": info["pages_total"],
+        "pages_with_text": info["pages_with_text"],
+        "missing_pages": info["missing_pages"],
+        "warnings": info["warnings"],
     }
 
 

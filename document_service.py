@@ -62,7 +62,16 @@ _SENTENCE_END_PATTERN = re.compile(r"[。！？；!?;]")
 
 
 class DocumentError(RuntimeError):
-    """文档保存或读取失败时抛出的异常。"""
+    """文档保存或读取失败时抛出的异常。
+
+    code 是可选的稳定错误码（目前只在解析失败时透传 ParseError.code），
+    上传接口据此把失败原因告诉调用方，例如 password_required / no_text_layer。
+    """
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
 
 
 def _decode(data):
@@ -251,6 +260,126 @@ def _iter_parsed(directory):
         yield parsed, None
 
 
+def _document_state(parsed):
+    """文档级状态：解析成功（含 partial）时给调用方的完整性信息。"""
+
+    return {
+        "status": parsed.status,
+        "pages_total": parsed.pages_total,
+        "pages_with_text": parsed.pages_with_text,
+        "missing_pages": list(parsed.missing_pages),
+    }
+
+
+def _issue_state(issue):
+    """解析失败时的文档级状态：状态由错误码映射，页码信息一律为空。"""
+
+    return {
+        "status": status_for_code(issue.get("error_code")),
+        "pages_total": None,
+        "pages_with_text": None,
+        "missing_pages": [],
+        "error_code": issue.get("error_code"),
+    }
+
+
+def _document_warnings(parsed):
+    """解析出来了但不完整的情况：目前只有“PDF 部分页没有文本层”。"""
+
+    if parsed.status != STATUS_PARTIAL:
+        return []
+
+    return [
+        {
+            "source_name": parsed.source_name,
+            "warning_code": "missing_pages",
+            "page_numbers": list(parsed.missing_pages),
+            "message": (
+                f"PDF 共 {parsed.pages_total} 页，其中 "
+                f"{len(parsed.missing_pages)} 页没有可提取的文本层"
+                f"（第 {', '.join(str(page) for page in parsed.missing_pages)} 页），"
+                "本阶段不做 OCR"
+            ),
+        }
+    ]
+
+
+def _chunk_records_for(parsed):
+    """把一份已解析文档切成富记录（15 字段 + source）。"""
+
+    txt_splitter = split_into_chunks if parsed.file_type == "txt" else None
+
+    records = []
+
+    for chunk in chunk_document(parsed, CHUNK_MAX_CHARS, txt_splitter):
+        record = chunk.to_record()
+        # source 是历史键名，保留它让检索层无需区分新旧字段
+        record["source"] = chunk.source_name
+        records.append(record)
+
+    return records
+
+
+def load_chunk_records_with_states(directory=None):
+    """一次扫描同时返回富记录与文档级状态表。
+
+    返回 (records, states)：
+        records 与 load_chunk_records() 完全一致（15 字段 + source）
+        states  是 {source: {status, pages_total, pages_with_text, missing_pages}}，
+                解析失败的文件也会有状态，供检索层判断来源文档是否 partial，
+                不必为了拿状态再扫一遍知识库
+
+    注意：状态是“文档级”信息，不写进 Chunk 的 15 字段契约。
+    """
+
+    records = []
+    states = {}
+
+    for parsed, issue in _iter_parsed(directory):
+        if parsed is None:
+            source = issue.get("source_name")
+            states[source] = _issue_state(issue)
+            continue
+
+        states[parsed.source_name] = _document_state(parsed)
+        records.extend(_chunk_records_for(parsed))
+
+    return records, states
+
+
+def inspect_document(source, directory=None):
+    """解析单个文件，返回文档级状态 + 切片数（上传接口用）。
+
+    返回 {"status", "pages_total", "pages_with_text", "missing_pages",
+          "warnings", "chunk_count", "document_id", "parser_version", "chunker_version"}；
+    解析失败抛 DocumentError（带 ParseError.code），调用方据此决定返回 400 还是报错。
+    """
+
+    root = Path(directory) if directory is not None else KNOWLEDGE_PATH
+    file = root / source
+
+    if not file.is_file():
+        raise DocumentError(f"文件不存在：{source}")
+
+    try:
+        parsed = parse_file(file, source_name=source)
+    except ParseError as error:
+        raise DocumentError(
+            f"{source} 解析失败（{error.code}）：{error.message}",
+            code=error.code,
+        ) from error
+
+    chunks = _chunk_records_for(parsed)
+    info = _document_state(parsed)
+    info["warnings"] = _document_warnings(parsed)
+    info["chunk_count"] = len(chunks)
+    info["document_id"] = parsed.document_id
+    info["parser_version"] = parsed.parser_version
+    info["chunker_version"] = CHUNKER_VERSION
+
+    return info
+
+
 def load_documents(directory=None):
     """递归读取目录下所有支持的文档，返回 [{"content", "source"}]。
 
@@ -277,23 +406,10 @@ def load_chunk_records(directory=None):
 
     记录字段见 document_chunker.CHUNK_FIELDS，另外附带 "source"，
     方便检索层继续按既有的 source 键组装上下文。
+    需要文档级状态（partial 等）时用 load_chunk_records_with_states()，一次扫描拿两份结果。
     """
 
-    records = []
-
-    for parsed, _issue in _iter_parsed(directory):
-        if parsed is None:
-            continue
-
-        txt_splitter = split_into_chunks if parsed.file_type == "txt" else None
-
-        for chunk in chunk_document(parsed, CHUNK_MAX_CHARS, txt_splitter):
-            record = chunk.to_record()
-            # source 是历史键名，保留它让检索层无需区分新旧字段
-            record["source"] = chunk.source_name
-            records.append(record)
-
-    return records
+    return load_chunk_records_with_states(directory)[0]
 
 
 def load_chunks(directory=None, with_metadata=False):
@@ -389,19 +505,7 @@ def scan_knowledge(directory=None):
         chunk_count += len(chunks)
 
         if parsed.status == STATUS_PARTIAL:
-            warnings.append(
-                {
-                    "source_name": parsed.source_name,
-                    "warning_code": "missing_pages",
-                    "page_numbers": list(parsed.missing_pages),
-                    "message": (
-                        f"PDF 共 {parsed.pages_total} 页，其中 "
-                        f"{len(parsed.missing_pages)} 页没有可提取的文本层"
-                        f"（第 {', '.join(str(page) for page in parsed.missing_pages)} 页），"
-                        "本阶段不做 OCR"
-                    ),
-                }
-            )
+            warnings.extend(_document_warnings(parsed))
 
         documents.append(
             {
@@ -476,7 +580,10 @@ def save_document(filename, content, directory=None, overwrite=False):
         try:
             parse_bytes(payload, source)
         except ParseError as error:
-            raise DocumentError(f"{source} 解析失败（{error.code}）：{error.message}") from error
+            raise DocumentError(
+                f"{source} 解析失败（{error.code}）：{error.message}",
+                code=error.code,
+            ) from error
 
     target = root / source
 

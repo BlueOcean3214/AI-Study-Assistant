@@ -1,6 +1,6 @@
 # S1 文档解析与来源定位设计说明
 
-> 版本：v1.2（2026-11-18，第一轮独立审查 P1/P2 修复后修订：document_id 加路径命名空间、chunk_id 分隔符安全编码、PDF 真实字符偏移、混合型 PDF partial 状态）｜分支：`rag/document-parsing-s1`（基线 `origin/main` = `c0c425b`）
+> 版本：v1.3（2026-11-18，第二轮独立审查修复后修订：解析器/切片器升到 `s1.2`、`document_id` 路径摘要 8→16 位、加密 PDF 判断顺序与 `password_required`、`/upload` 透出文档级状态、富元数据检索透出 `document_status`）｜分支：`rag/document-parsing-s1`（基线 `origin/main` = `c0c425b`）
 > 范围：TXT / 可提取文本的 PDF / DOCX 的解析、切片、chunk_id 与来源定位。不含 OCR、不含 Rerank、不改长期记忆逻辑。
 > 本文档先落数据契约，再描述实现；所有描述均对应当前分支已提交的代码，未实现的内容集中在 §11「后续工作」，不写成本阶段已具备。
 
@@ -33,7 +33,7 @@
 
 | # | 字段 | 类型 | 含义 | 生成规则 |
 |---|---|---|---|---|
-| 1 | `document_id` | str | 文档稳定标识（含路径命名空间与版本） | `f"{安全文件名}-{路径摘要}-{document_hash[:8]}"`（`document_parser.document_id_for`）；路径摘要 = `sha256(规范化相对路径)[:8]`；内容或相对路径任一变化即变 |
+| 1 | `document_id` | str | 文档稳定标识（含路径命名空间与版本） | `f"{安全文件名}-{路径摘要}-{document_hash[:8]}"`（`document_parser.document_id_for`）；路径摘要 = `sha256(规范化相对路径)[:16]`（`PATH_DIGEST_CHARS = 16`，s1.2 起由 8 位放宽到 16 位）；内容或相对路径任一变化即变 |
 | 2 | `document_hash` | str | 源文件字节 SHA-256（64 位小写十六进制） | `hashlib.sha256(raw_bytes).hexdigest()`，按原始字节算，与编码无关 |
 | 3 | `source_name` | str | 知识库内相对路径（正斜杠） | 如 `probability/条件概率.pdf` |
 | 4 | `file_type` | str | `txt` / `pdf` / `docx` | 由后缀小写决定 |
@@ -46,8 +46,8 @@
 | 11 | `heading_path` | list[str] | 该片首块的标题链 | DOCX 由标题样式层级推导（可多级）；PDF 为启发式识别的最近一个标题（0 或 1 项）；TXT 恒为空列表 |
 | 12 | `paragraph_index` | int \| null | 该片首块的文档内序号（0 起） | DOCX/PDF 为解析序；TXT 为切片序 |
 | 13 | `source_spans` | list[dict] | 来源范围（跨页时多条） | 每条 `{block_index, kind, page_number, paragraph_index, char_start, char_end, heading_path}`，按块顺序排列 |
-| 14 | `parser_version` | str | 解析器版本 | 当前 `"s1.1"`；解析行为变更必须升版 |
-| 15 | `chunker_version` | str | 切片器版本 | 当前 `"s1.1"`；切片规则变更必须升版 |
+| 14 | `parser_version` | str | 解析器版本 | 当前 `"s1.2"`；解析行为变更必须升版 |
+| 15 | `chunker_version` | str | 切片器版本 | 当前 `"s1.2"`；切片规则变更必须升版 |
 
 补充约束：
 
@@ -70,7 +70,7 @@ h          = sha256(f"{CHUNKER_VERSION}|{PARSER_VERSION}|{max_chars}|{document_h
 chunk_id   = f"{document_id}#{locator}#{h}"
 ```
 
-示例：`条件概率-3f2a91bc-9d1e00aa#p12#7c1d90e3a4`（`条件概率`=安全文件名，`3f2a91bc`=路径摘要，`9d1e00aa`=`document_hash[:8]`）
+示例：`条件概率-3f2a91bc4d5e6f70-9d1e00aa#p12#7c1d90e3a4`（`条件概率`=安全文件名，`3f2a91bc4d5e6f70`=16 位路径摘要，`9d1e00aa`=`document_hash[:8]`）
 
 性质与理由：
 
@@ -99,7 +99,7 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 - 标题启发式（`_looks_like_heading`）：文本 ≤ 30 字、不以「。」结尾，且命中编号型（`1.3 条件概率`）、章节型（`第三章 …`）或以「：/：」结尾，则视为标题；标题块 `kind="heading"`，后续块 `heading_path` 只记最近这一个标题。
 - 跨页：片由块贪心合并而成（§5），若相邻页的块合进同一片，`source_spans` 就有 ≥ 2 条且 `page_number` 不同，`locator` 用 `p{a}-{b}`。
 - 无文本层：全部页 `extract_text()` 去空白后皆空 → `ParseError(code="no_text_layer")`，**不产出任何 chunk**。
-- 加密 PDF：先尝试空口令 `decrypt("")`，仍失败 → `corrupted_pdf`。
+- 加密 PDF：**先判 `reader.is_encrypted`，再按 `reader.decrypt("")` 的返回值定成败，解密成功后才读取页对象**。返回假值（`NOT_DECRYPTED`）或抛异常 → `ParseError(code="password_required")`，错误信息明确“需要打开密码”，不伪装成 `corrupted_pdf`；owner 口令加密（只限制权限、不限制阅读）用空口令即可解开，正常解析。
 
 ### 4.2 DOCX
 
@@ -143,7 +143,8 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 | `empty_file` | 0 字节 / 仅空白 / 无可提正文 | `empty` |
 | `no_text_layer` | PDF 全部页无文本层 | `no_text_layer` |
 | `oversize` | 超过 `MAX_DOCUMENT_BYTES`（20 MB） | `skipped_oversize` |
-| `corrupted_pdf` | pypdf 读取/提取抛异常、加密无法解密 | `failed` |
+| `corrupted_pdf` | pypdf 读取/页面提取抛异常 | `failed` |
+| `password_required` | PDF 已加密且空口令解不开（需要打开密码） | `password_required` |
 | `corrupted_docx` | python-docx 读取抛异常 | `failed` |
 | `decode_failed` | TXT 编码无法识别 | `failed` |
 | `parser_unavailable` | 缺 pypdf / python-docx | `failed` |
@@ -163,7 +164,7 @@ chunk_id   = f"{document_id}#{locator}#{h}"
      "document_id": str | None, "document_hash": str | None, "chunk_count": int,
      "bytes": int | None, "error_code": None | str, "error_message": None | str,
      "pages_total": int | None, "pages_with_text": int | None, "missing_pages": [int, ...],
-     "parser_version": "s1.1", "chunker_version": "s1.1"}
+     "parser_version": "s1.2", "chunker_version": "s1.2"}
   ],
   "warnings": [{"source_name": ..., "warning_code": "missing_pages", "page_numbers": [int, ...], "message": str}],
   "issues": [{"source_name": ..., "file_type": ..., "error_code": ..., "error_message": ...}],
@@ -173,13 +174,35 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 
 规则：**`documents` 覆盖扫描到的每个文件（含失败的）**，失败文件 `document_id/document_hash` 为 `None`、`chunk_count=0`；`issues` 只装失败文件，供调用方单独报警；`warnings` 装「解析成功但不完整」的情况（当前只有 `missing_pages`），`partial` 文档**同时**出现在 `documents` 与 `warnings`，且不进 `issues`（它不是解析失败）。任何被跳过的文件都两者可见，禁止静默 continue（`load_documents/load_chunks/load_chunk_records` 仍会 `print` 一行日志后继续处理其它文件）。
 
+### 6.1 `/upload` 的返回契约（s1.2 起）
+
+上传成功后调用 `document_service.inspect_document(source)` 取文档级状态，**不把 partial 报成完整成功**：
+
+```python
+# 成功（含 partial）
+{"message": "文档上传成功" | "文档已上传，但解析不完整：第 N 页没有可提取的文本层（本阶段不做 OCR），只有有文本的页面进入了索引",
+ "source": str, "size_bytes": int, "chunk_count": int,
+ "status": "ok" | "partial",
+ "pages_total": int | None, "pages_with_text": int | None,
+ "missing_pages": [int, ...], "warnings": [{...}]}
+# 失败（400）
+{"message": str, "status": "failed", "error_code": str | None}
+```
+
+混合型 PDF 仍会保存并可被检索，但 `status="partial"` 且 `message` 明确说明“解析不完整”，调用方不能把它当完整解析；全扫描 PDF 走解析失败分支（`error_code="no_text_layer"`），不落盘、不进索引。`document_service.inspect_document(source, directory=None)` 也可单独查询：`{status, pages_total, pages_with_text, missing_pages, warnings, chunk_count, document_id, parser_version, chunker_version}`。
+
+文档级状态**不写进 15 字段 `Chunk` 契约**（那是切片级身份），而是由 `load_chunk_records_with_states()` / `rag_service.load_chunks_with_states()` 与记录一起返回 `{source: state}`；需要来源定位的调用方据此就能区分 partial 与 ok。
+
 ---
 
 ## 7. 版本与可复现
 
-- `PARSER_VERSION = "s1.1"`（`document_parser`）、`CHUNKER_VERSION = "s1.1"`（`document_chunker`），均作为模块常量导出并写入每条记录。
+- `PARSER_VERSION = "s1.2"`（`document_parser`）、`CHUNKER_VERSION = "s1.2"`（`document_chunker`），均作为模块常量导出并写入每条记录。
 - 两者任一升级 → 所有 chunk_id 换代；升级必须重跑评测并记录新 manifest。
-- 说明：`document_id` 公式在第一轮审查后修正（加入路径命名空间）。本分支尚未合并、未产出任何正式产物，因此没有历史 chunk_id 需要迁移；`PARSER_VERSION`/`CHUNKER_VERSION` 仍为 `s1.1`。
+- 版本历史：
+  - `s1.1`：第一轮审查后（`document_id` 加路径命名空间、`chunk_id` 分隔符编码、PDF 真实字符偏移、混合型 PDF `partial`）。
+  - `s1.2`：第二轮审查后（`document_id` 路径摘要 8→16 位、加密 PDF 先判 `is_encrypted` 再按 `decrypt("")` 返回值定成败并新增 `password_required`）。**路径摘要变长会改 `document_id`，`parser_version` 与 `chunker_version` 又都进入 `chunk_id` 的哈希输入，因此同一文件在 s1.2 下 chunk_id 整批换代**——这是刻意的，用于区分旧索引。
+- 说明：`document_id` 公式在前两轮审查中各有修正（加入路径命名空间、摘要加长）。本分支尚未合并、未产出任何正式产物，因此没有历史 chunk_id 需要迁移。
 - 解析结果不做跨进程缓存：每次调用重新解析（当前知识库很小），保证「文件即真相」；向量缓存仍按 `content_hash` 复用，不受 chunk_id 变化影响。
 
 ---
@@ -200,14 +223,15 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 |---|---|---|
 | `document_service.load_chunks(directory=None)` | 旧结构 `{content, source}` | `load_chunks(directory, with_metadata=True)` 或 `load_chunk_records(directory)` 返回 15 字段记录（外加 `source`） |
 | `rag_service.load_chunks(directory=None)` | 旧结构（转发到 `document_service.load_chunks`，不传 `with_metadata`） | `rag_service.load_chunks(directory, with_metadata=True)` / `rag_service.load_chunk_records(directory)` |
-| `rag_service.retrieve_chunks(query, top_k, with_metadata=False)` | 旧结构 `{content, source, score}` | `with_metadata=True` 时追加 `chunk_id/document_id/document_hash/file_type/page_number/printed_page_number/heading_path/paragraph_index/source_spans/parser_version/chunker_version` |
+| `rag_service.retrieve_chunks(query, top_k, with_metadata=False)` | 旧结构 `{content, source, score}` | `with_metadata=True` 时追加 `chunk_id/document_id/document_hash/file_type/page_number/printed_page_number/heading_path/paragraph_index/source_spans/parser_version/chunker_version`，并额外带文档级 `document_status`（`ok` / `partial`；查不到状态时为 `None`） |
 | `rag_service._retrieve_vector` / `_retrieve_hybrid` | 同上 | 同上（`with_metadata` 透传） |
+| `document_service.load_chunk_records_with_states(directory)` / `rag_service.load_chunks_with_states(directory)` | — | 返回 `(records, states)`，`states = {source: {status, pages_total, pages_with_text, missing_pages}}`；一次扫描不重复解析 |
 
 理由：这些精确断言是既有消费方的契约（前端、评测脚本、Prompt 组装都按三字段读），改默认值等于静默破坏；显式开关让新消费方拿到定位信息，同时不制造回归。
 
 Hybrid 去重键同步升级：`_chunk_key()` 有 `chunk_id` 时用 `("chunk_id", id)`，否则退回旧的 `("content", source, content)`——默认路径行为与升级前完全一致。
 
-> 唯一改动的既有测试：`test_upload.py` 里被拒类型的用例（原断言「目前只支持 .txt 文件」，现文案「目前只支持 .txt / .pdf / .docx 文件」，被拒类型改为 md/xlsx/png/jpg）。属于**有意的契约变更**，PR 说明里单独标出。
+> 唯一改动的既有测试：`test_upload.py`（1）被拒类型的用例（原断言「目前只支持 .txt 文件」，现文案「目前只支持 .txt / .pdf / .docx 文件」，被拒类型改为 md/xlsx/png/jpg）；（2）新增三个 PDF 上传的 API 级用例（完整 PDF = `ok`、混合型 PDF = `partial` 且 message 明确“解析不完整”、全扫描 PDF = 400 + `no_text_layer`）。属于**有意的契约变更与新增覆盖**，PR 说明里单独标出。
 
 ---
 
@@ -237,6 +261,7 @@ Hybrid 去重键同步升级：`_chunk_key()` 有 `chunk_id` 时用 `("chunk_id"
 | chunk_id 随正文变 | 刻意性质 | manifest 保留旧版本记录用于对照 |
 | TXT `find` 失败 | 退化为游标起算的保守区间 | 不跳过、不丢内容；测试覆盖正常路径 |
 | DOCX 页码 | 恒为 `None` | 不虚构；需要页码时以 PDF 为准 |
+| 带打开密码的 PDF | 无法解析（`password_required`），不落盘、不进索引 | 需先解除加密；本阶段不做密码输入 |
 
 ---
 

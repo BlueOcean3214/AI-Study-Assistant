@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from document_parser import TextBlock
 
 # 切片器版本：切分规则（合并、断点、空白处理）一改就要升版
-CHUNKER_VERSION = "s1.1"
+# chunker_version 与 parser_version 都是 chunk_id 的哈希输入：
+# 任一个升版，同一文件同一内容的 chunk_id 都会整批换代（这是刻意的，便于识别旧索引）
+CHUNKER_VERSION = "s1.2"
 
 CHUNK_FIELDS = (
     "document_id",
