@@ -335,8 +335,8 @@ async def upload_document(file: UploadFile = File(...)):
     if not filename:
         return upload_error("文件名不能为空")
 
-    if Path(filename).suffix.lower() != ".txt":
-        return upload_error("目前只支持 .txt 文件")
+    if Path(filename).suffix.lower() not in document_service.ALLOWED_SUFFIXES:
+        return upload_error("目前只支持 .txt / .pdf / .docx 文件")
 
     # 2. 读取 bytes，并限制大小
 
@@ -358,16 +358,12 @@ async def upload_document(file: UploadFile = File(...)):
 
         return upload_error(str(error))
 
-    # 4. 复用 document_service 统计这篇文档切成了多少 chunk
+    # 4. 复用 document_service 统计这篇文档切成了多少 chunk（TXT / PDF / DOCX 同一口径）
 
     try:
 
-        text = document_service.read_text(
-            document_service.KNOWLEDGE_PATH / source
-        )
-
         chunk_count = len(
-            document_service.chunk_text(text, source)
+            document_service.chunk_file(source)
         )
 
     except document_service.DocumentError:

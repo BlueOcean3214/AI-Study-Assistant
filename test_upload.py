@@ -168,8 +168,8 @@ try:
 
     # 4. 非 txt 被拒绝
     for bad_name, bad_type in (
-        ("notes.pdf", "application/pdf"),
-        ("word.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("notes.md", "text/markdown"),
+        ("data.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         ("pic.png", "image/png"),
         ("photo.jpg", "image/jpeg"),
     ):
@@ -179,8 +179,9 @@ try:
             timeout=30,
         )
         check(
-            f"拒绝非 txt 文件 {bad_name}",
-            bad.status_code == 400 and bad.json().get("message") == "目前只支持 .txt 文件",
+            f"拒绝不支持的文件类型 {bad_name}",
+            bad.status_code == 400
+            and bad.json().get("message") == "目前只支持 .txt / .pdf / .docx 文件",
             f"status={bad.status_code} body={bad.text[:80]}",
         )
 

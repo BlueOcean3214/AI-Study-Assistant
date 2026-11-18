@@ -270,10 +270,22 @@ def split_into_chunks(text, max_chars=CHUNK_MAX_CHARS):
     return _split_into_chunks(text, max_chars)
 
 
-def load_chunks():
-    """读取并切片，返回 [{"content", "source"}]。"""
+def load_chunks(directory=None, with_metadata=False):
+    """读取并切片。
 
-    return _load_chunks(KNOWLEDGE_PATH)
+    默认返回 [{"content", "source"}]（旧结构，任何调用方都不受影响）；
+    with_metadata=True 时返回带完整来源定位的富记录（见 document_service.load_chunk_records）。
+    """
+
+    return _load_chunks(KNOWLEDGE_PATH if directory is None else directory,
+                        with_metadata=with_metadata)
+
+
+def load_chunk_records(directory=None):
+    """读取并切片，只返回富记录（chunk_id / 页码 / 标题路径 / 来源范围等）。"""
+
+    return _load_chunks(KNOWLEDGE_PATH if directory is None else directory,
+                        with_metadata=True)
 
 
 def _cosine_similarity(vector_a, vector_b):
@@ -432,8 +444,53 @@ def _bm25_ranked(query, chunks, limit):
             for index_position, score in index.search(query, limit)]
 
 
-def _retrieve_vector(query, chunks, top_k):
-    """纯向量模式：返回结构与历史版本完全一致 [{content, source, score}]。"""
+# 检索结果的默认键（冻结契约）：任何模式下都至少是这三个
+RESULT_BASE_FIELDS = ("content", "source", "score")
+
+# with_metadata=True 时额外带出的来源定位字段（顺序固定，便于断言）
+RESULT_METADATA_FIELDS = (
+    "chunk_id",
+    "document_id",
+    "document_hash",
+    "file_type",
+    "page_number",
+    "printed_page_number",
+    "heading_path",
+    "paragraph_index",
+    "source_spans",
+    "parser_version",
+    "chunker_version",
+)
+
+
+def _chunk_key(chunk):
+    """去重键：富记录用 chunk_id，旧结构退回 (source, content)。"""
+
+    chunk_id = chunk.get("chunk_id")
+
+    if chunk_id:
+        return ("chunk_id", chunk_id)
+
+    return ("content", chunk.get("source"), chunk.get("content"))
+
+
+def _result_entry(chunk, with_metadata):
+    """构造检索结果的前两个键，富模式再附加来源定位字段。"""
+
+    entry = {
+        "content": chunk["content"],
+        "source": chunk["source"],
+    }
+
+    if with_metadata:
+        for field in RESULT_METADATA_FIELDS:
+            entry[field] = chunk.get(field)
+
+    return entry
+
+
+def _retrieve_vector(query, chunks, top_k, with_metadata=False):
+    """纯向量模式：默认返回结构与历史版本完全一致 [{content, source, score}]。"""
 
     try:
         ranked = _vector_ranked(query, chunks, top_k)
@@ -442,16 +499,21 @@ def _retrieve_vector(query, chunks, top_k):
         print("embedding 调用失败:", error)
         return []
 
-    return [
-        {"content": chunk["content"], "source": chunk["source"], "score": score}
-        for chunk, score in ranked
-    ]
+    results = []
+
+    for chunk, score in ranked:
+        entry = _result_entry(chunk, with_metadata)
+        entry["score"] = score
+        results.append(entry)
+
+    return results
 
 
-def _retrieve_hybrid(query, chunks, top_k):
+def _retrieve_hybrid(query, chunks, top_k, with_metadata=False):
     """混合模式：向量 + BM25 两路排名做 RRF 融合。
 
-    - 同一 (source, content) 片段两路都命中时去重，融合分数相加，matched_by 记录命中通道
+    - 同一片段两路都命中时去重（富记录按 chunk_id，旧结构按 (source, content)），
+      融合分数相加，matched_by 记录命中通道
     - MIN_SCORE 只约束向量通道；BM25 通道的候选规则是“至少命中一个查询词（分数>0）”
     - score 是 RRF 排名融合分（score_type="rrf_fusion"），vector_score 才是余弦相似度，
       两者量纲不同，不做数值混合
@@ -491,7 +553,7 @@ def _retrieve_hybrid(query, chunks, top_k):
     fused = {}
 
     def entry_for(chunk):
-        key = (chunk.get("source"), chunk.get("content"))
+        key = _chunk_key(chunk)
 
         if key not in fused:
             fused[key] = {
@@ -505,7 +567,7 @@ def _retrieve_hybrid(query, chunks, top_k):
 
     # vector_score 记录真实余弦（含低于 MIN_SCORE 的），只有过阈值进入候选排名的才算命中向量通道
     cosine_by_key = {
-        (chunk.get("source"), chunk.get("content")): score
+        _chunk_key(chunk): score
         for chunk, score in vector_all
     }
 
@@ -536,25 +598,28 @@ def _retrieve_hybrid(query, chunks, top_k):
     for entry in merged[:top_k]:
         chunk = entry["chunk"]
 
-        results.append({
-            "content": chunk["content"],
-            "source": chunk["source"],
-            "score": round(entry["fusion"], 6),
-            "score_type": "rrf_fusion",
-            "vector_score": entry["vector_score"],
-            "matched_by": entry["matched_by"],
-        })
+        result = _result_entry(chunk, with_metadata)
+        result["score"] = round(entry["fusion"], 6)
+        result["score_type"] = "rrf_fusion"
+        result["vector_score"] = entry["vector_score"]
+        result["matched_by"] = entry["matched_by"]
+
+        results.append(result)
 
     return results
 
 
-def retrieve_chunks(query, top_k=TOP_K):
+def retrieve_chunks(query, top_k=TOP_K, with_metadata=False):
     """检索最相关的前 top_k 个片段（模式由 RAG_RETRIEVAL_MODE 决定）。
 
     返回格式：
     - vector 模式：[{"content", "source", "score"}]（score = 余弦相似度）
     - hybrid 模式：[{...同上, "score_type", "vector_score", "matched_by"}]
       （score = RRF 融合分，仅用于排序）
+    - with_metadata=True：在上面基础上追加来源定位字段
+      （chunk_id / document_id / document_hash / file_type / page_number /
+       printed_page_number / heading_path / paragraph_index / source_spans /
+       parser_version / chunker_version），去重也改为按 chunk_id
     """
 
     started = time.perf_counter()
@@ -562,7 +627,8 @@ def retrieve_chunks(query, top_k=TOP_K):
     if not isinstance(query, str) or not query.strip():
         return []
 
-    chunks = load_chunks()
+    # 默认路径用不传参的 load_chunks()，保持与历史实现完全一致的调用方式
+    chunks = load_chunks(with_metadata=True) if with_metadata else load_chunks()
 
     if not chunks:
         return []
@@ -570,9 +636,9 @@ def retrieve_chunks(query, top_k=TOP_K):
     mode = retrieval_mode()
 
     if mode == RETRIEVAL_MODE_HYBRID:
-        results = _retrieve_hybrid(query, chunks, top_k)
+        results = _retrieve_hybrid(query, chunks, top_k, with_metadata=with_metadata)
     else:
-        results = _retrieve_vector(query, chunks, top_k)
+        results = _retrieve_vector(query, chunks, top_k, with_metadata=with_metadata)
 
     _log_retrieval_metrics(query, results, time.perf_counter() - started, mode)
 
