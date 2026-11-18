@@ -240,7 +240,17 @@ def broken_embedding():
 
 @contextlib.contextmanager
 def isolated_environment(case, isolate=True):
-    """夹具数据库 + 夹具缓存 + 故障注入 + 确认凭证隔离。"""
+    """夹具数据库 + 夹具缓存 + 故障注入 + 确认凭证隔离。
+
+    try 的范围必须覆盖「路径切换 + init_db + seed_database + yield」：
+    初始化失败、播种失败、用例失败三种情况都会让控制权离开本上下文，
+    只要有任何一步在 try 之外，退出时就不会恢复进入前的真实路径，
+    进程后续所有数据库/缓存读写都会落到夹具或真实开发库上。
+
+    reset_cache 的调用位置固定在路径恢复之后：先把两个全局路径改回真实值，
+    再清 rag_service 的进程内缓存；顺序反了会把夹具缓存的条目当成真实目录的
+    缓存继续复用（夹具库已换掉，向量却还是旧的）。
+    """
 
     # 每个用例开始前清空确认凭证：P5 在夹具内自行创建并确认自己的凭证
     confirmation_service.reset_confirmations()
@@ -252,24 +262,25 @@ def isolated_environment(case, isolate=True):
     previous_database_path = database.DATABASE_PATH
     previous_cache_dir = vector_cache.CACHE_DIR
 
-    if isolate:
-        # 不在用例之间删除数据库文件：sqlite 连接靠 GC 释放，
-        # Windows 上立刻 unlink 会因文件仍被占用而失败。
-        # 每个用例用 delete_all_feedback() + 播种来重置数据即可。
-        database.DATABASE_PATH = FIXTURE_DB
-        vector_cache.CACHE_DIR = FIXTURE_CACHE
-        database.init_db()
-        seed_database(case.get("seed"))
-
     patches = broken_embedding() if case.get("inject") == "broken_embedding" else contextlib.nullcontext()
 
     try:
+        if isolate:
+            # 不在用例之间删除数据库文件：sqlite 连接靠 GC 释放，
+            # Windows 上立刻 unlink 会因文件仍被占用而失败。
+            # 每个用例用 delete_all_feedback() + 播种来重置数据即可。
+            database.DATABASE_PATH = FIXTURE_DB
+            vector_cache.CACHE_DIR = FIXTURE_CACHE
+            database.init_db()
+            seed_database(case.get("seed"))
+
         with patches:
             yield
     finally:
         if isolate:
             database.DATABASE_PATH = previous_database_path
             vector_cache.CACHE_DIR = previous_cache_dir
+            # 顺序要求：路径恢复之后才允许清缓存。
             rag_service.reset_cache()
 
 
