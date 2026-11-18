@@ -1196,15 +1196,20 @@ def _commit_conclusion(memory, conn, info, status=None, extra_fields=None):
     return database.get_memory(memory["id"], conn=conn)
 
 
-def _plan_difficulties_for(rows, conn, subject_key=None):
+def _plan_difficulties_for(rows, conn, subject_key=None, cache=None):
     """给带 plan_id 的反馈补齐 plans.difficulty（time_pattern 的关系判定要用）。
 
     subject_key 非 None 时按 §5.2 做完整有效性校验（plan 存在、难度合法且等于
     subject_key、estimated_minutes > 0），无效行不进返回字典——调用方的
     evaluate 会把它们计成 invalid_plan，既不参与统计也不写正式证据。
+
+    cache 传请求级缓存时与 _plan_difficulty_for_row() 共用同一份 plan 行：
+    两边都按 plan_id 存「plan 字典或 None」，不能存 difficulty，否则另一方会
+    把字符串当成 plan 字典用。plans 在一次 apply_feedback 内不会被改动，
+    所以复用一个请求内的读结果不改变任何判定。
     """
 
-    cache = {}
+    plan_cache = {} if cache is None else cache
     result = {}
 
     for row in rows:
@@ -1218,16 +1223,16 @@ def _plan_difficulties_for(rows, conn, subject_key=None):
             continue
 
         if subject_key is not None:
-            difficulty = _plan_difficulty_for_row(row, subject_key, conn, cache)
+            difficulty = _plan_difficulty_for_row(row, subject_key, conn, plan_cache)
             if difficulty is not None:
                 result[row["id"]] = difficulty
             continue
 
-        if plan_id not in cache:
-            plan = database.get_plan_by_id(plan_id, conn=conn)
-            cache[plan_id] = None if plan is None else plan.get("difficulty")
+        if plan_id not in plan_cache:
+            plan_cache[plan_id] = database.get_plan_by_id(plan_id, conn=conn)
 
-        result[row["id"]] = cache[plan_id]
+        plan = plan_cache[plan_id]
+        result[row["id"]] = None if plan is None else plan.get("difficulty")
 
     return result
 
@@ -1306,7 +1311,9 @@ def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id
     plan_difficulties = None
 
     if memory_type == "time_pattern":
-        plan_difficulties = _plan_difficulties_for(rows, conn, memory["subject_key"])
+        plan_difficulties = _plan_difficulties_for(
+            rows, conn, memory["subject_key"], cache
+        )
 
     conclusion = evaluate(memory_type, rows, as_of, plan_difficulties)
     value = dict(conclusion["value"])
@@ -1652,7 +1659,9 @@ def _drain_pending(memory, trigger, as_of, conn, info, cache=None):
     plan_difficulties = {}
 
     if memory["memory_type"] == "time_pattern":
-        plan_difficulties = _plan_difficulties_for(valid, conn, memory["subject_key"])
+        plan_difficulties = _plan_difficulties_for(
+            valid, conn, memory["subject_key"], cache
+        )
 
     evidence_ids = []
     consumed_ids = []
@@ -1720,7 +1729,13 @@ def _drain_pending(memory, trigger, as_of, conn, info, cache=None):
         return 0
 
     value = _episode_value(
-        memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+        memory,
+        as_of,
+        conn,
+        direction,
+        end_feedback_id=trigger["id"],
+        info=info,
+        cache=cache,
     )
     _finalize(
         memory,
@@ -1765,7 +1780,10 @@ def _try_promote(memory, trigger, as_of, conn, info, cache=None):
         return False
 
     plan_difficulties = _plan_difficulties_for(
-        rows, conn, memory["subject_key"] if memory["memory_type"] == "time_pattern" else None
+        rows,
+        conn,
+        memory["subject_key"] if memory["memory_type"] == "time_pattern" else None,
+        cache,
     )
     conclusion = evaluate(memory["memory_type"], rows, as_of, plan_difficulties)
 
@@ -1815,7 +1833,13 @@ def _try_promote(memory, trigger, as_of, conn, info, cache=None):
     probe["episode"] = episode
     probe["episode_start_feedback_id"] = episode_start_feedback_id
     value = _episode_value(
-        probe, as_of, conn, value["direction"], episode=episode, end_feedback_id=trigger["id"]
+        probe,
+        as_of,
+        conn,
+        value["direction"],
+        episode=episode,
+        end_feedback_id=trigger["id"],
+        cache=cache,
     )
 
     payload = _conclusion_payload(
@@ -1861,7 +1885,7 @@ def _try_promote(memory, trigger, as_of, conn, info, cache=None):
     _write_event(memory["id"], event_type, detail, as_of, conn, info)
 
     refreshed = database.get_memory(memory["id"], conn=conn)
-    _drain_pending(refreshed, trigger, as_of, conn, info)
+    _drain_pending(refreshed, trigger, as_of, conn, info, cache)
 
     return True
 
