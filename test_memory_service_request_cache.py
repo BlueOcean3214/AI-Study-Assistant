@@ -5,12 +5,15 @@
 1. 查询计数：一次 apply_feedback 里同一个窗口 SQL / 同一个 plan 只回表一次，
    无论请求走到普通更新、pending 消费、只有 neutral、resolved/archived 晋升还是
    time_pattern 的 plan 校验。
-2. 业务结果一致性：关掉缓存（强制 cache=None）重跑同一串反馈，最终落库状态与
-   info 计数必须逐行相同——缓存只能省查询，不能改判定。
+2. 业务结果一致性：关掉缓存（把三个读取侧缓存入口全部强制 cache=None）重跑
+   同一串反馈，最终落库状态与 info 计数必须逐行相同——缓存只能省查询，不能
+   改判定。三个入口是 _window_rows / _plan_difficulties_for /
+   _plan_difficulty_for_row，只关前两个不算无缓存对照。
 
 测试全程只用自己的 tempfile 子目录，不碰仓库 feedback.db / .rag_cache。
 """
 
+import contextlib
 import gc
 import json
 import os
@@ -404,50 +407,138 @@ def test_time_pattern_plan_lookup_once_per_plan():
         _cleanup(db_dir)
 
 
-def _promotion_scenario(db_dir, disable_cache):
-    """resolved → active 的晋升场景；返回 (info, 全库快照)。"""
+def _disable_request_cache():
+    """把所有读取侧缓存入口强制改成 cache=None；返回 (restore, stats)。
 
-    _activate(db_dir)
-    plan_ids = _seed_easy_plans()
-    memory = _seed_time_pattern_memory(status="resolved", pending_episode=2)
-    pending_ids = [
-        _insert_feedback(f"2026-11-1{4 + index}T10:00:00", plan_id=plan_id,
-                         estimated_minutes=20, actual_minutes=40)
-        for index, plan_id in enumerate(plan_ids)
-    ]
-    for index, feedback_id in enumerate(pending_ids):
-        database.insert_pending(
-            memory["id"], feedback_id, plan_ids[index], 2,
-            "2026-11-16T12:00:00", "2026-11-16T12:00:00",
+    memory_service 只有三个函数真正读写请求级缓存：
+      - _window_rows(893)              窗口 SQL 的结果
+      - _plan_difficulties_for(1199)   plan 难度批量补齐
+      - _plan_difficulty_for_row(528)  单行 plan 校验（_episode_candidates 与
+                                       _plan_difficulties_for 内部都走它）
+    _candidate_rows / _episode_candidates / _episode_value / _drain_pending /
+    _try_promote / apply_feedback 只是把同一个 cache 往下传，所以三个入口
+    全部置空就等于整条链路无缓存。
+
+    stats["caches_seen"] 记录拿到非 None cache 对象的次数，stats["observed_caches"]
+    保存这些对象本身，跑完必须全部为空字典——即没有任何一次读写落进请求级
+    缓存；stats["plan_row_calls"] 记录单行 plan 校验实际被调用次数，用来证明
+    无缓存对照不是空跑。包装函数保留原名，QuerySpy 才能按调用方名字认出
+    plan 查询。
+    """
+
+    stats = {"caches_seen": 0, "plan_row_calls": 0, "observed_caches": []}
+    originals = {
+        "_window_rows": memory_service._window_rows,
+        "_plan_difficulties_for": memory_service._plan_difficulties_for,
+        "_plan_difficulty_for_row": memory_service._plan_difficulty_for_row,
+    }
+
+    def note_cache(cache):
+        if cache is not None:
+            stats["caches_seen"] += 1
+            if not any(cache is seen for seen in stats["observed_caches"]):
+                stats["observed_caches"].append(cache)
+
+    def _window_rows(start, end, max_id, conn, cache=None, with_plan_difficulty=None):
+        note_cache(cache)
+        return originals["_window_rows"](
+            start, end, max_id, conn, None, with_plan_difficulty
         )
 
-    trigger_id = _insert_feedback(
+    def _plan_difficulties_for(rows, conn, subject_key=None, cache=None):
+        note_cache(cache)
+        return originals["_plan_difficulties_for"](rows, conn, subject_key, None)
+
+    def _plan_difficulty_for_row(row, subject_key, conn, cache=None):
+        note_cache(cache)
+        stats["plan_row_calls"] += 1
+        return originals["_plan_difficulty_for_row"](row, subject_key, conn, None)
+
+    memory_service._window_rows = _window_rows
+    memory_service._plan_difficulties_for = _plan_difficulties_for
+    memory_service._plan_difficulty_for_row = _plan_difficulty_for_row
+
+    def restore():
+        memory_service._window_rows = originals["_window_rows"]
+        memory_service._plan_difficulties_for = originals["_plan_difficulties_for"]
+        memory_service._plan_difficulty_for_row = originals["_plan_difficulty_for_row"]
+
+    return restore, stats
+
+
+@contextlib.contextmanager
+def _cache_disabled():
+    """无缓存对照的上下文：进入时关掉三个入口，退出时在 finally 里恢复。"""
+
+    restore, stats = _disable_request_cache()
+    try:
+        yield stats
+    finally:
+        restore()
+
+
+def _scenario_active_update():
+    """active 记忆重算：task_performance 记忆 + 3 条历史证据 + 触发反馈。"""
+
+    key, label = memory_service.normalize_subject("专项练习")
+    memory = _insert_memory(
+        "task_performance", key, label,
+        {"samples": 3, "rate": 1.0, "direction": "high"},
+    )
+    for index in range(3):
+        feedback_id = _insert_feedback(f"2026-11-1{4 + index}T10:00:00")
+        database.insert_evidence(
+            memory["id"], feedback_id, None, memory["episode"], "supports",
+            f"2026-11-1{4 + index}T10:00:00",
+        )
+    return _insert_feedback("2026-11-17T10:00:00")
+
+
+def _scenario_pending_drain():
+    """pending 消费：difficulty 记忆 + 2 条 pending + partial 触发。"""
+
+    key, label = memory_service.normalize_subject("专项练习")
+    memory = _insert_memory(
+        "difficulty", key, label,
+        {"failed_count": 2, "window_days": 30, "direction": "supports"},
+    )
+    for created_at in ("2026-11-15T10:00:00", "2026-11-16T10:00:00"):
+        feedback_id = _insert_feedback(created_at)
+        database.insert_pending(
+            memory["id"], feedback_id, None, memory["episode"],
+            "2026-11-16T12:00:00", "2026-11-16T12:00:00",
+        )
+    return _insert_feedback("2026-11-17T10:00:00", status="partial", reason="任务难度太高")
+
+
+def _scenario_time_pattern_promotion():
+    """resolved → active 晋升：time_pattern 记忆 + 3 条带 plan 的 pending + 触发。"""
+
+    plan_ids = _seed_easy_plans()
+    memory = _seed_time_pattern_memory(status="resolved", pending_episode=2)
+    for index, plan_id in enumerate(plan_ids):
+        feedback_id = _insert_feedback(
+            f"2026-11-1{4 + index}T10:00:00", plan_id=plan_id,
+            estimated_minutes=20, actual_minutes=40,
+        )
+        database.insert_pending(
+            memory["id"], feedback_id, plan_id, 2,
+            "2026-11-16T12:00:00", "2026-11-16T12:00:00",
+        )
+    return _insert_feedback(
         "2026-11-17T10:00:00", plan_id=plan_ids[2], estimated_minutes=20,
         actual_minutes=40,
     )
 
-    if not disable_cache:
-        result = _apply(trigger_id)
-        return result, _snapshot(database.DATABASE_PATH)
 
-    original_window = memory_service._window_rows
-    original_difficulties = memory_service._plan_difficulties_for
-
-    def window_rows(start, end, max_id, conn, cache=None, with_plan_difficulty=None):
-        return original_window(start, end, max_id, conn, None, with_plan_difficulty)
-
-    def plan_difficulties(rows, conn, subject_key=None, cache=None):
-        return original_difficulties(rows, conn, subject_key, None)
-
-    memory_service._window_rows = window_rows
-    memory_service._plan_difficulties_for = plan_difficulties
-    try:
-        result = _apply(trigger_id)
-    finally:
-        memory_service._window_rows = original_window
-        memory_service._plan_difficulties_for = original_difficulties
-
-    return result, _snapshot(database.DATABASE_PATH)
+SNAPSHOT_TABLES = (
+    "feedbacks",
+    "plans",
+    "learning_memories",
+    "memory_evidence",
+    "memory_events",
+    "memory_pending_evidence",
+)
 
 
 def test_promotion_path_shares_cache():
@@ -495,32 +586,90 @@ def test_promotion_path_shares_cache():
 
 
 def _snapshot(db_path):
-    tables = ("feedbacks", "plans", "learning_memories", "memory_evidence",
-              "memory_events", "memory_pending_evidence")
     snapshot = {}
     with sqlite3.connect(db_path) as conn:
-        for table in tables:
-            snapshot[table] = conn.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+        for table in SNAPSHOT_TABLES:
+            snapshot[table] = conn.execute(
+                f"SELECT * FROM {table} ORDER BY id"
+            ).fetchall()
     return snapshot
 
 
-def test_cached_and_uncached_runs_match():
-    cached_dir = _temp_dir()
-    plain_dir = _temp_dir()
-    try:
-        cached_result, cached_snapshot = _promotion_scenario(cached_dir, disable_cache=False)
-        plain_result, plain_snapshot = _promotion_scenario(plain_dir, disable_cache=True)
+def _run_scenario(builder, db_dir, disable_cache):
+    """在全新临时库里跑一个场景，返回 info、全库快照与查询计数。"""
 
-        check("一致性：info 计数完全相同", cached_result["info"] == plain_result["info"],
-              f"{cached_result['info']} != {plain_result['info']}")
-        for table in ("feedbacks", "plans", "learning_memories", "memory_evidence",
-                      "memory_events", "memory_pending_evidence"):
-            check(f"一致性：{table} 逐行相同",
-                  cached_snapshot[table] == plain_snapshot[table],
-                  f"{len(cached_snapshot[table])} != {len(plain_snapshot[table])}")
+    _activate(db_dir)
+    trigger_id = builder()
+
+    spy = QuerySpy().install()
+    try:
+        if disable_cache:
+            with _cache_disabled() as stats:
+                result = _apply(trigger_id)
+        else:
+            stats = {"caches_seen": 0, "plan_row_calls": 0, "observed_caches": []}
+            result = _apply(trigger_id)
     finally:
-        _cleanup(cached_dir)
-        _cleanup(plain_dir)
+        spy.restore()
+
+    return {
+        "info": result["info"],
+        "snapshot": _snapshot(database.DATABASE_PATH),
+        "window_calls": len(spy.window),
+        "plan_calls": spy.cache_plan_calls(),
+        "stats": stats,
+    }
+
+
+def _check_scenario_matches(label, cached, plain, expect_plan_lookups=False):
+    """缓存版与无缓存版逐项比较：info + 六张表逐行 + 查询次数方向。"""
+
+    check(f"{label}：无缓存版的请求级 cache 始终为空",
+          all(len(cache) == 0 for cache in plain["stats"]["observed_caches"]),
+          f"观察到 {plain['stats']['caches_seen']} 次 cache 传递，非空条目="
+          f"{[len(cache) for cache in plain['stats']['observed_caches']]}")
+    check(f"{label}：apply_feedback 返回的 info 完全相同",
+          cached["info"] == plain["info"],
+          f"{cached['info']} != {plain['info']}")
+    for table in SNAPSHOT_TABLES:
+        check(f"{label}：{table} 逐行相同",
+              cached["snapshot"][table] == plain["snapshot"][table],
+              f"{len(cached['snapshot'][table])} 行 vs "
+              f"{len(plain['snapshot'][table])} 行")
+    check(f"{label}：缓存版窗口查询次数不多于无缓存版",
+          cached["window_calls"] <= plain["window_calls"],
+          f"{cached['window_calls']} vs {plain['window_calls']}")
+    if expect_plan_lookups:
+        check(f"{label}：无缓存对照确实走到了单行 plan 校验",
+              plain["stats"]["plan_row_calls"] > 0, str(plain["stats"]))
+        check(f"{label}：缓存版 plan 回表次数少于无缓存版",
+              len(cached["plan_calls"]) < len(plain["plan_calls"]),
+              f"{len(cached['plan_calls'])} vs {len(plain['plan_calls'])}")
+
+
+def test_cached_and_uncached_runs_match():
+    """同一串反馈跑两遍：一遍带请求级缓存，一遍完全关掉，结果必须一致。
+
+    三个场景各起两个全新临时库：active 重算、pending 消费、resolved 晋升；
+    晋升场景还要求无缓存版真的调用过单行 plan 校验、缓存版真的少回表，否则
+    「cache 始终为空」只是个空断言。
+    """
+
+    scenarios = (
+        ("active 更新", _scenario_active_update, False),
+        ("pending 消费", _scenario_pending_drain, False),
+        ("resolved 晋升", _scenario_time_pattern_promotion, True),
+    )
+    for label, builder, expect_plan_lookups in scenarios:
+        cached_dir = _temp_dir()
+        plain_dir = _temp_dir()
+        try:
+            cached = _run_scenario(builder, cached_dir, disable_cache=False)
+            plain = _run_scenario(builder, plain_dir, disable_cache=True)
+            _check_scenario_matches(label, cached, plain, expect_plan_lookups)
+        finally:
+            _cleanup(cached_dir)
+            _cleanup(plain_dir)
 
 
 def _run_all():
