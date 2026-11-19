@@ -25,6 +25,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -305,15 +306,19 @@ def test_insert_feedback_without_plan_id_still_works():
 def test_get_feedback_since_returns_plan_id_and_keeps_clamping():
     remove_file(UNIT_DB)
 
+    # get_feedback_since 使用 datetime.now() - days 计算滚动窗口。
+    # 测试数据也必须使用当前时间，不能固定在某一天，否则测试经过 7 天后自然过期。
+    recent_created_at = datetime.now().isoformat(timespec="seconds")
+
     with fixture_database(UNIT_DB):
         database.init_db()
-        database.insert_feedback(_feedback(plan_id=3), "2026-11-10T12:10:00")
+        database.insert_feedback(_feedback(plan_id=3), recent_created_at)
 
         rows = database.get_feedback_since(days=7, limit=20)
         clamped = database.get_feedback_since(days=0, limit=999)
 
     assert len(rows) == 1 and rows[0]["plan_id"] == 3
-    assert len(clamped) == 1, "非法 days 回退 7 后仍应查到今天的记录"
+    assert len(clamped) == 1, "非法 days 回退 7 后仍应查到刚写入的近期记录"
 
     print("PASS: get_feedback_since 返回 plan_id，days/limit 钳制行为不变")
 
