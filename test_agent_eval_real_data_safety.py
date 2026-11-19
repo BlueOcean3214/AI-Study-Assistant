@@ -14,13 +14,17 @@
    字典、白名单外新 id、注入 setup/after_run 都无法借 read_only=True 混进来；
 6. 真实数据模式在 Agent 工具层也只读：Schema 不暴露 save_plan，Dispatcher
    对写工具直接拒绝；退出后完整 Schema 恢复；
-7. 真实数据模式不把用量写入真实库，且退出后记录器与记录能力都恢复。
+7. 真实数据模式不把用量写入真实库，且退出后记录器与记录能力都恢复；
+8. 真实数据模式不初始化真实库、不动进入前已建的确认凭证；收尾清理自己抛异常时，
+   数据安全验证仍要执行，清理失败与安全结果同时进报告，退出码仍为非零。
 
 全部使用 tempfile 临时目录、临时 SQLite 与合成数据；不读写正式 feedback.db、
 不碰仓库里的 _eval_fixture.db / _eval_cache，不调用真实 LLM / Embedding。
 """
 
+import contextlib
 import hashlib
+import io
 import os
 import shutil
 import sqlite3
@@ -406,9 +410,30 @@ def main():
         )
         llm_client._chat_openai = stub_chat_openai
 
+        # 真实模式还必须「不初始化真实库」：init_db 会 CREATE TABLE / 建索引，
+        # 即使不写数据也可能改库。reset_confirmations 会清掉进入前残留的真实凭证，
+        # 真实数据模式不该动它。两处都打桩计数，调到一次就算违规。
+        init_db_hits = []
+        reset_confirmations_hits = []
+        original_init_db = database.init_db
+        original_reset_confirmations = confirmation_service.reset_confirmations
+
+        def forbidden_init_db(*_args, **_kwargs):
+            init_db_hits.append("call")
+            raise AssertionError("真实数据模式调用了 database.init_db")
+
+        def forbidden_reset_confirmations(*_args, **_kwargs):
+            reset_confirmations_hits.append("call")
+            raise AssertionError("真实数据模式调用了 confirmation_service.reset_confirmations")
+
+        database.init_db = forbidden_init_db
+        confirmation_service.reset_confirmations = forbidden_reset_confirmations
+
         try:
             real_report = agent_eval.run_all(runner=real_runner, isolate=False)
         finally:
+            database.init_db = original_init_db
+            confirmation_service.reset_confirmations = original_reset_confirmations
             llm_client.get_settings = original_llm_settings
             llm_client._chat_openai = original_chat_openai
             for case in agent_eval_cases.EVAL_CASES:
@@ -423,6 +448,17 @@ def main():
 
         executed = [item["case_id"] for item in real_report["cases"]]
         skipped = {item["case_id"]: item["reason"] for item in real_report["skipped"]}
+
+        check(
+            "真实数据模式没有调用 database.init_db（不初始化真实库）",
+            init_db_hits == [],
+            f"hits={init_db_hits}",
+        )
+        check(
+            "真实数据模式没有调用 confirmation_service.reset_confirmations（不动进入前凭证）",
+            reset_confirmations_hits == [],
+            f"hits={reset_confirmations_hits}",
+        )
 
         check(
             "真实数据模式只执行 read_only 白名单",
@@ -797,6 +833,60 @@ def main():
         finally:
             database.DATABASE_PATH = previous_db_path
             llm_client.set_usage_recorder(original_usage_recorder)
+
+        # ---- 4d) 收尾清理自己失败：数据安全证据不能跟着丢 ----
+        # clean_fixtures() 抛异常时若跳过 verify_data_safety，报告里就没有
+        # 「真实库是否被改」的证据，退出码也可能变成 0。这里把旧实现打回去。
+        original_verify = agent_eval.verify_data_safety
+        original_embedding = embedding_service.get_embedding
+        verify_calls = []
+
+        def tracking_verify(safety_baseline):
+            verify_calls.append("verify")
+            return original_verify(safety_baseline)
+
+        def raising_clean():
+            raise RuntimeError("桩：夹具清理失败")
+
+        agent_eval.run_case = recording_run_case
+        agent_eval.clean_fixtures = raising_clean
+        agent_eval.verify_data_safety = tracking_verify
+        embedding_service.get_embedding = lambda text: [0.0]
+        try:
+            cleanup_report = agent_eval.run_all(isolate=True)
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                cleanup_exit = agent_eval.main(["--no-archive"])
+        finally:
+            agent_eval.run_case = original_run_case
+            agent_eval.clean_fixtures = original_clean
+            agent_eval.verify_data_safety = original_verify
+            embedding_service.get_embedding = original_embedding
+
+        check(
+            "清理抛异常时数据安全验证仍然执行（run_all 与 main 各一次）",
+            len(verify_calls) == 2 and bool(cleanup_report["data_safety"]["checks"]),
+            f"verify_calls={len(verify_calls)} checks={len(cleanup_report['data_safety']['checks'])}",
+        )
+        check(
+            "清理失败单独记进报告，且不影响数据安全结果",
+            cleanup_report["cleanup_error"] is not None
+            and cleanup_report["cleanup_error"]["type"] == "RuntimeError"
+            and cleanup_report["data_safety"]["ok"] is True
+            and cleanup_report["summary"]["cleanup_failures"] == 1,
+            f"cleanup_error={cleanup_report['cleanup_error']} "
+            f"safety_ok={cleanup_report['data_safety']['ok']}",
+        )
+        check(
+            "清理失败让整份报告 ok=False（不因数据安全通过就放行）",
+            cleanup_report["ok"] is False,
+            f"ok={cleanup_report['ok']}",
+        )
+        check(
+            "清理失败时 main() 退出码为非零且报告打印出清理失败",
+            cleanup_exit == 1 and "收尾清理失败" in printed.getvalue(),
+            f"exit={cleanup_exit} has_line={'收尾清理失败' in printed.getvalue()}",
+        )
 
         # ---- 5) 路径恢复回归测试继续保留且能通过 ----
         sibling = Path(agent_eval.PROJECT_DIR) / "test_agent_eval_db_restore.py"

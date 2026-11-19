@@ -939,6 +939,16 @@ def run_case(case, runner=None, isolate=True, verbose=False):
     }
 
 
+def _error_detail(error):
+    """把一次异常做成可归档的结构，供报告直接引用。"""
+
+    return {
+        "type": type(error).__name__,
+        "message": str(error),
+        "traceback": traceback.format_exc(),
+    }
+
+
 def run_all(cases=None, runner=None, isolate=True, verbose=False):
     """跑完整场景集，返回评测报告。
 
@@ -981,6 +991,8 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
     run_error = None
     original_error = None
     data_safety = None
+    cleanup_error = None
+    recorder_error = None
     current_case_id = None
 
     try:
@@ -996,16 +1008,23 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
         }
         original_error = error
     finally:
+        # 收尾三件事必须互不阻塞：恢复用量记录器、清理固定夹具、数据安全验证。
+        # 任何一步自己抛异常都不能让后面的步骤被跳过——否则报告和真实库是否被
+        # 改动的安全证据会一起丢，这正是最不能丢证据的时刻。
         try:
             if not isolate:
                 llm_client.set_usage_recorder(previous_recorder)
+        except Exception as error:  # noqa: BLE001 - 恢复失败要进报告，不能盖住安全验证
+            recorder_error = _error_detail(error)
         finally:
             if isolate:
                 # 真实数据模式不拥有固定夹具，绝不清理（见 clean_fixtures 说明）。
-                clean_fixtures()
+                try:
+                    clean_fixtures()
+                except Exception as error:  # noqa: BLE001 - 清理失败单独记一条，不中断验证
+                    cleanup_error = _error_detail(error)
 
-            # 正常结束与用例异常都要留下数据安全证据：异常路径不做验证，
-            # 真实库被改动就没人报。
+            # 正常结束、用例异常、清理失败都要留下数据安全证据。
             try:
                 data_safety = verify_data_safety(baseline)
             except Exception as error:  # noqa: BLE001 - 验证本身失败也是失败
@@ -1014,6 +1033,15 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
                     "failures": [f"数据安全验证本身失败：{type(error).__name__}: {error}"],
                     "checks": [],
                 }
+
+    if data_safety is None:
+        # 只有 BaseException（如 KeyboardInterrupt）会让验证没跑完；报告结构仍要完整，
+        # 不能变成 None 让后面的 report 组装抛 TypeError。
+        data_safety = {
+            "ok": False,
+            "failures": ["数据安全验证未执行（运行被中断）"],
+            "checks": [],
+        }
 
     hard_failures = sum(len(item["evaluation"]["hard_failures"]) for item in results)
     deviations = sum(len(item["evaluation"]["deviations"]) for item in results)
@@ -1034,6 +1062,8 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
             "hard_failures": hard_failures,
             "deviations": deviations,
             "data_safety_failures": len(data_safety["failures"]),
+            "cleanup_failures": 1 if cleanup_error is not None else 0,
+            "recorder_failures": 1 if recorder_error is not None else 0,
             "interrupted": 1 if run_error is not None else 0,
             "passed": sum(
                 1 for item in results
@@ -1041,6 +1071,8 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
             ),
         },
         "data_safety": data_safety,
+        "cleanup_error": cleanup_error,
+        "recorder_error": recorder_error,
         "run_error": run_error,
         "skipped": skipped,
         "cases": results,
@@ -1050,6 +1082,8 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
     report["ok"] = (
         hard_failures == 0
         and data_safety["ok"]
+        and cleanup_error is None
+        and recorder_error is None
         and run_error is None
     )
 
@@ -1128,6 +1162,22 @@ def print_report(report):
 
     for failure in safety["failures"]:
         print(f"  安全检查失败: {failure}")
+
+    cleanup_error = report.get("cleanup_error")
+
+    if cleanup_error:
+        print(
+            "收尾清理失败: "
+            f"{cleanup_error.get('type')}: {cleanup_error.get('message')}"
+        )
+
+    recorder_error = report.get("recorder_error")
+
+    if recorder_error:
+        print(
+            "用量记录器恢复失败: "
+            f"{recorder_error.get('type')}: {recorder_error.get('message')}"
+        )
 
 
 def main(argv=None):
