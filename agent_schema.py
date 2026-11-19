@@ -20,6 +20,7 @@ Schema 中不出现：embedding / vector / cache / MIN_SCORE / SQLite / 数据�
 参数范围直接引用 agent_tools 里的常量，避免说明书和真实实现脱节。
 """
 
+import contextlib
 from copy import deepcopy
 
 from agent_tools import (
@@ -226,16 +227,54 @@ ARGUMENT_RULES = {
 }
 
 
-def get_tool_schemas():
-    """返回 Schema 的深拷贝，避免调用方改动模块级状态。"""
+# 真实数据模式只开放这三个只读工具；save_plan 是唯一写入口，必须留在夹具模式。
+READ_ONLY_TOOL_NAMES = ("get_recent_feedback", "search_knowledge", "get_learning_memory")
 
-    return deepcopy(TOOL_SCHEMAS)
+_READ_ONLY_DEPTH = 0
+
+
+def is_read_only_mode():
+    """当前是否处于真实数据只读上下文（由 read_only_tools 打开）。"""
+
+    return _READ_ONLY_DEPTH > 0
+
+
+@contextlib.contextmanager
+def read_only_tools():
+    """真实数据模式：只暴露只读工具 Schema，嵌套调用按层计数。"""
+
+    global _READ_ONLY_DEPTH
+
+    _READ_ONLY_DEPTH += 1
+
+    try:
+        yield
+    finally:
+        _READ_ONLY_DEPTH -= 1
+
+
+def get_tool_schemas():
+    """返回 Schema 的深拷贝，避免调用方改动模块级状态。
+
+    只读模式下过滤掉写工具：模型连 save_plan 的存在都看不到，
+    Dispatcher 侧另有独立拒绝（见 agent_dispatcher.dispatch）。
+    """
+
+    schemas = deepcopy(TOOL_SCHEMAS)
+
+    if is_read_only_mode():
+        schemas = [
+            schema for schema in schemas
+            if schema["function"]["name"] in READ_ONLY_TOOL_NAMES
+        ]
+
+    return schemas
 
 
 def describe_tools():
-    """一行式工具清单，供系统 Prompt 与日志使用。"""
+    """一行式工具清单，供系统 Prompt 与日志使用（只读模式下同样过滤）。"""
 
     return "\n".join(
         f"- {schema['function']['name']}: {schema['function']['description']}"
-        for schema in TOOL_SCHEMAS
+        for schema in get_tool_schemas()
     )

@@ -97,6 +97,12 @@ def set_usage_recorder(recorder):
     _USAGE_RECORDER = recorder
 
 
+def get_usage_recorder():
+    """当前用量记录函数（None 表示不记录）；供调用方暂存与恢复。"""
+
+    return _USAGE_RECORDER
+
+
 def _env(name, default=None):
     value = os.getenv(name)
 

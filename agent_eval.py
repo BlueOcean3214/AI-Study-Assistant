@@ -25,20 +25,29 @@ import sqlite3
 import sys
 import tempfile
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
 import agent_dispatcher
 import agent_loop
 import agent_plan_draft
+import agent_schema
 import ai_service
 import confirmation_service
 import database
 import embedding_service
+import llm_client
 import plan_service
 import rag_service
 import vector_cache
-from agent_eval_cases import EVAL_CASES, READ_ONLY_CASE_IDS, case_ids, get_case
+from agent_eval_cases import (
+    EVAL_CASES,
+    READ_ONLY_CASE_IDS,
+    canonical_case,
+    case_ids,
+    get_case,
+)
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -57,6 +66,22 @@ RETRIEVAL_METRICS_FILE = PROJECT_DIR / "rag_metrics.jsonl"
 
 class DataSafetyError(RuntimeError):
     """违反真实数据库只读边界（例如把可写用例放进 --real-data）。"""
+
+
+class EvalRunError(RuntimeError):
+    """运行中断（用例抛异常），但数据安全验证仍已完成。
+
+    report 同时保留原始运行异常与数据安全结果：两者不能互相覆盖，
+    退出码因此仍然是失败（非零）。
+    """
+
+    def __init__(self, report):
+        self.report = report
+        run_error = report.get("run_error") or {}
+        super().__init__(
+            f"评测在用例 {run_error.get('case_id')!r} 中断："
+            f"{run_error.get('type')}: {run_error.get('message')}"
+        )
 
 # 墙钟硬检查允许的额外开销（进程/IO 抖动）
 WALL_CLOCK_OVERHEAD_SECONDS = 15
@@ -186,9 +211,24 @@ SEED_ROWS = {
 
 
 def case_is_read_only(case):
-    """是否允许在真实数据库上执行：只认显式 read_only=True（fail-closed）。"""
+    """是否允许在真实数据库上执行（fail-closed，多重条件缺一不可）。
 
-    return case.get("read_only") is True and case.get("id") in READ_ONLY_CASE_IDS
+    1. 必须是 agent_eval_cases 导入时注册的同一个对象（复制 id 的字典不算）；
+    2. 该对象的结构指纹必须与注册时一致（被追加 setup/after_run 也不认）；
+    3. 规范用例本身必须显式 read_only=True，且 id 在显式白名单里；
+    4. 规范用例不得带任何 setup / after_run 回调——真实模式没有夹具回滚，
+       未审查的钩子一律不执行。
+    """
+
+    canonical = canonical_case(case)
+
+    if canonical is None:
+        return False
+
+    if canonical.get("read_only") is not True or canonical["id"] not in READ_ONLY_CASE_IDS:
+        return False
+
+    return not callable(canonical.get("setup")) and not callable(canonical.get("after_run"))
 
 
 def _file_fingerprint(path):
@@ -291,6 +331,17 @@ def capture_data_safety_baseline():
 
     if actual_db.resolve() != REAL_DB.resolve():
         entries.insert(1, {"name": "real_db", "kind": "file", "path": REAL_DB})
+
+    # 缓存目录可能被 RAG_CACHE_DIR 覆盖（vector_cache.CACHE_DIR）：只盯固定的
+    # REAL_CACHE 会漏掉真正生效的那条路径，所以两条都记、都逐项比内容指纹。
+    effective_cache = Path(vector_cache.CACHE_DIR)
+
+    if effective_cache.resolve() != REAL_CACHE.resolve():
+        entries.insert(-1, {
+            "name": "effective_cache",
+            "kind": "directory",
+            "path": effective_cache,
+        })
 
     captured = []
 
@@ -817,7 +868,13 @@ def run_case(case, runner=None, isolate=True, verbose=False):
     if not isolate and not case_is_read_only(case):
         raise DataSafetyError(
             f"拒绝在真实数据库上执行用例 {case.get('id')!r}："
-            "该用例没有显式声明 read_only=True（可能含保存/确认/写库回调）"
+            "必须是 agent_eval_cases 注册的规范用例、结构未被改动、"
+            "显式声明 read_only=True 且不带 setup/after_run 回调"
+        )
+
+    if not isolate and (callable(case.get("setup")) or callable(case.get("after_run"))):
+        raise DataSafetyError(
+            f"拒绝在真实数据库上执行用例 {case.get('id')!r} 的 setup/after_run 回调"
         )
 
     if case.get("mode") == "plan_draft":
@@ -841,7 +898,12 @@ def run_case(case, runner=None, isolate=True, verbose=False):
         message = case["message"]() if callable(case["message"]) else case["message"]
 
         started = time.time()
-        run_result = runner(message, verbose=verbose)
+
+        # 真实模式：工具层同样只读——Schema 里没有 save_plan，Dispatcher 也会
+        # 拒绝写工具；夹具模式维持完整工具能力（P4/P5/P6/P7 依赖它）。
+        with (contextlib.nullcontext() if isolate else agent_schema.read_only_tools()):
+            run_result = runner(message, verbose=verbose)
+
         duration = time.time() - started
 
         side_effects = {
@@ -887,8 +949,6 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
 
     cases = list(cases if cases is not None else EVAL_CASES)
 
-    baseline = capture_data_safety_baseline()
-
     if isolate:
         executable = cases
         skipped = []
@@ -896,26 +956,64 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
         executable = [case for case in cases if case_is_read_only(case)]
         skipped = [
             {
-                "case_id": case["id"],
-                "reason": "非只读用例：含保存/确认/写库路径，真实数据模式不执行",
+                "case_id": case.get("id"),
+                "reason": (
+                    "非只读用例：不是 agent_eval_cases 的规范注册用例、"
+                    "结构已被改动、未显式声明 read_only=True，"
+                    "或带 setup/after_run 写库回调；真实数据模式不执行"
+                ),
             }
             for case in cases
             if not case_is_read_only(case)
         ]
 
+    baseline = capture_data_safety_baseline()
+
+    # 真实模式：用量记录会 INSERT model_usage 到「当前 DATABASE_PATH」，也就是真实库。
+    # 运行前就关掉（不能只靠事后 SHA256 发现），退出时恢复原记录器。
+    previous_recorder = llm_client.get_usage_recorder()
+
+    if not isolate:
+        llm_client.set_usage_recorder(None)
+
     started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     results = []
+    run_error = None
+    original_error = None
+    data_safety = None
+    current_case_id = None
 
     try:
         for case in executable:
-            result = run_case(case, runner, isolate=isolate, verbose=verbose)
-            results.append(result)
+            current_case_id = case.get("id")
+            results.append(run_case(case, runner, isolate=isolate, verbose=verbose))
+    except Exception as error:  # noqa: BLE001 - 记录后重新抛出，不能被吞掉
+        run_error = {
+            "case_id": current_case_id,
+            "type": type(error).__name__,
+            "message": str(error),
+            "traceback": traceback.format_exc(),
+        }
+        original_error = error
     finally:
-        if isolate:
-            # 真实数据模式不拥有固定夹具，绝不清理（见 clean_fixtures 说明）。
-            clean_fixtures()
+        try:
+            if not isolate:
+                llm_client.set_usage_recorder(previous_recorder)
+        finally:
+            if isolate:
+                # 真实数据模式不拥有固定夹具，绝不清理（见 clean_fixtures 说明）。
+                clean_fixtures()
 
-    data_safety = verify_data_safety(baseline)
+            # 正常结束与用例异常都要留下数据安全证据：异常路径不做验证，
+            # 真实库被改动就没人报。
+            try:
+                data_safety = verify_data_safety(baseline)
+            except Exception as error:  # noqa: BLE001 - 验证本身失败也是失败
+                data_safety = {
+                    "ok": False,
+                    "failures": [f"数据安全验证本身失败：{type(error).__name__}: {error}"],
+                    "checks": [],
+                }
 
     hard_failures = sum(len(item["evaluation"]["hard_failures"]) for item in results)
     deviations = sum(len(item["evaluation"]["deviations"]) for item in results)
@@ -936,18 +1034,27 @@ def run_all(cases=None, runner=None, isolate=True, verbose=False):
             "hard_failures": hard_failures,
             "deviations": deviations,
             "data_safety_failures": len(data_safety["failures"]),
+            "interrupted": 1 if run_error is not None else 0,
             "passed": sum(
                 1 for item in results
                 if not item["evaluation"]["hard_failures"] and not item["evaluation"]["deviations"]
             ),
         },
         "data_safety": data_safety,
+        "run_error": run_error,
         "skipped": skipped,
         "cases": results,
     }
 
-    # 退出语义：硬性失败或任一数据安全检查失败都必须让整个评测明确失败。
-    report["ok"] = hard_failures == 0 and data_safety["ok"]
+    # 退出语义：硬性失败、数据安全失败、运行中断都必须让整个评测明确失败。
+    report["ok"] = (
+        hard_failures == 0
+        and data_safety["ok"]
+        and run_error is None
+    )
+
+    if run_error is not None:
+        raise EvalRunError(report) from original_error
 
     return report
 
@@ -1007,6 +1114,11 @@ def print_report(report):
     print(f"用例={summary['cases']}  跳过={summary.get('skipped', 0)}  完全符合={summary['passed']}  "
           f"期望偏差={summary['deviations']}  硬性失败={summary['hard_failures']}")
 
+    run_error = report.get("run_error")
+
+    if run_error:
+        print(f"运行中断: {run_error.get('case_id')} -> {run_error.get('type')}: {run_error.get('message')}")
+
     safety = report["data_safety"]
     print(f"数据安全: {'通过' if safety['ok'] else '失败'}")
 
@@ -1020,7 +1132,7 @@ def print_report(report):
 
 def main(argv=None):
     import model_usage
-    model_usage.install()
+
     parser = argparse.ArgumentParser(description="只读 Agent 评测基线")
     parser.add_argument(
         "--real-data",
@@ -1032,6 +1144,23 @@ def main(argv=None):
     parser.add_argument("--verbose", action="store_true", help="打印 Agent 完整轨迹")
     arguments = parser.parse_args(argv)
 
+    # 用量记录器：夹具模式正常安装（写夹具库）；真实模式显式关闭，因为
+    # record_usage 会 INSERT model_usage 到当前 DATABASE_PATH（也就是真实库）。
+    # 无论哪种模式，退出时都恢复进入前的记录器，不影响同进程的其它调用方。
+    previous_recorder = llm_client.get_usage_recorder()
+
+    if arguments.real_data:
+        llm_client.set_usage_recorder(None)
+    else:
+        model_usage.install()
+
+    try:
+        return _run_eval(arguments)
+    finally:
+        llm_client.set_usage_recorder(previous_recorder)
+
+
+def _run_eval(arguments):
     cases = EVAL_CASES
 
     if arguments.only:
@@ -1048,11 +1177,23 @@ def main(argv=None):
         print(f"embedding 服务不可用，请检查云端 Embedding API 配置（EMBEDDING_PROVIDER/EMBEDDING_BASE_URL/EMBEDDING_MODEL/EMBEDDING_API_KEY，见 docs/MODEL-API-MIGRATION.md）：{error}")
         return 2
 
-    report = run_all(
-        cases=cases,
-        isolate=not arguments.real_data,
-        verbose=arguments.verbose,
-    )
+    try:
+        report = run_all(
+            cases=cases,
+            isolate=not arguments.real_data,
+            verbose=arguments.verbose,
+        )
+    except EvalRunError as error:
+        # 运行中断也不能吞掉数据安全结果：报告照样打印、归档，退出码为 1。
+        report = error.report
+        print_report(report)
+
+        if not arguments.no_archive:
+            path = archive_report(report)
+            print(f"轨迹归档: {path.relative_to(PROJECT_DIR)}")
+
+        print(f"评测中断：{error}")
+        return 1
 
     print_report(report)
 

@@ -33,6 +33,7 @@
     - 数据安全：不修改 feedback.db / knowledge/
 """
 
+import hashlib
 import json
 
 import confirmation_service
@@ -396,3 +397,60 @@ def read_only_case_ids():
 
 
 READ_ONLY_CASE_IDS = read_only_case_ids()
+
+
+def _case_fingerprint(case):
+    """用例结构指纹：字段值 + 回调身份。
+
+    只比较 id 与 read_only 布尔是可伪造的：复制一个白名单 id 的字典，
+    或者给规范用例追加 setup / after_run，都能绕过。这里把每个字段
+    （含 callable 的模块、限定名与对象身份）一起哈希：任何新增、替换、
+    删除字段都会改变指纹，白名单因此绑死在「导入时的规范用例」上。
+    """
+
+    payload = {}
+
+    for key in sorted(case):
+        value = case[key]
+
+        if callable(value):
+            payload[key] = (
+                f"callable:{getattr(value, '__module__', '')}."
+                f"{getattr(value, '__qualname__', type(value).__name__)}@{id(value)}"
+            )
+        else:
+            payload[key] = value
+
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=repr)
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+CANONICAL_CASES = tuple(EVAL_CASES)
+CANONICAL_CASE_FINGERPRINTS = {
+    case["id"]: _case_fingerprint(case) for case in CANONICAL_CASES
+}
+_CANONICAL_BY_ID = {case["id"]: case for case in CANONICAL_CASES}
+
+
+def canonical_case(case):
+    """返回规范注册用例；传入的不是同一对象或已被改动时返回 None（fail-closed）。"""
+
+    if not isinstance(case, dict):
+        return None
+
+    case_id = case.get("id")
+
+    if not isinstance(case_id, str):
+        return None
+
+    canonical = _CANONICAL_BY_ID.get(case_id)
+
+    if canonical is None or canonical is not case:
+        return None
+
+    if _case_fingerprint(case) != CANONICAL_CASE_FINGERPRINTS[case_id]:
+        return None
+
+    return canonical
+

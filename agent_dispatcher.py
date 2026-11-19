@@ -12,7 +12,7 @@
 - 不破坏 Tool 自身返回结构：成功时 result 原样透传
 """
 
-from agent_schema import ARGUMENT_RULES, TOOL_NAMES
+from agent_schema import ARGUMENT_RULES, READ_ONLY_TOOL_NAMES, TOOL_NAMES, is_read_only_mode
 from agent_tools import get_learning_memory, get_recent_feedback, save_plan, search_knowledge
 
 
@@ -28,6 +28,7 @@ TOOLS = {
 ERROR_UNKNOWN_TOOL = "unknown_tool"
 ERROR_INVALID_ARGUMENTS = "invalid_arguments"
 ERROR_TOOL_FAILED = "tool_failed"
+ERROR_READ_ONLY_VIOLATION = "read_only_violation"
 
 
 def _failed(tool_name, message, error_type):
@@ -125,6 +126,15 @@ def dispatch(tool_call):
         return _failed(tool_name, "tool name 不能为空", ERROR_INVALID_ARGUMENTS)
 
     tool_name = tool_name.strip()
+
+    # 真实数据模式：即使模型自行请求写工具（例如 Schema 里已看不到的 save_plan），
+    # 也在调用 plan_service 之前直接拒绝，绝不落到 TOOLS 写函数上。
+    if is_read_only_mode() and tool_name not in READ_ONLY_TOOL_NAMES:
+        return _failed(
+            tool_name,
+            f"真实数据只读模式禁止调用写工具：{tool_name}",
+            ERROR_READ_ONLY_VIOLATION,
+        )
 
     if tool_name not in TOOLS:
         return _failed(
