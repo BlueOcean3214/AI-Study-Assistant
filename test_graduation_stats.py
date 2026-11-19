@@ -99,7 +99,7 @@ def _formal_spec():
 
 
 def _calibration_spec():
-    return [{"sample": sample, "condition": "A", "repeat": 0,
+    return [{"sample": sample, "condition": "A", "repeat": 3,
              "phase": "calibration", "batch": "main",
              "run_dir": "runs/calibration"}
             for sample in ("S1", "S2", "S3", "S4", "S5", "S6")]
@@ -528,6 +528,12 @@ def test_wilcoxon_ties_and_zeros():
     check("负差主导 W- 手算 22", close(res3["w_minus"], 22.0), res3)
     check("混合符号 p 与 DP 一致", close(res3["p_raw"], reference_p(mixed)), res3)
     check("dz 符号与均值同号", res3["dz"] < 0, res3)
+    mixed6 = [3, -1, 2, 0, 1, -2]
+    res6 = A.wilcoxon_exact(mixed6)
+    check("dz 分母用全部有效配对（6 个，含零差）",
+          res6["n_total"] == 6 and close(res6["dz"],
+                                         A.mean(mixed6) / A.sample_sd(mixed6)), res6)
+    check("m 只数非零差（6 个中 5 个非零）", res6["m_nonzero"] == 5, res6)
 
 
 def test_wilcoxon_all_zero():
@@ -774,6 +780,14 @@ def test_e2e():
           "5 次" in report and "3 份" in report)
     check("报告写明 H1 的 m=6 与 0.0939",
           "0.0939" in report or "0.0313" in report)
+    check("报告把描述统计与推断检验分成独立小节",
+          "## 4. 描述统计（描述性" in report
+          and "## 5. 主假设检验（推断性" in report, report[:200])
+    check("报告把二分类结果标为只描述、不做推断",
+          "## 8. 二分类比例（只描述" in report
+          and "不产出任何二分类推断 p 值" in report)
+    check("报告写明 Friedman 只做描述性定位",
+          "## 7. Friedman（描述性定位）" in report)
 
     check("stdout 打印输出目录", "OK 输出目录" in stdout, stdout[-200:])
     return fixture, out_dir
@@ -1046,6 +1060,31 @@ def test_adjudication_flow():
                             rater_overrides=split, adjudications=bad2)
     expect_error("裁决 final_value 越界 → bad-adjudication", "bad-adjudication",
                  lambda: run_main(fixture4, TMP_ROOT / "adj_bad2_out"))
+
+    # A6：裁决按 rater_a/rater_b 身份匹配原始值；互换两人取值必须被拒。
+    swapped = [dict(adjudications[0], rater_a_value="4", rater_b_value="2")]
+    fixture5 = make_fixture(TMP_ROOT / "adj_swap", overrides=overrides,
+                            rater_overrides=split, adjudications=swapped)
+    swap_out = TMP_ROOT / "adj_swap_out"
+    swap_code, swap_text = 0, ""
+    swap_argv = [
+        "--formal-raw", str(fixture5["paths"]["formal_raw"]),
+        "--calibration-raw", str(fixture5["paths"]["calibration_raw"]),
+        "--supplement-raw", str(fixture5["paths"]["supplement_raw"]),
+        "--adjudicated", str(fixture5["paths"]["adjudicated"]),
+        "--mapping", str(fixture5["paths"]["mapping"]),
+        "--out-dir", str(swap_out),
+        "--bootstrap", "500",
+    ]
+    try:
+        swap_code = A.main(swap_argv)
+    except A.StatsError as exc:
+        swap_code = 2
+        swap_text = "\n".join([str(exc)] + [str(item) for item in exc.problems])
+    check("裁决把两人取值互换 → 拒绝（StatsError，非 0）", swap_code != 0, swap_code)
+    check("互换身份的错误文案点明「不按身份对应」",
+          "不按身份对应" in swap_text, swap_text[-300:])
+    check("互换身份被拒后不产生正式输出", not swap_out.exists(), swap_out)
 
 
 def test_mapping_fail_closed():
@@ -1479,6 +1518,81 @@ def test_mapping_structure():
     expect_error("补充份用 main 批次 → bad-mapping", "bad-mapping",
                  one("map_supp_main", supp_uses_main))
 
+    # 7b) 校准与正式不得同格同 repeat。正式覆盖全部 28 格 × repeat{0,1,2}，
+    #     所以校准只能用 repeat{3,4}；这里只改 (sample_id, condition,
+    #     repeat_index) 三元组，来源行号与 blind_id 保持原值（与正式行天然不同），
+    #     以证明检查不是靠来源记录或 blind_id 间接命中的。
+    def _calib_and_formal(rows):
+        formal = [r for r in rows if r["phase"] == "formal"]
+        calib = [r for r in rows if r["phase"] == "calibration"]
+        return formal, calib
+
+    def _move_cell(rows, sample, condition, repeats):
+        """把某格的三份正式行改成指定 repeat（规则 6 只要求三者互异且在 0..4）。"""
+        targets = [r for r in rows if r["phase"] == "formal"
+                   and r["sample_id"] == sample and r["condition"] == condition]
+        targets.sort(key=lambda r: int(r["repeat_index"]))
+        for row, repeat in zip(targets, repeats):
+            row["repeat_index"] = repeat
+
+    def load_and_grab(root_name, mutate):
+        root = TMP_ROOT / root_name
+        if root.exists():
+            shutil.rmtree(root)
+        built = make_fixture(root, overrides=e2e_overrides())
+        mutate_csv(built["paths"]["mapping"], mutate)
+        try:
+            A.load_mapping(built["paths"]["mapping"])
+        except A.StatsError as exc:
+            detail = [str(exc)] + [str(item) for item in getattr(exc, "problems", [])]
+            return None, "\n".join(detail)
+        return built, None
+
+    def calib_same_slot(rows):
+        formal, calib = _calib_and_formal(rows)
+        target = [r for r in formal
+                  if r["sample_id"] == "S1" and r["condition"] == "A"][0]
+        calib[0]["sample_id"] = target["sample_id"]
+        calib[0]["condition"] = target["condition"]
+        calib[0]["repeat_index"] = target["repeat_index"]
+        check("A4 负向用例只改格点（来源行号与 blind_id 仍与正式行不同）",
+              calib[0]["source_row_number"] != target["source_row_number"] and
+              calib[0]["blind_id"] != target["blind_id"],
+              (calib[0]["source_row_number"], target["source_row_number"]))
+
+    _, message = load_and_grab("map_calib_slot", calib_same_slot)
+    check("A4 校准与正式同格同 repeat → bad-mapping", message is not None,
+          message)
+    check("A4 同格同 repeat 的错误文案指出两侧行号",
+          message is not None and "同格同 repeat" in message
+          and message.count("mapping.csv:") >= 2, message)
+
+    def calib_same_cell_other_repeat(rows):
+        _, calib = _calib_and_formal(rows)
+        calib[0]["repeat_index"] = 4
+
+    _, message = load_and_grab("map_calib_other_repeat",
+                               calib_same_cell_other_repeat)
+    check("A4 校准同格但不同 repeat → 通过", message is None, message)
+
+    def calib_other_sample_same_repeat(rows):
+        _move_cell(rows, "S2", "A", (0, 1, 4))
+        _, calib = _calib_and_formal(rows)
+        calib[0]["repeat_index"] = 4
+
+    _, message = load_and_grab("map_calib_other_sample",
+                               calib_other_sample_same_repeat)
+    check("A4 校准不同样本但同条件同 repeat → 通过", message is None, message)
+
+    def calib_other_condition_same_repeat(rows):
+        _move_cell(rows, "S1", "B", (0, 1, 4))
+        _, calib = _calib_and_formal(rows)
+        calib[0]["repeat_index"] = 4
+
+    _, message = load_and_grab("map_calib_other_cond",
+                               calib_other_condition_same_repeat)
+    check("A4 校准不同条件但同样本同 repeat → 通过", message is None, message)
+
     # 合规 mapping 必须仍然通过（不能把真实取值误判）。
     good = A.load_mapping(make_fixture(TMP_ROOT / "map_good",
                                        overrides=e2e_overrides())["paths"]["mapping"])
@@ -1560,6 +1674,96 @@ def test_transactional_publish():
                  lambda: run_main(fixture4, out_dir4))
     check("A5 拒绝复用后不写正式输出", not out_dir4.exists(), out_dir4)
 
+    # 5) 目标目录已存在但为空 → 明确清掉后发布整组，不得静默复用。
+    fixture5 = make_fixture(TMP_ROOT / "txn_empty", overrides=e2e_overrides())
+    out_dir5 = TMP_ROOT / "txn_empty_out"
+    out_dir5.mkdir(parents=True)
+    code5, _ = run_main(fixture5, out_dir5)
+    check("A5 空目录可发布且返回 0", code5 == 0, code5)
+    written5 = sorted(path.name for path in out_dir5.iterdir())
+    check("A5 空目录发布后 17 个文件齐全", len(written5) == 17, written5)
+    staging5 = out_dir5.parent / (out_dir5.name + ".staging")
+    check("A5 空目录发布后不残留 staging", not staging5.exists(), staging5)
+
+    # 6) 目标目录已存在且非空 → 拒绝，且既有内容一个字节都不动。
+    fixture6 = make_fixture(TMP_ROOT / "txn_busy", overrides=e2e_overrides())
+    out_dir6 = TMP_ROOT / "txn_busy_out"
+    out_dir6.mkdir(parents=True)
+    stray = out_dir6 / "stray.txt"
+    stray.write_text("不该被删或覆盖", encoding="utf-8")
+    stray_sha = A.sha256_file(stray)
+    expect_error("A5 非空目标目录 → output-exists", "output-exists",
+                 lambda: run_main(fixture6, out_dir6))
+    check("A5 非空目标目录被拒后残留文件仍在且未改动",
+          stray.exists() and A.sha256_file(stray) == stray_sha, out_dir6)
+    check("A5 非空目标目录被拒后不留 staging",
+          not (out_dir6.parent / (out_dir6.name + ".staging")).exists())
+
+    # 7) 目标是普通文件 → 拒绝（不得先删后建）。
+    fixture7 = make_fixture(TMP_ROOT / "txn_file", overrides=e2e_overrides())
+    out_dir7 = TMP_ROOT / "txn_file_out"
+    out_dir7.write_text("占位", encoding="utf-8")
+    # 入口参数校验先拦住（bad-out-dir），发布段的同类检查作为纵深防御保留。
+    expect_error("A5 目标路径是普通文件 → 入口拒绝 bad-out-dir", "bad-out-dir",
+                 lambda: run_main(fixture7, out_dir7))
+    check("A5 目标文件被拒后内容未变",
+          out_dir7.is_file() and out_dir7.read_text(encoding="utf-8") == "占位",
+          out_dir7)
+
+    # 8) 目录级 rename 本身失败 → 正式目录不出现半套结果，staging 被清理。
+    fixture8 = make_fixture(TMP_ROOT / "txn_rename", overrides=e2e_overrides())
+    out_dir8 = TMP_ROOT / "txn_rename_out"
+    real_replace = A.os.replace
+
+    def failing_replace(src, dst):
+        if str(dst) == str(out_dir8):
+            raise OSError("模拟目录级 rename 失败")
+        return real_replace(src, dst)
+
+    A.os.replace = failing_replace
+    try:
+        run_main(fixture8, out_dir8)
+        check("A5 目录级 rename 失败应抛出异常", False, "未抛异常")
+    except OSError as exc:
+        check("A5 目录级 rename 失败 → OSError 上抛",
+              "模拟目录级 rename 失败" in str(exc), exc)
+    finally:
+        A.os.replace = real_replace
+    check("A5 rename 失败后无正式输出目录", not out_dir8.exists(), out_dir8)
+    check("A5 rename 失败后 staging 被清理",
+          not (out_dir8.parent / (out_dir8.name + ".staging")).exists())
+
+    # 9) 发布后复核：目录内文件被动手脚 → publish-incomplete，不假装完整。
+    fixture9 = make_fixture(TMP_ROOT / "txn_tamper", overrides=e2e_overrides())
+    out_dir9 = TMP_ROOT / "txn_tamper_out"
+
+    def tampering_replace(src, dst):
+        result = real_replace(src, dst)
+        if str(dst) == str(out_dir9):
+            (out_dir9 / "primary_hypothesis_tests.csv").unlink()
+        return result
+
+    A.os.replace = tampering_replace
+    try:
+        expect_error("A5 发布后文件被删 → publish-incomplete", "publish-incomplete",
+                     lambda: run_main(fixture9, out_dir9))
+    finally:
+        A.os.replace = real_replace
+
+    # 10) 成功后重算 17 个文件哈希；再跑一次必须拒绝覆盖且哈希一个都不变。
+    fixture10 = make_fixture(TMP_ROOT / "txn_hashes", overrides=e2e_overrides())
+    out_dir10 = TMP_ROOT / "txn_hashes_out"
+    code10, _ = run_main(fixture10, out_dir10)
+    names10 = sorted(path.name for path in out_dir10.iterdir())
+    before10 = {name: A.sha256_file(out_dir10 / name) for name in names10}
+    check("A5 发布后 17 个文件均有 SHA-256",
+          code10 == 0 and len(names10) == 17 and len(before10) == 17, names10)
+    expect_error("A5 二次运行 → output-exists", "output-exists",
+                 lambda: run_main(fixture10, out_dir10))
+    after10 = {name: A.sha256_file(out_dir10 / name) for name in names10}
+    check("A5 二次运行被拒后 17 个文件哈希全部未变", before10 == after10,
+          sorted(set(before10) ^ set(after10)))
+
 
 def test_holm_rank_dependent():
     """A6：Holm 是 rank-dependent；H1 排最后时乘数 1，Holm p 可低于 0.05。"""
@@ -1605,6 +1809,85 @@ def test_holm_rank_dependent():
           "口径" in report and "负责人" in report)
 
 
+def test_holm_report_consistency():
+    """A7：Holm 的三种排序、running max 单调性、报告/README 口径一致、完整判据另算。"""
+    labels = ["H1_D_minus_B_P3", "H2a_D_minus_B_P1", "H2b_C_minus_A_P1"]
+
+    def by_label(values):
+        rows = A.holm_adjust(values, "primary_H1_H2a_H2b", labels=labels)
+        return {row["contrast"]: row for row in rows}
+
+    # H1 只用 P3，S7 的 P3 不适用 → 最多 6 个有效配对，原始 p 下限是 0.03125。
+    first = by_label([0.03125, 0.0625, 0.25])
+    check("A7 H1 排第一（乘 3）→ Holm p=0.09375 且不拒绝",
+          int(first["H1_D_minus_B_P3"]["rank"]) == 1 and
+          close(float(first["H1_D_minus_B_P3"]["p_holm"]), 0.09375) and
+          not first["H1_D_minus_B_P3"]["rejected"],
+          first["H1_D_minus_B_P3"])
+
+    second = by_label([0.03125, 0.015625, 0.25])
+    check("A7 H1 排第二（乘 2）→ Holm p=0.0625 且不拒绝",
+          int(second["H1_D_minus_B_P3"]["rank"]) == 2 and
+          close(float(second["H1_D_minus_B_P3"]["p_holm"]), 0.0625) and
+          not second["H1_D_minus_B_P3"]["rejected"],
+          second["H1_D_minus_B_P3"])
+
+    third = by_label([0.03125, 0.015625, 0.015625])
+    check("A7 H1 排第三（乘 1）→ running max 抬到 0.046875 且拒绝",
+          int(third["H1_D_minus_B_P3"]["rank"]) == 3 and
+          close(float(third["H1_D_minus_B_P3"]["p_holm"]), 0.046875) and
+          bool(third["H1_D_minus_B_P3"]["rejected"]),
+          third["H1_D_minus_B_P3"])
+
+    for name, rows in (("第一", first), ("第二", second), ("第三", third)):
+        ordered = sorted(rows.values(), key=lambda row: int(row["rank"]))
+        running = []
+        acc = 0.0
+        for row in ordered:
+            acc = max(acc, float(row["p_raw"]) * int(row["factor"]))
+            running.append(acc)
+        got = [float(row["p_holm"]) for row in ordered]
+        check("A7 H1 排%s 时 running max = 前缀最大值且单调不减" % name,
+              all(close(a, b) for a, b in zip(got, running)) and
+              all(running[i] <= running[i + 1] + 1e-12
+                  for i in range(len(running) - 1)),
+              ([(row["rank"], row["p_raw"], row["factor"], row["p_holm"])
+                for row in ordered], running))
+
+    # 报告文字：不能说“确实达不到 0.05”，且必须把两件事分开。
+    fixture = make_fixture(TMP_ROOT / "holm_text", overrides=e2e_overrides())
+    out_dir = TMP_ROOT / "holm_text_out"
+    run_main(fixture, out_dir)
+    report = (out_dir / "analysis_report.md").read_text(encoding="utf-8")
+    compact = "".join(report.split())
+    readme = (GRADUATION_DIR / "STATISTICS-README.md").read_text(encoding="utf-8")
+    check("A7 报告不再断言「H1 的 Holm p 确实达不到 0.05」",
+          "确实达不到0.05" not in compact and "一定达不到0.05" not in compact,
+          compact[compact.find("Holm的p") - 40: compact.find("Holm的p") + 120])
+    check("A7 报告写明「特定排序下可以低于 0.05」并给出 0.046875",
+          "特定排序" in report and "0.046875" in report and "低于0.05" in compact)
+    check("A7 报告把 Holm p 门槛与附录 B 完整判据分开写",
+          "附录B" in compact and "m=7" in report)
+    check("A7 README 与报告口径一致（rank-dependent + 并非绝对不可能）",
+          "rank-dependent" in readme and "rank-dependent" in report and
+          "并非绝对不可能" in readme and "可以低于0.05" in compact)
+    check("A7 README 与报告都给出 m=7 的结构性原因",
+          "m=7" in report and "m=7" in readme)
+
+    # 完整支持判据与 Holm p 无关：m=6 时即使 Holm p<0.05 也不能判“支持”。
+    base = {"status": "ok", "reason_code": None, "m_nonzero": 6, "n_blocks": 6,
+            "mean_diff": 1.0, "r_rb": 0.9, "dz": 1.2}
+    verdict6 = A.conclude(base, 0.046875)
+    check("A7 Holm p<0.05、效应量达标但 m=6 → 明确写未达 m=7",
+          "m=7" in verdict6 and not verdict6.startswith("支持"), verdict6)
+    verdict7 = A.conclude(dict(base, m_nonzero=7, n_blocks=7), 0.046875)
+    check("A7 同样效应量下 m=7 → 支持（推断性，n=7）",
+          verdict7.startswith("支持"), verdict7)
+    check("A7 m=6 且 Holm p>0.05 时仍先判「未观察到差异」",
+          A.conclude(base, 0.0625).startswith("未观察到差异"),
+          A.conclude(base, 0.0625))
+
+
 # ===========================================================================
 # main
 # ===========================================================================
@@ -1644,6 +1927,7 @@ def main():
         test_binary_descriptive_only()
         test_transactional_publish()
         test_holm_rank_dependent()
+        test_holm_report_consistency()
         test_h5_with_results()
         test_results_mismatch()
         test_missing_inputs()

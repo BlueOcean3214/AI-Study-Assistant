@@ -510,6 +510,23 @@ def _check_mapping_structure(rows, problems):
     if len(set(calib_samples)) != len(calib_samples):
         problems.append("mapping.csv：校准 6 份必须覆盖 6 个不同样本（每样本至多 1 份）")
 
+    # 7b) 校准不得与正式完全同格同 repeat：只比行的来源记录不足以发现这件事
+    #     （两份行可以来自不同 run、不同 blind_id，但落到同一个
+    #     （sample_id, condition, repeat_index）格点上）。这里直接比三元组。
+    formal_slots = {}
+    for row in formal_rows:
+        key = (row["sample_id"], row["condition"], row["repeat_index"])
+        formal_slots.setdefault(key, row)
+    for row in calib_rows:
+        key = (row["sample_id"], row["condition"], row["repeat_index"])
+        twin = formal_slots.get(key)
+        if twin is not None:
+            problems.append(
+                f"mapping.csv:{row['_line']}：校准行与正式行 mapping.csv:{twin['_line']} "
+                f"同格同 repeat（{key[0]},{key[1]},repeat={key[2]}）；"
+                f"校准不得复用正式的同一输出"
+            )
+
     # 8) 补充 23：批次份数与每批次格子份数。
     suppl_rows = [r for r in rows if r["phase"] == "supplementary"]
     batch_counts = {}
@@ -1914,7 +1931,8 @@ def render_report(ctx):
         add("| " + " | ".join(cells) + " |")
     add("")
     add("口径：精确符号秩（2^m 符号完全枚举、平均秩、零差剔除、不做连续性校正）；"
-        "`m` 是非零差值个数，与 `dz`（用全部 7 个配对差）口径不同，表注必须分别写。")
+        "`m` 是非零差值个数，与 `dz` 的口径不同——`dz` 用该对比实际存在的配对差"
+        "（H1 因 S7 的 P3 不适用只有 6 个配对），表注必须分别写。")
     add("")
     add("## 6. Holm 校正")
     add("")
@@ -1933,11 +1951,13 @@ def render_report(ctx):
         "若 H1 排第一或第二，乘数可能是 3 或 2，Holm p 可能是 0.09375 或 0.0625——"
         "这跟「H1 不可能显著」是两件事，必须分开写：")
     add("")
-    add("- **H1 的 Holm p 能否低于 0.05**：取决于三个对比的 p 排序，"
-        "理论上 H1 排第一时 ×3 = 0.09375 仍 >0.05；排第二时 ×2 = 0.0625 >0.05。"
-        "故在本实验的 p 取值格点上 H1 的 Holm p 确实达不到 0.05，"
-        "但这个结论来自「m=6 的最小原始 p 是 0.03125」这一算术事实，"
-        "不是来自「m 不够 7」。")
+    add("- **H1 的 Holm p 能否低于 0.05**：取决于三个对比的 p 排序与 running maximum，"
+        "不能一句话下结论。H1 排第一时 ×3 = 0.09375 >0.05；排第二时 ×2 = 0.0625 >0.05；"
+        "排第三（×1）时其自身 p 是 0.03125，但校正值是 running max——"
+        "若前两名的最小原始 p 为 0.015625（×3 = 0.046875），running max 会把 H1 抬到 "
+        "0.046875，此时 H1 的 Holm p 确实低于 0.05。"
+        "所以只能说「在特定排序下 H1 的 Holm p 可以低于 0.05」，"
+        "不能说「H1 的 Holm p 必然够不着 0.05」；本次运行的实际排序与取值见上表。")
     add("- **H1 是否满足附录 B 的完整支持判据**：不满足，且是结构性的——"
         "附录 B 要求 m=7（7 个非零配对）且 Δ≥0.5、|r_rb|≥0.5、dz≥0.8、Holm p<0.05 同时成立，"
         "而 P3 对 S7 按 §5.4.7 不适用，H1 最多只有 6 个有效配对，m=7 永远无法达成。")
@@ -2450,24 +2470,24 @@ def main(argv=None):
     }
     report = render_report(ctx)
 
-    # A5：事务式发布。
+    # A5：事务式发布（目录级原子发布）。
     # 1) 全部输出（CSV + 报告）先写进 out_dir 旁的独立 staging 目录；
     # 2) 写完复核所有输入 SHA-256（输入在统计期间被改动就整体失败）；
-    # 3) 只有全部成功才把 staging 里的整组文件一次性搬进 out_dir；
-    # 4) 任何异常都清掉 staging，正式目录不留任何统计文件。
-    written = []
+    # 3) staging 内容自检通过后，用一次同文件系统的目录级 os.replace 发布整组结果；
+    # 4) 发布后重新清点文件清单并重算哈希，任何异常都不在正式目录留下半套统计文件。
+    output_names = sorted(list(outputs) + ["analysis_report.md"])
     staging = out_dir.parent / (out_dir.name + ".staging")
     if staging.exists() or staging.is_symlink():
         raise StatsError(
             "staging-exists", f"staging 目录已存在，拒绝复用/覆盖：{staging}"
         )
+    staged_hashes = {}
     try:
         staging.mkdir(parents=True)
         for name, (columns, rows) in outputs.items():
             write_csv_atomic(staging / name, columns, rows)
-            written.append(name)
         _write_text_atomic(staging / "analysis_report.md", report)
-        written.append("analysis_report.md")
+        staged_hashes = {name: sha256_file(staging / name) for name in output_names}
 
         # 输入哈希复核：必须在发布之前完成。
         after = {str(p): sha256_file(p) for p in input_paths}
@@ -2477,38 +2497,56 @@ def main(argv=None):
 
         # staging 自检：数量与内容都要对上，避免发布半套结果。
         staged = sorted(p.name for p in staging.iterdir())
-        if staged != sorted(written):
+        if staged != output_names:
             raise StatsError(
                 "staging-mismatch",
-                f"staging 内容与预期不符：预期 {sorted(written)}，实际 {staged}",
+                f"staging 内容与预期不符：预期 {output_names}，实际 {staged}",
             )
 
-        # 发布：目标目录保持「不存在或为空」语义。
-        out_dir.mkdir(parents=True, exist_ok=True)
-        published = []
-        for name in written:
-            src = staging / name
-            dst = out_dir / name
-            if dst.exists() or dst.is_symlink():
+        # 发布前目标语义：不存在才发布；已存在且为空的目录明确清掉后再发布（不静默覆盖），
+        # 非空目录、普通文件或符号链接一律拒绝。
+        if out_dir.is_symlink():
+            raise StatsError(
+                "output-exists", f"输出目录是符号链接，拒绝写入：{out_dir}"
+            )
+        if out_dir.exists():
+            if not out_dir.is_dir():
                 raise StatsError(
-                    "output-exists", f"目标文件已存在，拒绝覆盖：{dst}"
+                    "output-exists", f"输出路径已存在且不是目录，拒绝覆盖：{out_dir}"
                 )
-            os.replace(src, dst)
-            published.append(name)
-        staging.rmdir()
+            leftovers = sorted(p.name for p in out_dir.iterdir())
+            if leftovers:
+                raise StatsError(
+                    "output-exists",
+                    f"输出目录已存在且非空，拒绝覆盖：{out_dir}（内含 {leftovers}）",
+                )
+            out_dir.rmdir()
+
+        # 同文件系统内的一次目录级 rename：要么整组就位，要么一个文件都不出现。
+        os.replace(str(staging), str(out_dir))
     except BaseException:
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
         raise
 
-    if len(published) != len(written):
+    # 发布后复核：清单与哈希都要与 staging 一致，否则明确报错，不假装完整。
+    published = sorted(p.name for p in out_dir.iterdir())
+    if published != output_names:
         raise StatsError(
             "publish-incomplete",
-            f"只发布了 {len(published)}/{len(written)} 个文件：{published}",
+            f"发布后目录内容与预期不符：预期 {output_names}，实际 {published}",
+        )
+    mismatched = [
+        name for name in output_names
+        if sha256_file(out_dir / name) != staged_hashes[name]
+    ]
+    if mismatched:
+        raise StatsError(
+            "publish-incomplete", f"发布后文件哈希与 staging 不一致：{mismatched}"
         )
 
     print("OK 输出目录：" + str(out_dir))
-    for name in written:
+    for name in output_names:
         print("  - " + name)
     return 0
 
