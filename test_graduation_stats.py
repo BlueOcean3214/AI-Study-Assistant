@@ -106,26 +106,28 @@ def _calibration_spec():
 
 
 def _supplement_spec():
-    """§5.4.4 的 23 份：S7-empty×D 3 + B0-S5 5 + B0-S7 5 + C/D-subj 10。"""
+    """§5.4.4 的 23 份：S7-empty×D 3 + B0-S5 5 + B0-S7 5 + C/D-subj 10。
+
+    取值严格照真实 runs/ 与 make_blind_pack.py 的 mapping_rows()：
+    - suppl-s7empty：sample_id="S7-empty"、condition="D"
+    - b0-legacy：sample_id ∈ {S5,S7}、condition="B0"、round_index 为空
+    - suppl-subj：sample_id="S5"、condition ∈ {C-subj,D-subj}
+    """
     spec = []
     for repeat in range(3):
-        spec.append({"sample": "S7", "condition": "D", "repeat": repeat,
+        spec.append({"sample": "S7-empty", "condition": "D", "repeat": repeat,
                      "phase": "supplementary", "batch": "suppl-s7empty",
-                     "run_dir": "runs/supp-s7empty"})
-    for repeat, condition in enumerate(("A", "B", "C", "D", "A")):
-        spec.append({"sample": "S5", "condition": condition, "repeat": repeat,
-                     "phase": "supplementary", "batch": "b0-legacy",
-                     "run_dir": "runs/b0"})
-    for repeat, condition in enumerate(("A", "B", "C", "D", "A")):
-        spec.append({"sample": "S7", "condition": condition, "repeat": repeat,
-                     "phase": "supplementary", "batch": "b0-legacy",
-                     "run_dir": "runs/b0"})
-    subj = [("S1", "C"), ("S1", "D"), ("S2", "C"), ("S2", "D"), ("S3", "C"),
-            ("S3", "D"), ("S4", "C"), ("S4", "D"), ("S1", "D"), ("S2", "C")]
-    for repeat, (sample, condition) in enumerate(subj):
-        spec.append({"sample": sample, "condition": condition, "repeat": repeat,
-                     "phase": "supplementary", "batch": "suppl-subj",
-                     "run_dir": "runs/suppl-subj"})
+                     "run_dir": "runs/suppl-s7empty", "round": str(repeat)})
+    for sample in ("S5", "S7"):
+        for repeat in range(5):
+            spec.append({"sample": sample, "condition": "B0", "repeat": repeat,
+                         "phase": "supplementary", "batch": "b0-legacy",
+                         "run_dir": "runs/b0", "round": ""})
+    for condition in ("C-subj", "D-subj"):
+        for repeat in range(5):
+            spec.append({"sample": "S5", "condition": condition, "repeat": repeat,
+                         "phase": "supplementary", "batch": "suppl-subj",
+                         "run_dir": "runs/suppl-subj", "round": str(repeat)})
     return spec
 
 
@@ -209,7 +211,7 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
             "group": "G" + sample[1:],
             "condition": condition,
             "repeat_index": str(repeat),
-            "round_index": "1",
+            "round_index": item.get("round", "1"),
             "source_prompt_sha256": prompt,
             "source_result_row_sha256": row_sha,
             "source_results_file_sha256": _sha("file", item["run_dir"]),
@@ -233,7 +235,7 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
         sample = meta["sample_id"]
         condition = meta["condition"]
         repeat = int(meta["repeat_index"])
-        for rater in ("R1", "R2"):
+        for rater in A.RATER_IDS:
             if phase == "supplementary":
                 row = {"blind_id": meta["blind_id"], "rater_id": rater,
                        "phase": phase, "notes": ""}
@@ -362,7 +364,10 @@ def test_average_ranks():
 
 def test_parse_values():
     check("parse_likert 整数", A.parse_likert("3", "t") == ("score", 3))
-    check("parse_likert 空 = pending", A.parse_likert("", "t") == ("pending", None))
+    check("parse_likert 空 = pending（仅 allow_blank）",
+          A.parse_likert("", "t", allow_blank=True) == ("pending", None))
+    expect_error("parse_likert 默认拒绝空白", "blank-value",
+                 lambda: A.parse_likert("", "t"))
     check("parse_likert N/A", A.parse_likert("N/A", "t") == ("na", None))
     check("parse_likert n/a 小写", A.parse_likert("n/a", "t") == ("na", None))
     expect_error("parse_likert 拒绝 05", "bad-value",
@@ -666,8 +671,8 @@ def test_e2e():
         "primary_hypothesis_tests.csv": 3,
         "holm_adjusted_results.csv": 3,
         "friedman_results.csv": 4,
-        "binary_rates.csv": 4,
-        "binary_tests.csv": 1,
+        "binary_rates.csv": 10,
+        "binary_tests.csv": 3,
         "h5_results.csv": 0,
         "y2_calls_distribution.csv": 0,
         "input_hashes.csv": 5,
@@ -874,13 +879,15 @@ def test_input_hashes_unchanged(fixture, out_dir):
 
 
 def test_pending_denominator():
+    """A2：原始表不能靠空白产生 pending；pending 只能来自「两人合法分歧 + 无裁决」。"""
     overrides = e2e_overrides()
-    pending = {("S1", "A", 0, "P1", "R2")}
+    dispute = {("S1", "A", 0, "P1", "rater_a"): "2",
+               ("S1", "A", 0, "P1", "rater_b"): "4"}
     fixture = make_fixture(TMP_ROOT / "pending_part", overrides=overrides,
-                           pending=pending)
+                           rater_overrides=dispute)
     out_dir = TMP_ROOT / "pending_part_out"
     code, _ = run_main(fixture, out_dir)
-    check("单份 pending 仍可跑完", code == 0)
+    check("单份未裁决分歧仍可跑完", code == 0)
     aggregates = {(row["sample_id"], row["condition"], row["metric"]): row
                   for row in read_csv(out_dir / "cell_aggregates.csv")}
     cell = aggregates[("S1", "A", "P1")]
@@ -891,16 +898,18 @@ def test_pending_denominator():
               read_csv(out_dir / "ratings_final_detail.csv")}
     bid = blind_of(fixture, "formal", "S1", "A", 0)
     check("pending 最终分保留 pending 标记",
-          detail[(bid, "P1")]["status"] == "pending" and
+          detail[(bid, "P1")]["status"] == "pending_unadjudicated" and
           detail[(bid, "P1")]["final_value"] == "pending", detail[(bid, "P1")])
 
 
 def test_pending_blocks_hypothesis():
     overrides = e2e_overrides()
-    pending = {("S5", "B", repeat, "P1", rater)
-               for repeat in range(3) for rater in ("R1", "R2")}
+    dispute = {}
+    for repeat in range(3):
+        dispute[("S5", "B", repeat, "P1", "rater_a")] = "2"
+        dispute[("S5", "B", repeat, "P1", "rater_b")] = "4"
     fixture = make_fixture(TMP_ROOT / "pending_all", overrides=overrides,
-                           pending=pending)
+                           rater_overrides=dispute)
     out_dir = TMP_ROOT / "pending_all_out"
     code, _ = run_main(fixture, out_dir)
     check("整格 pending 仍可跑完（不中止）", code == 0)
@@ -920,11 +929,59 @@ def test_pending_blocks_hypothesis():
     check("缺格结论=不可计算", h2a["conclusion"] == "不可计算", h2a["conclusion"])
 
 
+def test_blank_fail_closed():
+    """A2：原始评分表适用字段留空必须 fail-closed，不得静默缩小分母。"""
+    cases = [
+        ("formal P1 空白", ("S1", "A", "P1")),
+        ("formal P3 空白（S7 不适用也必须写 N/A）", ("S7", "A", "P3")),
+    ]
+    for index, (label, where) in enumerate(cases):
+        overrides = e2e_overrides()
+        overrides[where] = ""
+        fixture = make_fixture(TMP_ROOT / ("blank_%d" % index),
+                               overrides=overrides)
+        out_dir = TMP_ROOT / ("blank_out_%d" % index)
+        expect_error("留空必须失败：" + label, "blank-value",
+                     lambda f=fixture, o=out_dir: run_main(f, o))
+        check("留空失败后不产生正式输出：" + label, not out_dir.exists(), out_dir)
+
+    # 补充表与校准表的空白同样 fail-closed。
+    fixture = make_fixture(TMP_ROOT / "blank_calib",
+                           rater_overrides={("S2", "A", 0, "P2", "rater_a"): ""})
+    expect_error("校准表留空必须失败", "blank-value",
+                 lambda: run_main(fixture, TMP_ROOT / "blank_calib_out"))
+    fixture = make_fixture(
+        TMP_ROOT / "blank_supp",
+        rater_overrides={("S5", "B0", 0, "E1", "rater_b"): ""})
+    expect_error("补充表留空必须失败", "blank-value",
+                 lambda: run_main(fixture, TMP_ROOT / "blank_supp_out"))
+
+    # 原始表空白不被当作 pending：显式 N/A 与留空语义不同。
+    fixture = make_fixture(TMP_ROOT / "blank_semantics")
+    check("解析层默认拒绝空白",
+          _raises(lambda: A.parse_likert("", "t"), "blank-value"))
+    check("解析层 allow_blank 才返回 pending",
+          A.parse_likert("", "t", allow_blank=True) == ("pending", None))
+    check("显式 N/A 是 na 不是 pending",
+          A.parse_likert("N/A", "t") == ("na", None))
+    check("空表语义夹具可正常解析", fixture is not None)
+
+
+def _raises(fn, code):
+    try:
+        fn()
+    except A.StatsError as exc:
+        return exc.code == code
+    except Exception:
+        return False
+    return False
+
+
 def test_adjudication_flow():
     overrides = e2e_overrides()
-    split = {("S2", "B", repeat, "P1", "R1"): "2"
+    split = {("S2", "B", repeat, "P1", "rater_a"): "2"
              for repeat in range(3)}
-    split.update({("S2", "B", repeat, "P1", "R2"): "4"
+    split.update({("S2", "B", repeat, "P1", "rater_b"): "4"
                   for repeat in range(3)})
 
     fixture = make_fixture(TMP_ROOT / "adj_missing", overrides=overrides,
@@ -1202,6 +1259,352 @@ def test_missing_inputs():
                  lambda: run_main(fixture, TMP_ROOT / "miss_out"))
 
 
+def test_binary_descriptive_only():
+    """A1：二分类只报描述性比例，不做任何推断检验。"""
+    fixture = make_fixture(TMP_ROOT / "bin", overrides=e2e_overrides())
+    out_dir = TMP_ROOT / "bin_out"
+    code, _ = run_main(fixture, out_dir)
+    check("A1 二分类夹具可跑完", code == 0)
+
+    tests = read_csv(out_dir / "binary_tests.csv")
+    check("A1 binary_tests 三行（S3_flag/E1/E7）", len(tests) == 3,
+          [row["metric"] for row in tests])
+    check("A1 全部 not_executed",
+          all(row["status"] == "not_executed" for row in tests), tests)
+    check("A1 不产出任何推断统计量与 p 值",
+          all(row["statistic"] == "" and row["p"] == "" for row in tests), tests)
+    check("A1 不调用 Cochran's Q / McNemar",
+          all(row["test"] == "none" for row in tests), tests)
+    s3 = [row for row in tests if row["metric"] == "S3_flag"][0]
+    check("A1 S3_flag 写明 5 vs 3 设计歧义",
+          "5 次" in s3["note"] and "3 份" in s3["note"], s3["note"])
+    check("A1 S3_flag 说明不能恢复样本级 0/1 判定",
+          "样本级" in s3["note"], s3["note"])
+    for metric in ("E1", "E7"):
+        row = [r for r in tests if r["metric"] == metric][0]
+        check("A1 %s 说明只描述" % metric, "描述" in row["note"], row["note"])
+
+    rates = read_csv(out_dir / "binary_rates.csv")
+    formal_s3 = [r for r in rates if r["metric"] == "S3_flag"]
+    check("A1 S3_flag 逐条件 4 行", len(formal_s3) == 4, formal_s3)
+    check("A1 S3_flag 只统计可算格（S3/S6 → 每条件 2 格）",
+          all(int(r["n_units"]) == 2 for r in formal_s3), formal_s3)
+    e1 = [r for r in rates if r["metric"] == "E1"]
+    e7 = [r for r in rates if r["metric"] == "E7"]
+    check("A1 E1 三批次各一行", len(e1) == 3 and len(e7) == 3, (e1, e7))
+    e1_units = {r["group"]: int(r["n_units"]) for r in e1}
+    check("A1 E1 适用份数 3/10/10 合计 23",
+          e1_units == {"suppl-s7empty": 3, "b0-legacy": 10, "suppl-subj": 10}
+          and sum(e1_units.values()) == A.SUPPLEMENT_COUNT, e1_units)
+    e7_units = {r["group"]: int(r["n_units"]) for r in e7}
+    check("A1 E7 适用份数 0/5/10 合计 15",
+          e7_units == {"suppl-s7empty": 0, "b0-legacy": 5, "suppl-subj": 10}
+          and sum(e7_units.values()) == 15, e7_units)
+    check("A1 E7 分子分母都记（n_scored≤n_units）",
+          all(int(r["n_scored"]) <= int(r["n_units"]) for r in rates), rates)
+
+    report = (out_dir / "analysis_report.md").read_text(encoding="utf-8")
+    check("A1 报告写明不产出二分类推断 p 值",
+          "不产出任何二分类推断 p 值" in report)
+    check("A1 报告写明 Cochran's Q / McNemar 未执行",
+          "Cochran's Q" in report and "McNemar" in report)
+
+    # 即使只有两个样本能算，也不能拿去做 Cochran's Q。
+    check("A1 只有 2 个样本也不误跑 Cochran's Q",
+          all("p" not in r or r["p"] == "" for r in tests), tests)
+
+
+def test_rater_id_strict():
+    """A3：只允许 rater_a / rater_b 各一行；裁决值必须按身份对应。"""
+    def one(root_name, mutate):
+        root = TMP_ROOT / root_name
+        if root.exists():
+            shutil.rmtree(root)
+        built = make_fixture(root, overrides=e2e_overrides())
+        mutate(built)
+        return built
+
+    def load_formal(built):
+        mapping = A.load_mapping(built["paths"]["mapping"])
+        return lambda: A.load_raw_ratings(built["paths"]["formal_raw"], mapping,
+                                          "formal")
+
+    def illegal_id(built):
+        def mutate(rows):
+            rows[0]["rater_id"] = "R1"
+        mutate_csv(built["paths"]["formal_raw"], mutate)
+
+    expect_error("非法 rater_id → bad-formal-raw", "bad-formal-raw",
+                 load_formal(one("rid_illegal", illegal_id)))
+
+    def duplicate_rater(built):
+        def mutate(rows):
+            pair = {}
+            for row in rows:
+                pair.setdefault(row["blind_id"], []).append(row)
+            for group in pair.values():
+                if len(group) == 2:
+                    group[1]["rater_id"] = group[0]["rater_id"]
+                    break
+        mutate_csv(built["paths"]["formal_raw"], mutate)
+
+    expect_error("重复评分者（同一人两行）→ bad-formal-raw", "bad-formal-raw",
+                 load_formal(one("rid_dup", duplicate_rater)))
+
+    def missing_rater(built):
+        def mutate(rows):
+            del rows[0]
+        mutate_csv(built["paths"]["formal_raw"], mutate)
+
+    expect_error("缺一个评分者 → bad-formal-raw", "bad-formal-raw",
+                 load_formal(one("rid_missing", missing_rater)))
+
+    def supplement_illegal(built):
+        def mutate(rows):
+            rows[0]["rater_id"] = "r1"
+        mutate_csv(built["paths"]["supplement_raw"], mutate)
+
+    def load_supp(built):
+        mapping = A.load_mapping(built["paths"]["mapping"])
+        return lambda: A.load_supplement_ratings(built["paths"]["supplement_raw"],
+                                                 mapping)
+
+    expect_error("补充表非法 rater_id → bad-supplement-raw", "bad-supplement-raw",
+                 load_supp(one("rid_supp", supplement_illegal)))
+
+    # 裁决值必须按身份对应：把两人的值交换必须被拒。
+    overrides = e2e_overrides()
+    split = {}
+    for repeat in range(3):
+        split[("S2", "B", repeat, "P1", "rater_a")] = "2"
+        split[("S2", "B", repeat, "P1", "rater_b")] = "4"
+    fixture = make_fixture(TMP_ROOT / "rid_swap", overrides=overrides,
+                           rater_overrides=split)
+    swapped = [{
+        "blind_id": blind_of(fixture, "formal", "S2", "B", repeat),
+        "item": "P1", "rater_a_value": "4", "rater_b_value": "2",
+        "final_value": "3", "adjudicator": "导师", "reason": "取中",
+        "decided_utc": "2026-11-19T01:00:00Z",
+    } for repeat in range(3)]
+    fixture_swap = make_fixture(TMP_ROOT / "rid_swap2", overrides=overrides,
+                                rater_overrides=split, adjudications=swapped)
+    expect_error("裁决值交换身份对应 → bad-adjudication", "bad-adjudication",
+                 lambda: run_main(fixture_swap, TMP_ROOT / "rid_swap2_out"))
+
+
+def test_mapping_structure():
+    """A4：mapping 结构规则（repeat/round/批次矩阵）逐条 fail-closed。"""
+    def one(root_name, mutate):
+        root = TMP_ROOT / root_name
+        if root.exists():
+            shutil.rmtree(root)
+        built = make_fixture(root, overrides=e2e_overrides())
+        mutate_csv(built["paths"]["mapping"], mutate)
+        return lambda: A.load_mapping(built["paths"]["mapping"])
+
+    def dup_repeat_in_cell(rows):
+        rows[1]["repeat_index"] = rows[0]["repeat_index"]
+
+    expect_error("同格两份重复 repeat_index → bad-mapping", "bad-mapping",
+                 one("map_dup_repeat", dup_repeat_in_cell))
+
+    def repeat_out_of_range(rows):
+        rows[0]["repeat_index"] = "7"
+
+    expect_error("repeat_index 越界 → bad-mapping", "bad-mapping",
+                 one("map_repeat_range", repeat_out_of_range))
+
+    def round_empty_main(rows):
+        rows[0]["round_index"] = ""
+
+    expect_error("非 B0 批次 round_index 为空 → bad-mapping", "bad-mapping",
+                 one("map_round_empty", round_empty_main))
+
+    def round_out_of_range(rows):
+        rows[0]["round_index"] = "9"
+
+    expect_error("round_index 越界 → bad-mapping", "bad-mapping",
+                 one("map_round_range", round_out_of_range))
+
+    def s7empty_wrong_sample(rows):
+        for row in rows:
+            if row["batch"] == "suppl-s7empty":
+                row["sample_id"] = "S7"
+                break
+
+    expect_error("S7-empty 批次写 S7 → bad-mapping", "bad-mapping",
+                 one("map_s7sample", s7empty_wrong_sample))
+
+    def b0_wrong_condition(rows):
+        for row in rows:
+            if row["batch"] == "b0-legacy":
+                row["condition"] = "A"
+                break
+
+    expect_error("B0 批次写 A 条件 → bad-mapping", "bad-mapping",
+                 one("map_b0cond", b0_wrong_condition))
+
+    def subj_wrong_sample(rows):
+        for row in rows:
+            if row["batch"] == "suppl-subj":
+                row["sample_id"] = "S1"
+                break
+
+    expect_error("subj 批次写 S1 → bad-mapping", "bad-mapping",
+                 one("map_subjsample", subj_wrong_sample))
+
+    def calib_same_cell(rows):
+        calib = [row for row in rows if row["phase"] == "calibration"]
+        calib[1]["sample_id"] = calib[0]["sample_id"]
+        calib[1]["condition"] = calib[0]["condition"]
+
+    expect_error("校准两份同格 → bad-mapping", "bad-mapping",
+                 one("map_calib_cell", calib_same_cell))
+
+    def formal_batch_wrong(rows):
+        for row in rows:
+            if row["phase"] == "formal":
+                row["batch"] = "suppl-subj"
+                break
+
+    expect_error("正式份写 supplementary batch → bad-mapping", "bad-mapping",
+                 one("map_formal_batch", formal_batch_wrong))
+
+    def supp_uses_main(rows):
+        for row in rows:
+            if row["phase"] == "supplementary":
+                row["batch"] = "main"
+                break
+
+    expect_error("补充份用 main 批次 → bad-mapping", "bad-mapping",
+                 one("map_supp_main", supp_uses_main))
+
+    # 合规 mapping 必须仍然通过（不能把真实取值误判）。
+    good = A.load_mapping(make_fixture(TMP_ROOT / "map_good",
+                                       overrides=e2e_overrides())["paths"]["mapping"])
+    check("A4 合规 mapping 通过（含 S7-empty / B0 / C-subj）", len(good) == 113,
+          len(good))
+    phases = {}
+    for meta in good.values():
+        phases[meta["phase"]] = phases.get(meta["phase"], 0) + 1
+    check("A4 phase 计数 84/6/23",
+          phases == {"formal": 84, "calibration": 6, "supplementary": 23}, phases)
+
+
+def test_transactional_publish():
+    """A5：整组写入 staging，复核成功才发布；失败不留正式输出。"""
+    # 1) 成功后不留 staging，输出数量与预期一致。
+    fixture = make_fixture(TMP_ROOT / "txn_ok", overrides=e2e_overrides())
+    out_dir = TMP_ROOT / "txn_ok_out"
+    code, _ = run_main(fixture, out_dir)
+    check("A5 成功路径返回 0", code == 0)
+    staging = out_dir.parent / (out_dir.name + ".staging")
+    check("A5 成功后不残留 staging", not staging.exists(), staging)
+    written = sorted(path.name for path in out_dir.iterdir())
+    check("A5 发布后 16 CSV + 报告齐全", len(written) == 17, written)
+
+    # 2) 运行期间输入被改动 → input-mutated，且不留正式输出。
+    fixture2 = make_fixture(TMP_ROOT / "txn_mutate", overrides=e2e_overrides())
+    out_dir2 = TMP_ROOT / "txn_mutate_out"
+    original_render = A.render_report
+
+    def render_then_mutate(ctx):
+        text = original_render(ctx)
+        with open(fixture2["paths"]["formal_raw"], "ab") as handle:
+            handle.write(b"\n")
+        return text
+
+    A.render_report = render_then_mutate
+    try:
+        expect_error("A5 输入中途改动 → input-mutated", "input-mutated",
+                     lambda: run_main(fixture2, out_dir2))
+    finally:
+        A.render_report = original_render
+    check("A5 输入改动后无正式输出目录", not out_dir2.exists(), out_dir2)
+    staging2 = out_dir2.parent / (out_dir2.name + ".staging")
+    check("A5 输入改动后 staging 被清理", not staging2.exists(), staging2)
+
+    # 3) 写盘中途失败 → 清理 staging，不留半个结果。
+    fixture3 = make_fixture(TMP_ROOT / "txn_fail", overrides=e2e_overrides())
+    out_dir3 = TMP_ROOT / "txn_fail_out"
+    original_write = A.write_csv_atomic
+    calls = {"n": 0}
+
+    def flaky_write(path, columns, rows):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise OSError("模拟写盘失败")
+        return original_write(path, columns, rows)
+
+    A.write_csv_atomic = flaky_write
+    try:
+        run_main(fixture3, out_dir3)
+        check("A5 中途写盘失败应抛出异常", False, "未抛异常")
+    except OSError as exc:
+        check("A5 中途写盘失败 → OSError 上抛", "模拟写盘失败" in str(exc), exc)
+    except Exception as exc:  # noqa: BLE001
+        check("A5 中途写盘失败 → OSError 上抛", False,
+              "%s：%s" % (type(exc).__name__, exc))
+    finally:
+        A.write_csv_atomic = original_write
+    check("A5 写盘失败后无正式输出目录", not out_dir3.exists(), out_dir3)
+    staging3 = out_dir3.parent / (out_dir3.name + ".staging")
+    check("A5 写盘失败后 staging 被清理", not staging3.exists(), staging3)
+
+    # 4) staging 已存在 → 拒绝复用。
+    fixture4 = make_fixture(TMP_ROOT / "txn_stale", overrides=e2e_overrides())
+    out_dir4 = TMP_ROOT / "txn_stale_out"
+    stale = out_dir4.parent / (out_dir4.name + ".staging")
+    stale.mkdir(parents=True, exist_ok=True)
+    expect_error("A5 staging 已存在 → staging-exists", "staging-exists",
+                 lambda: run_main(fixture4, out_dir4))
+    check("A5 拒绝复用后不写正式输出", not out_dir4.exists(), out_dir4)
+
+
+def test_holm_rank_dependent():
+    """A6：Holm 是 rank-dependent；H1 排最后时乘数 1，Holm p 可低于 0.05。"""
+    rows = A.holm_adjust([0.03125, 0.015625, 0.015625],
+                         "primary_H1_H2a_H2b",
+                         labels=["H1_D_minus_B_P3", "H2a_D_minus_B_P1",
+                                 "H2b_C_minus_A_P1"])
+    by_label = {row["contrast"]: row for row in rows}
+    check("A6 H1 排第三（乘数 1）", int(by_label["H1_D_minus_B_P3"]["rank"]) == 3,
+          by_label["H1_D_minus_B_P3"])
+    check("A6 H1 Holm 后 = 0.046875（running max 取到第 1 名的 0.046875）",
+          close(float(by_label["H1_D_minus_B_P3"]["p_holm"]), 0.046875),
+          by_label["H1_D_minus_B_P3"])
+    check("A6 H1 的 Holm p 可以低于 0.05",
+          float(by_label["H1_D_minus_B_P3"]["p_holm"]) < 0.05,
+          by_label["H1_D_minus_B_P3"])
+    check("A6 乘数随排名变化，不是固定 ×3",
+          int(by_label["H1_D_minus_B_P3"]["factor"]) == 1 and
+          int(by_label["H2a_D_minus_B_P1"]["factor"]) == 3,
+          {k: v["factor"] for k, v in by_label.items()})
+    check("A6 三行 rejected 与阈值一致",
+          all(row["rejected"] == (float(row["p_holm"]) <= 0.05) for row in rows),
+          rows)
+
+    # H1 的真实 m 上限（P3 对 S7 不适用）：E2E 里 H1 m=6、n_blocks=6。
+    fixture = make_fixture(TMP_ROOT / "holm_m6", overrides=e2e_overrides())
+    out_dir = TMP_ROOT / "holm_m6_out"
+    run_main(fixture, out_dir)
+    primary = {row["contrast"]: row for row in
+               read_csv(out_dir / "primary_hypothesis_tests.csv")}
+    h1 = primary["H1_D_minus_B_P3"]
+    check("A6 H1 有效配对 6（dz 分母也是 6 个差）",
+          int(h1["n_blocks"]) == 6 and int(h1["m_nonzero"]) == 6, h1)
+    check("A6 H1 原始 p=0.03125（m=6 最小可达）",
+          close(float(h1["p_raw"]), 0.03125), h1)
+    check("A6 H1 结论不写「显著」", "显著" not in h1["conclusion"], h1["conclusion"])
+    report = (out_dir / "analysis_report.md").read_text(encoding="utf-8")
+    check("A6 报告说明 Holm 是 rank-dependent",
+          "rank-dependent" in report)
+    check("A6 报告区分「Holm p 门槛」与「附录 B 完整判据」",
+          "附录 B" in report and "m=7" in report)
+    check("A6 报告写明设计文档存在口径冲突需负责人确认",
+          "口径" in report and "负责人" in report)
+
+
 # ===========================================================================
 # main
 # ===========================================================================
@@ -1232,9 +1635,15 @@ def main():
 
         test_pending_denominator()
         test_pending_blocks_hypothesis()
+        test_blank_fail_closed()
         test_adjudication_flow()
         test_mapping_fail_closed()
+        test_mapping_structure()
         test_raw_ratings_fail_closed()
+        test_rater_id_strict()
+        test_binary_descriptive_only()
+        test_transactional_publish()
+        test_holm_rank_dependent()
         test_h5_with_results()
         test_results_mismatch()
         test_missing_inputs()

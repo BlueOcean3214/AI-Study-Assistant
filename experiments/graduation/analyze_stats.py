@@ -52,6 +52,7 @@ import math
 import os
 import random
 import re
+import shutil
 import statistics
 import sys
 from pathlib import Path
@@ -89,6 +90,37 @@ SAMPLES = ("S1", "S2", "S3", "S4", "S5", "S6", "S7")
 CONDITIONS = ("A", "B", "C", "D")
 CELL_OUTPUTS = 3          # 每格实际纳入盲评的份数（§5.4.2 / §5.4.7）
 REPEATS_PER_CELL = 5      # §5.5 提到的 5 次重复；盲评只抽 3 份，故 5 与 3 的差异见 README 歧义节
+
+# A3：评分者身份只允许 rater_a / rater_b（两份评分材料固定发给这两位）
+RATER_IDS = ("rater_a", "rater_b")
+
+# A4：mapping 的 phase / batch / 样本 / 条件边界。
+# 口径来源：§5.4.4/§5.4.5/§5.4.7 的批次表 + make_blind_pack.py 的 build_items()/mapping_rows()。
+PHASES = ("formal", "calibration", "supplementary")
+BATCH_MAIN = "main"
+BATCH_SUBJ = "suppl-subj"
+BATCH_S7EMPTY = "suppl-s7empty"
+BATCH_B0 = "b0-legacy"
+BATCHES = (BATCH_MAIN, BATCH_SUBJ, BATCH_S7EMPTY, BATCH_B0)
+S7EMPTY_SAMPLE = "S7-empty"          # 生成器把 S7-empty 作为 sample_id 直接写入 mapping
+SUBJ_CONDITIONS = ("C-subj", "D-subj")
+B0_CONDITION = "B0"
+B0_SAMPLES = ("S5", "S7")
+# 每批次允许出现的 (sample_id, condition) 组合；None 表示「S1..S7 × A..D 全组合」
+BATCH_SAMPLE_CONDITIONS = {
+    BATCH_MAIN: None,
+    BATCH_S7EMPTY: frozenset({(S7EMPTY_SAMPLE, "D")}),
+    BATCH_SUBJ: frozenset({("S5", c) for c in SUBJ_CONDITIONS}),
+    BATCH_B0: frozenset({(s, B0_CONDITION) for s in B0_SAMPLES}),
+}
+# 补充批次在 mapping 里的份数（§5.4.4：3 + 10 + 10 = 23）
+BATCH_COUNTS = {BATCH_S7EMPTY: 3, BATCH_B0: 10, BATCH_SUBJ: 10}
+# 补充批次里每个 (sample, group) 的份数（B0：S5 5 份 + S7 5 份；subj：两个条件各 5 份）
+BATCH_CELL_COUNTS = {
+    BATCH_S7EMPTY: {(S7EMPTY_SAMPLE, "D"): 3},
+    BATCH_B0: {("S5", B0_CONDITION): 5, ("S7", B0_CONDITION): 5},
+    BATCH_SUBJ: {("S5", "C-subj"): 5, ("S5", "D-subj"): 5},
+}
 
 FORMAL_COUNT = 84
 CALIBRATION_COUNT = 6
@@ -294,10 +326,26 @@ NA_TOKEN = "N/A"
 MISSING_TOKEN = ""
 
 
-def parse_likert(raw, where):
+def _blank_error(where):
+    """A2：原始评分表里的空白必须 fail-closed。
+
+    设计文档 §5.4.6 允许「N/A 或留空」，但留空在统计侧会被静默排除出格内分母，
+    等于用一个看不见的理由缩小样本量。本脚本属于目录录入/统计层，按 PR #22
+    同一套工具层口径收紧：不适用必须显式写 N/A，留空一律报错。
+    """
+    return StatsError(
+        "blank-value",
+        f"{where}：原始评分表不得留空；该样本不适用请写 N/A，"
+        f"未评不会静默计入分母（工具层收紧，见 STATISTICS-README.md）",
+    )
+
+
+def parse_likert(raw, where, allow_blank=False):
     """1–5 分：返回 (kind, value)；kind ∈ score/na/pending。"""
     text = (raw or "").strip()
     if text == "":
+        if not allow_blank:
+            raise _blank_error(where)
         return ("pending", None)
     if text.upper() == NA_TOKEN:
         return ("na", None)
@@ -314,9 +362,11 @@ def parse_likert(raw, where):
     return ("score", value)
 
 
-def parse_binary(raw, where):
+def parse_binary(raw, where, allow_blank=False):
     text = (raw or "").strip()
     if text == "":
+        if not allow_blank:
+            raise _blank_error(where)
         return ("pending", None)
     if text.upper() == NA_TOKEN:
         return ("na", None)
@@ -327,9 +377,11 @@ def parse_binary(raw, where):
     )
 
 
-def parse_verdict(raw, where):
+def parse_verdict(raw, where, allow_blank=False):
     text = (raw or "").strip()
     if text == "":
+        if not allow_blank:
+            raise _blank_error(where)
         return ("pending", None)
     if text.upper() == NA_TOKEN:
         return ("na", None)
@@ -340,19 +392,147 @@ def parse_verdict(raw, where):
     )
 
 
-def parse_item(item, raw, where):
+def parse_item(item, raw, where, allow_blank=False):
     if item in LIKERT_ITEMS:
-        return parse_likert(raw, where)
+        return parse_likert(raw, where, allow_blank=allow_blank)
     if item in SUPPLEMENT_ITEMS or item in BINARY_ITEMS:
-        return parse_binary(raw, where)
+        return parse_binary(raw, where, allow_blank=allow_blank)
     if item in VERDICT_ITEMS:
-        return parse_verdict(raw, where)
+        return parse_verdict(raw, where, allow_blank=allow_blank)
     raise StatsError("unknown-item", f"{where}：未知评分项 {item!r}")
 
 
 # ---------------------------------------------------------------------------
 # 映射表（blind_id → 源记录身份）
 # ---------------------------------------------------------------------------
+
+
+def _check_mapping_structure(rows, problems):
+    """A4：按批次校验 phase/batch/sample/condition 对应关系与重复编号。
+
+    只实现有冻结设计（§5.4.4/§5.4.5/§5.4.7）或生成器代码
+    （make_blind_pack.py 的 build_items()/load_*_rows()）依据的规则。
+    """
+    # 1) phase 与 batch 的对应关系：正式与校准只能是 main 批次；
+    #    补充批次只能是三个 legacy/补充批次之一。
+    for row in rows:
+        where = f"mapping.csv:{row['_line']}"
+        phase = row["phase"]
+        batch = row["batch"]
+        if phase in ("formal", "calibration") and batch != BATCH_MAIN:
+            problems.append(
+                f"{where}：phase={phase} 的 batch 必须是 {BATCH_MAIN}，实际 {batch!r}"
+            )
+        if phase == "supplementary" and batch == BATCH_MAIN:
+            problems.append(
+                f"{where}：phase=supplementary 不应使用 {BATCH_MAIN} 批次"
+            )
+
+    # 2) 批次与 (sample_id, condition) 的对应关系。
+    for row in rows:
+        where = f"mapping.csv:{row['_line']}"
+        allowed = BATCH_SAMPLE_CONDITIONS.get(row["batch"])
+        if allowed is None:
+            continue
+        pair = (row["sample_id"], row["condition"])
+        if pair not in allowed:
+            problems.append(
+                f"{where}：批次 {row['batch']} 不允许 (sample_id, condition)={pair}；"
+                f"允许 {sorted(allowed)}"
+            )
+
+    # 3) 主批次（正式 + 校准）的 sample/condition 只能是 S1..S7 × A..D。
+    for row in rows:
+        if row["batch"] != BATCH_MAIN:
+            continue
+        where = f"mapping.csv:{row['_line']}"
+        if row["sample_id"] not in SAMPLES:
+            problems.append(f"{where}：main 批次 sample_id 非法 {row['sample_id']!r}")
+        if row["condition"] not in CONDITIONS:
+            problems.append(f"{where}：main 批次 condition 非法 {row['condition']!r}")
+
+    # 4) repeat_index 合法范围 0..4（生成器 REPEATS=[0..4]）。
+    for row in rows:
+        if not (0 <= row["repeat_index"] < REPEATS_PER_CELL):
+            problems.append(
+                f"mapping.csv:{row['_line']}：repeat_index 越界 {row['repeat_index']}"
+                f"（应在 0..{REPEATS_PER_CELL - 1}）"
+            )
+
+    # 5) round_index：B0 legacy 允许为空，其它批次必须是 0..4。
+    for row in rows:
+        where = f"mapping.csv:{row['_line']}"
+        raw = row.get("_round_index_raw", "")
+        if row["batch"] == BATCH_B0:
+            if raw not in ("", None) and not (0 <= row["round_index"] < REPEATS_PER_CELL):
+                problems.append(f"{where}：round_index 越界 {row['round_index']}")
+            continue
+        if raw in ("", None):
+            problems.append(
+                f"{where}：批次 {row['batch']} 的 round_index 不得为空"
+                f"（只有 {BATCH_B0} 允许为空）"
+            )
+        elif not (0 <= row["round_index"] < REPEATS_PER_CELL):
+            problems.append(f"{where}：round_index 越界 {row['round_index']}")
+
+    # 6) 正式 84：28 格每格 3 份，且三份的 repeat_index 必须互不相同
+    #    （不得用重复 repeat_index 凑满每格）。
+    formal_rows = [r for r in rows if r["phase"] == "formal"]
+    cell_repeats = {}
+    for row in formal_rows:
+        cell_repeats.setdefault((row["sample_id"], row["condition"]), []).append(
+            row["repeat_index"]
+        )
+    for sample in SAMPLES:
+        for condition in CONDITIONS:
+            repeats = cell_repeats.get((sample, condition), [])
+            if len(repeats) != CELL_OUTPUTS:
+                problems.append(
+                    f"mapping.csv：正式格 ({sample},{condition}) 应为 {CELL_OUTPUTS} 份，"
+                    f"实际 {len(repeats)} 份"
+                )
+                continue
+            if len(set(repeats)) != len(repeats):
+                problems.append(
+                    f"mapping.csv：正式格 ({sample},{condition}) 的 repeat_index 重复 "
+                    f"{sorted(repeats)}；三份必须来自不同 repeat"
+                )
+    extra_formal = set(cell_repeats) - {(s, c) for s in SAMPLES for c in CONDITIONS}
+    if extra_formal:
+        problems.append(f"mapping.csv：正式出现 28 格之外的格子 {sorted(extra_formal)[:3]}")
+
+    # 7) 校准 6：每格至多 1 份、每样本至多 1 份（§5.4.3），不得与正式完全同格同 repeat。
+    calib_rows = [r for r in rows if r["phase"] == "calibration"]
+    calib_cells = [(r["sample_id"], r["condition"]) for r in calib_rows]
+    if len(set(calib_cells)) != len(calib_cells):
+        problems.append("mapping.csv：校准 6 份必须覆盖 6 个不同格子（每格至多 1 份）")
+    calib_samples = [r["sample_id"] for r in calib_rows]
+    if len(set(calib_samples)) != len(calib_samples):
+        problems.append("mapping.csv：校准 6 份必须覆盖 6 个不同样本（每样本至多 1 份）")
+
+    # 8) 补充 23：批次份数与每批次格子份数。
+    suppl_rows = [r for r in rows if r["phase"] == "supplementary"]
+    batch_counts = {}
+    for row in suppl_rows:
+        batch_counts[row["batch"]] = batch_counts.get(row["batch"], 0) + 1
+    for batch, want in BATCH_COUNTS.items():
+        got = batch_counts.get(batch, 0)
+        if got != want:
+            problems.append(
+                f"mapping.csv：补充批次 {batch} 应为 {want} 份，实际 {got}"
+            )
+    cell_counts = {}
+    for row in suppl_rows:
+        key = (row["batch"], row["sample_id"], row["condition"])
+        cell_counts[key] = cell_counts.get(key, 0) + 1
+    for batch, spec in BATCH_CELL_COUNTS.items():
+        for (sample, condition), want in spec.items():
+            got = cell_counts.get((batch, sample, condition), 0)
+            if got != want:
+                problems.append(
+                    f"mapping.csv：补充批次 {batch} 格 ({sample},{condition}) 应为 {want} 份，"
+                    f"实际 {got}"
+                )
 
 
 def load_mapping(path):
@@ -368,15 +548,16 @@ def load_mapping(path):
             problems.append(f"{where}：blind_id 重复 {blind_id}")
         row["source_row_number"] = _int_field(row["source_row_number"], f"{where} source_row_number")
         row["repeat_index"] = _int_field(row["repeat_index"], f"{where} repeat_index")
-        row["round_index"] = _int_field(row["round_index"], f"{where} round_index")
-        if row["phase"] not in ("formal", "calibration", "supplementary"):
+        # round_index：B0 legacy 允许为空；空串必须保留下来不被 int() 吃掉。
+        row["_round_index_raw"] = (row.get("round_index") or "").strip()
+        if row["_round_index_raw"] == "":
+            row["round_index"] = -1
+        else:
+            row["round_index"] = _int_field(row["round_index"], f"{where} round_index")
+        if row["phase"] not in PHASES:
             problems.append(f"{where}：phase 非法 {row['phase']!r}")
-        if row["batch"] not in ("main", "suppl-subj", "suppl-s7empty", "b0-legacy"):
+        if row["batch"] not in BATCHES:
             problems.append(f"{where}：batch 非法 {row['batch']!r}")
-        if row["sample_id"] not in SAMPLES:
-            problems.append(f"{where}：sample_id 非法 {row['sample_id']!r}")
-        if row["condition"] not in CONDITIONS:
-            problems.append(f"{where}：condition 非法 {row['condition']!r}")
         if not SHA256_RE.match(row["source_result_row_sha256"]):
             problems.append(f"{where}：source_result_row_sha256 不是 64 位小写十六进制")
         if not SHA256_RE.match(row["source_prompt_sha256"]):
@@ -417,23 +598,8 @@ def load_mapping(path):
             )
         seen[key] = row["blind_id"]
 
-    # 正式 84：7 样本 × 4 条件 × 3 份
-    cell_counts = {}
-    for row in rows:
-        if row["phase"] == "formal":
-            cell_counts[(row["sample_id"], row["condition"])] = \
-                cell_counts.get((row["sample_id"], row["condition"]), 0) + 1
-    for sample in SAMPLES:
-        for condition in CONDITIONS:
-            got = cell_counts.get((sample, condition), 0)
-            if got != CELL_OUTPUTS:
-                problems.append(
-                    f"mapping.csv：正式格 ({sample},{condition}) 应为 {CELL_OUTPUTS} 份，实际 {got}"
-                )
-    if len(cell_counts) != len(SAMPLES) * len(CONDITIONS):
-        problems.append(
-            f"mapping.csv：正式格应为 28 个，实际 {len(cell_counts)} 个"
-        )
+    _check_mapping_structure(rows, problems)
+
     if problems:
         raise StatsError("bad-mapping", f"mapping.csv 有 {len(problems)} 处问题", problems)
     return by_id
@@ -475,8 +641,11 @@ def load_raw_ratings(path, mapping, phase):
             )
         if row["phase"] != phase:
             problems.append(f"{where}：phase 应为 {phase}，实际 {row['phase']!r}")
-        if not row["rater_id"]:
-            problems.append(f"{where}：rater_id 为空")
+        if row["rater_id"] not in RATER_IDS:
+            problems.append(
+                f"{where}：rater_id 必须是 {RATER_IDS} 之一，实际 {row['rater_id']!r}"
+                f"（不允许任意两个不同 ID 冒充两位评分者）"
+            )
         by_blind.setdefault(blind_id, []).append(row)
 
     expected_ids = {bid for bid, m in mapping.items() if m["phase"] == phase}
@@ -497,6 +666,11 @@ def load_raw_ratings(path, mapping, phase):
         raters = [g["rater_id"] for g in group]
         if len(set(raters)) != len(raters):
             problems.append(f"{where}：rater_id 重复 {raters}")
+        # A3：必须严格是 rater_a 与 rater_b 各一行，不能缺也不能换成别的 ID。
+        if set(raters) != set(RATER_IDS):
+            problems.append(
+                f"{where}：评分者必须是 {list(RATER_IDS)} 各一行，实际 {sorted(set(raters))}"
+            )
         item_kinds = {}
         sample = mapping[blind_id]["sample_id"]
         for row in group:
@@ -513,7 +687,8 @@ def load_raw_ratings(path, mapping, phase):
                 if applicable and kind == "na":
                     problems.append(
                         f"{where} rater={row['rater_id']} {item}：该样本适用，"
-                        f"不得写 N/A（未评请留空），实际 {row[item]!r}"
+                        f"不得写 N/A（请给 1–5 分，未评不会静默计入分母），"
+                        f"实际 {row[item]!r}"
                     )
                 item_kinds.setdefault(item, []).append(kind)
                 row["_parsed_" + item] = (kind, value)
@@ -564,8 +739,11 @@ def load_supplement_ratings(path, mapping):
             problems.append(f"{where}：blind_id {blind_id} 不是补充批次")
         if row["phase"] != "supplementary":
             problems.append(f"{where}：phase 应为 supplementary，实际 {row['phase']!r}")
-        if not row["rater_id"]:
-            problems.append(f"{where}：rater_id 为空")
+        if row["rater_id"] not in RATER_IDS:
+            problems.append(
+                f"{where}：rater_id 必须是 {RATER_IDS} 之一，实际 {row['rater_id']!r}"
+                f"（不允许任意两个不同 ID 冒充两位评分者）"
+            )
         for item in SUPPLEMENT_ITEMS:
             applicable = _supplement_item_applicable(item, meta)
             kind, value = parse_item(
@@ -579,7 +757,7 @@ def load_supplement_ratings(path, mapping):
             if applicable and kind == "na":
                 problems.append(
                     f"{where} rater={row['rater_id']} {item}：该批次适用，"
-                    f"不得写 N/A（未评请留空），实际 {row[item]!r}"
+                    f"不得写 N/A（请给 0/1，未评不会静默计入分母），实际 {row[item]!r}"
                 )
             row["_parsed_" + item] = (kind, value)
         by_blind.setdefault(blind_id, []).append(row)
@@ -814,26 +992,43 @@ def load_adjudications(path, raw_rows_by_blind):
         if len(scored) != 2:
             problems.append(f"{where}：该 (blind_id,item) 没有两人的有效分，不应有裁决")
             continue
+        # A3：按评分者身份取值，不能只看排序后的两个值。
+        by_rater = {}
+        for g in group:
+            parsed_one = g.get("_parsed_" + item)
+            if parsed_one and parsed_one[0] == "score":
+                by_rater[g["rater_id"]] = parsed_one[1]
+        if set(by_rater) != set(RATER_IDS):
+            problems.append(
+                f"{where}：该 (blind_id,item) 的有效分不在 {list(RATER_IDS)} 上，"
+                f"实际 {sorted(by_rater)}"
+            )
+            continue
         if item in VERDICT_ITEMS:
-            triggered = scored[0] != scored[1]
+            triggered = by_rater["rater_a"] != by_rater["rater_b"]
             valid_final = VERDICT_LABELS
         elif item in LIKERT_ITEMS:
-            triggered = abs(scored[0] - scored[1]) > 1
+            triggered = abs(by_rater["rater_a"] - by_rater["rater_b"]) > 1
             valid_final = tuple(str(v) for v in range(1, 6))
         else:
-            triggered = scored[0] != scored[1]
+            triggered = by_rater["rater_a"] != by_rater["rater_b"]
             valid_final = ("0", "1")
         if not triggered:
             problems.append(
-                f"{where}：该项未触发裁决阈值（{scored}），按 §5.5 不应写入裁决表"
+                f"{where}：该项未触发裁决阈值"
+                f"（rater_a={by_rater['rater_a']}, rater_b={by_rater['rater_b']}），"
+                f"按 §5.5 不应写入裁决表"
             )
-        if row["rater_a_value"] != row["rater_b_value"]:
-            if sorted([row["rater_a_value"], row["rater_b_value"]]) != \
-                    sorted([str(scored[0]), str(scored[1])]):
-                problems.append(
-                    f"{where}：rater_a_value/rater_b_value={row['rater_a_value']!r}/"
-                    f"{row['rater_b_value']!r} 与原始分 {scored} 不一致"
-                )
+        # A3：rater_a_value 必须等于原始表 rater_a 的值，rater_b_value 同理；
+        # 交换两者（哪怕排序后相同）也要报错，否则身份被抹平。
+        if row["rater_a_value"] != str(by_rater["rater_a"]) or \
+                row["rater_b_value"] != str(by_rater["rater_b"]):
+            problems.append(
+                f"{where}：rater_a_value/rater_b_value="
+                f"{row['rater_a_value']!r}/{row['rater_b_value']!r} 与原始分"
+                f"（rater_a={by_rater['rater_a']}, rater_b={by_rater['rater_b']}）"
+                f"不按身份对应"
+            )
         if row["final_value"] not in valid_final:
             problems.append(
                 f"{where}：final_value={row['final_value']!r} 不在 {valid_final}"
@@ -862,8 +1057,14 @@ def derive_final(by_blind, adjudications):
                 final[item] = "N/A"
                 status = "na"
             elif "pending" in kinds:
-                final[item] = "pending"
-                status = "pending"
+                # A2：原始表空白会被 parse_* 直接拒绝，pending 只可能在派生阶段
+                # 由「两人合法评分分歧且无有效裁决」产生，绝不允许从这里冒出来，
+                # 否则就是把「漏填」和「未裁决分歧」混成同一个状态。
+                raise StatsError(
+                    "internal-pending",
+                    f"blind_id={blind_id} {item}：原始分不应出现 pending（{kinds}）；"
+                    f"原始表空白必须 fail-closed，pending 只在派生阶段产生",
+                )
             elif len(values) != 2:
                 raise StatsError(
                     "bad-pairing",
@@ -924,8 +1125,14 @@ def derive_supplement_final(by_blind, adjudications):
                 final[item] = "N/A"
                 status = "na"
             elif "pending" in kinds:
-                final[item] = "pending"
-                status = "pending"
+                # A2：原始表空白会被 parse_* 直接拒绝，pending 只可能在派生阶段
+                # 由「两人合法评分分歧且无有效裁决」产生，绝不允许从这里冒出来，
+                # 否则就是把「漏填」和「未裁决分歧」混成同一个状态。
+                raise StatsError(
+                    "internal-pending",
+                    f"blind_id={blind_id} {item}：原始分不应出现 pending（{kinds}）；"
+                    f"原始表空白必须 fail-closed，pending 只在派生阶段产生",
+                )
             elif len(values) != 2:
                 raise StatsError(
                     "bad-pairing", f"blind_id={blind_id} {item} 适用性不一致 {kinds}"
@@ -1469,7 +1676,8 @@ def paired_values(cell_values, contrast, cell_na=None):
 
     - 该格按 §5.4.7 **不适用**（三份都是 N/A，例如 P3 对 S7）→ 该样本合法退出这个
       对比，只减少 m，不报错。设计文档 §5.5 本身就写 H1 在 P3 上 m=6、最低双侧
-      p=0.0313、Holm 后 0.0939，正是这种情形的算例。
+      p=0.0313；至于它 Holm 后是多少，取决于该 p 在三个对比里的排名
+      （标准 rank-dependent Holm，乘数不是固定 3），见第 6 节说明。
     - 该格**该有值但没有**（pending / 未裁决，分母为 0）→ 属于数据不完整，返回
       missing，由调用方 fail-closed，不补零、不生成 p。
     """
@@ -1717,8 +1925,29 @@ def render_report(ctx):
             f"{row['rank']} | {row['factor']} | {fmt(row['p_holm'], 4)} | "
             f"{'是' if row['rejected'] else '否'} |")
     add("")
-    add("主家族 3 个对比统一校正；H5 家族（Y3/Y5）单独成族，不与主家族混算。"
-        "m=6 的最小原始 p=0.0313 经 Holm ×3 后为 0.0939，仍过不了 0.05。")
+    add("主家族 3 个对比统一校正；H5 家族（Y3/Y5）单独成族，不与主家族混算。")
+    add("")
+    add("**Holm 是 rank-dependent 的标准逐步法**：第 i 小的 p 乘以 (k−i+1)，"
+        "乘数取决于该 p 在家族里的排名，而不是固定乘以 3。因此"
+        "「m=6 时最小原始 p=0.0313 必然被 ×3 得 0.0939」只在它排最后一名时成立；"
+        "若 H1 排第一或第二，乘数可能是 3 或 2，Holm p 可能是 0.09375 或 0.0625——"
+        "这跟「H1 不可能显著」是两件事，必须分开写：")
+    add("")
+    add("- **H1 的 Holm p 能否低于 0.05**：取决于三个对比的 p 排序，"
+        "理论上 H1 排第一时 ×3 = 0.09375 仍 >0.05；排第二时 ×2 = 0.0625 >0.05。"
+        "故在本实验的 p 取值格点上 H1 的 Holm p 确实达不到 0.05，"
+        "但这个结论来自「m=6 的最小原始 p 是 0.03125」这一算术事实，"
+        "不是来自「m 不够 7」。")
+    add("- **H1 是否满足附录 B 的完整支持判据**：不满足，且是结构性的——"
+        "附录 B 要求 m=7（7 个非零配对）且 Δ≥0.5、|r_rb|≥0.5、dz≥0.8、Holm p<0.05 同时成立，"
+        "而 P3 对 S7 按 §5.4.7 不适用，H1 最多只有 6 个有效配对，m=7 永远无法达成。")
+    add("- **H1 的 dz 分母**：实际只基于 6 个可用 P3 配对（不是 7 个）；"
+        "`dz` 列用全部参与配对的差计算，样本数见 `n_blocks`。")
+    add("")
+    add("冻结设计文档 §5.5 对「m=6 时 Holm 如何解释」存在数学口径冲突"
+        "（文档给出的 0.0939 只对应「该 p 排最后」的情形），"
+        "本脚本不改设计文档、不改 Holm 算法，只按标准 rank-dependent 逐步法计算并如实标注；"
+        "此处需研究负责人确认最终解释口径。")
     add("")
 
     add("## 7. Friedman（描述性定位）")
@@ -1734,15 +1963,15 @@ def render_report(ctx):
         "也不在它之后做未预登记的事后两两扫描。")
     add("")
 
-    add("## 8. 二分类比例（描述性）")
+    add("## 8. 二分类比例（只描述，不做推断）")
     add("")
     add(f"- {DESIGN_AMBIGUITY_REPEATS}")
     add("")
-    add("| 指标 | 条件 | 有效格数 | 比例（样本级均值） | 描述 |")
-    add("| --- | --- | --- | --- | --- |")
+    add("| 指标 | 范围 | 批次/条件 | 适用单位数 | 有值单位数 | 平均比例 | 说明 |")
+    add("| --- | --- | --- | --- | --- | --- | --- |")
     for row in ctx["binary_rates"]:
-        add(f"| {row['metric']} | {row['condition']} | {row['n_cells']} | "
-            f"{fmt(row['mean_proportion'], 4)} | {row['note']} |")
+        add(f"| {row['metric']} | {row['scope']} | {row['group']} | {row['n_units']} | "
+            f"{row['n_scored']} | {fmt(row['mean_proportion'], 4)} | {row['note']} |")
     add("")
     if ctx["binary_tests"]:
         add("| 指标 | 检验 | 统计量 | p | 状态 | 说明 |")
@@ -1751,8 +1980,10 @@ def render_report(ctx):
             add(f"| {row['metric']} | {row['test']} | {fmt(row['statistic'], 4)} | "
                 f"{fmt(row['p'], 4)} | {row['status']} | {row['note']} |")
         add("")
-    add("二分类结果一律标**弱证据/描述性**，不据此宣称因果；"
-        "样本级 0/1 折叠需要「5 次中 ≥3 次」，本轮每格只有 3 份，未执行该折叠。")
+    add("二分类结果一律标**弱证据/描述性**，本脚本不产出任何二分类推断 p 值。"
+        "样本级 0/1 折叠按 §5.5 需要「同格 5 次重复中 ≥3 次为 1」，"
+        "而盲评每格只抽 3 份；3 份如何折叠未被冻结文档定义，"
+        "任何自定义折半门槛都属于新增判据，因此 Cochran's Q 与 McNemar 均未执行。")
     add("")
 
     add("## 9. H5（Y2/Y3/Y5，弱推断 + 描述）")
@@ -1906,36 +2137,59 @@ def build_ctx(args, out_dir):
             "reason_code": res["reason_code"], "note": note,
         })
 
-    # 二分类比例（描述性）：S3_flag 只用 S3、S6 两个样本，无法折叠 5 次
+    # 二分类比例（A1：只做描述性，不做任何推断检验）
+    #
+    # 为什么不做 Cochran's Q / McNemar：§5.5 要求「同格 5 次重复中 ≥3 次为 1」
+    # 才能把格子折叠成样本级 0/1，而盲评每格只抽 3 份 —— 冻结文档没说清 3 份
+    # 该怎么折。用「3 份比例 ≥0.5 就记 1」是我们自己发明的门槛，不是预登记判据，
+    # 会直接制造出设计里没有的 p 值。因此这里只报描述性比例，推断一律
+    # not_executed 并写明原因；也不新增任何未预登记的二分类比较。
     binary_rates = []
     binary_tests = []
-    for item in ("S3_flag",):
+    for item in BINARY_ITEMS:
         for condition in CONDITIONS:
-            values = [cell_values.get(item, {}).get((s, condition)) for s in SAMPLES]
-            values = [v for v in values if isinstance(v, (int, float))]
+            cells = []
+            for sample in SAMPLES:
+                value = cell_values.get(item, {}).get((sample, condition))
+                if isinstance(value, (int, float)):
+                    cells.append(value)
             binary_rates.append({
-                "metric": item, "condition": condition, "n_cells": len(values),
-                "mean_proportion": mean(values) if values else None,
-                "note": "仅 S3/S6 两份；每格 3 份的格内比例",
+                "metric": item, "scope": "formal", "group": condition,
+                "n_units": len(cells), "n_scored": len(cells),
+                "mean_proportion": mean(cells) if cells else None,
+                "note": "每格 3 份的格内比例，再对可算样本取均值；"
+                        "仅 S3/S6 适用（§5.4.7），n_units 是能算出比例的格数",
             })
-        matrix = []
-        for sample in SAMPLES:
-            row = [cell_values.get(item, {}).get((sample, c)) for c in CONDITIONS]
-            if all(isinstance(v, (int, float)) for v in row):
-                matrix.append([1 if v >= 0.5 else 0 for v in row])
-        if len(matrix) >= 2:
-            res = cochrans_q(matrix)
-            binary_tests.append({
-                "metric": item, "test": "cochrans_q", "statistic": res["q"],
-                "p": res["p"], "status": res["status"],
-                "note": f"n={len(matrix)} 个样本；弱证据、描述性；reason={res['reason_code'] or '-'}",
+    for item in SUPPLEMENT_ITEMS:
+        for batch in (BATCH_S7EMPTY, BATCH_B0, BATCH_SUBJ):
+            ids = [bid for bid, meta in mapping.items()
+                   if meta["phase"] == "supplementary" and meta["batch"] == batch]
+            applicable = [bid for bid in ids if _supplement_item_applicable(item, mapping[bid])]
+            scored = [final_supp[bid][item] for bid in applicable
+                      if isinstance(final_supp[bid][item], (int, float))]
+            binary_rates.append({
+                "metric": item, "scope": "supplementary", "group": batch,
+                "n_units": len(applicable), "n_scored": len(scored),
+                "mean_proportion": mean(scored) if scored else None,
+                "note": "补充批次描述性比例（份级 0/1，不含推断）；"
+                        f"分母为该批次 {item} 适用份数，pending 不计入分子",
             })
-        else:
-            binary_tests.append({
-                "metric": item, "test": "cochrans_q", "statistic": None, "p": None,
-                "status": "not_executed",
-                "note": f"只有 {len(matrix)} 个样本有四条件值，Cochran's Q 不执行",
-            })
+
+    binary_tests.append({
+        "metric": "S3_flag", "test": "none", "statistic": None, "p": None,
+        "status": "not_executed",
+        "note": "设计歧义：§5.5 要求同格 5 次重复中 ≥3 次为 1 才折成样本级 0/1，"
+                "但盲评每格只抽 3 份；3 份如何折叠未被冻结文档定义，"
+                "不能用任何自定义门槛恢复预登记的样本级判定。"
+                "Cochran's Q 与 McNemar 均不执行，只报描述性比例。",
+    })
+    for item in SUPPLEMENT_ITEMS:
+        binary_tests.append({
+            "metric": item, "test": "none", "statistic": None, "p": None,
+            "status": "not_executed",
+            "note": "补充批次 E1/E7 只做描述性比例；冻结文档未预登记任何"
+                    "补充批次的二分类推断比较，故不执行 Cochran's Q / McNemar。",
+        })
 
     # H5：Y2/Y3/Y5（需 results.jsonl）
     h5, h5_reason, y2_table = [], "", []
@@ -2100,9 +2354,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     out_dir = Path(args.out_dir)
-    if out_dir.exists() and any(out_dir.iterdir()):
-        raise StatsError("output-exists", f"--out-dir 已存在且非空：{out_dir}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # A5：先检查输出目录状态，失败要在做任何统计之前。
+    if out_dir.exists():
+        if not out_dir.is_dir():
+            raise StatsError("bad-out-dir", f"--out-dir 已存在且不是目录：{out_dir}")
+        if any(out_dir.iterdir()):
+            raise StatsError("output-exists", f"--out-dir 已存在且非空：{out_dir}")
 
     input_paths = [args.formal_raw, args.calibration_raw, args.supplement_raw,
                    args.adjudicated, args.mapping] + list(args.results or [])
@@ -2157,7 +2414,8 @@ def main(argv=None):
                                       _holm_rows(ctx["holm"])),
         "friedman_results.csv": (("metric", "n_blocks", "k", "q", "df", "p", "method",
                                   "status", "reason_code", "note"), ctx["friedman"]),
-        "binary_rates.csv": (("metric", "condition", "n_cells", "mean_proportion", "note"),
+        "binary_rates.csv": (("metric", "scope", "group", "n_units", "n_scored",
+                              "mean_proportion", "note"),
                              ctx["binary_rates"]),
         "binary_tests.csv": (("metric", "test", "statistic", "p", "status", "note"),
                              ctx["binary_tests"]),
@@ -2192,18 +2450,62 @@ def main(argv=None):
     }
     report = render_report(ctx)
 
+    # A5：事务式发布。
+    # 1) 全部输出（CSV + 报告）先写进 out_dir 旁的独立 staging 目录；
+    # 2) 写完复核所有输入 SHA-256（输入在统计期间被改动就整体失败）；
+    # 3) 只有全部成功才把 staging 里的整组文件一次性搬进 out_dir；
+    # 4) 任何异常都清掉 staging，正式目录不留任何统计文件。
     written = []
-    for name, (columns, rows) in outputs.items():
-        write_csv_atomic(targets[name], columns, rows)
-        written.append(name)
-    _write_text_atomic(out_dir / "analysis_report.md", report)
-    written.append("analysis_report.md")
+    staging = out_dir.parent / (out_dir.name + ".staging")
+    if staging.exists() or staging.is_symlink():
+        raise StatsError(
+            "staging-exists", f"staging 目录已存在，拒绝复用/覆盖：{staging}"
+        )
+    try:
+        staging.mkdir(parents=True)
+        for name, (columns, rows) in outputs.items():
+            write_csv_atomic(staging / name, columns, rows)
+            written.append(name)
+        _write_text_atomic(staging / "analysis_report.md", report)
+        written.append("analysis_report.md")
 
-    # 输入哈希复核：运行期间不得有任何输入被改动
-    after = {str(p): sha256_file(p) for p in input_paths}
-    changed = [p for p in after if after[p] != before[p]]
-    if changed:
-        raise StatsError("input-mutated", f"运行期间输入被改动：{changed}")
+        # 输入哈希复核：必须在发布之前完成。
+        after = {str(p): sha256_file(p) for p in input_paths}
+        changed = [p for p in after if after[p] != before[p]]
+        if changed:
+            raise StatsError("input-mutated", f"运行期间输入被改动：{changed}")
+
+        # staging 自检：数量与内容都要对上，避免发布半套结果。
+        staged = sorted(p.name for p in staging.iterdir())
+        if staged != sorted(written):
+            raise StatsError(
+                "staging-mismatch",
+                f"staging 内容与预期不符：预期 {sorted(written)}，实际 {staged}",
+            )
+
+        # 发布：目标目录保持「不存在或为空」语义。
+        out_dir.mkdir(parents=True, exist_ok=True)
+        published = []
+        for name in written:
+            src = staging / name
+            dst = out_dir / name
+            if dst.exists() or dst.is_symlink():
+                raise StatsError(
+                    "output-exists", f"目标文件已存在，拒绝覆盖：{dst}"
+                )
+            os.replace(src, dst)
+            published.append(name)
+        staging.rmdir()
+    except BaseException:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    if len(published) != len(written):
+        raise StatsError(
+            "publish-incomplete",
+            f"只发布了 {len(published)}/{len(written)} 个文件：{published}",
+        )
 
     print("OK 输出目录：" + str(out_dir))
     for name in written:
