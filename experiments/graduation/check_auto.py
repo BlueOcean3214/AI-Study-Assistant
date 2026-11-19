@@ -319,6 +319,9 @@ def verify_manifest(run_name, run_dir, hashes, rows_count, manifest_path=None):
 
 PROMPT_SYSTEM_PREFIX = "===== SYSTEM =====\n"
 PROMPT_USER_SEP = "\n\n===== USER =====\n"
+# 归档层（build_prompts.write_sample_output）在 USER 原文后额外追加的结束换行。
+# 它不是 Prompt 内容，解析时必须精确去掉这一个字符，不能动原始 Prompt 自己的尾随空白。
+PROMPT_ARCHIVE_TRAILER = "\n"
 
 
 def prompt_text(run_dir, sample_id, group):
@@ -336,6 +339,8 @@ def parse_prompt_archive(text):
     """把归档 Prompt 拆回 (system, user)。
 
     分隔符只在「文档级」出现一次：先确认 SYSTEM 前缀，再按唯一的 USER 分隔符切分。
+    USER 段末尾的那个换行是归档器（build_prompts.write_sample_output）写的格式结束符，
+    不是 Prompt 原文，这里精确去掉一个；原文自带的尾随换行/空格一律保留。
     任何一处不满足就抛 ValueError —— 宁可判 UNVERIFIABLE，也不用字符串切割截断内容。
     """
 
@@ -352,6 +357,12 @@ def parse_prompt_archive(text):
 
     if not system.strip():
         raise ValueError("归档 Prompt 的 SYSTEM 内容为空")
+
+    if not user.endswith(PROMPT_ARCHIVE_TRAILER):
+        raise ValueError("归档 Prompt 的 USER 段缺少归档结束换行（格式异常），拒绝猜测原文")
+
+    # 只脱掉归档层追加的那一个字符；原文的尾随换行/空格留在 user 里。
+    user = user[: -len(PROMPT_ARCHIVE_TRAILER)]
 
     if not user.strip():
         raise ValueError("归档 Prompt 的 USER 内容为空")
