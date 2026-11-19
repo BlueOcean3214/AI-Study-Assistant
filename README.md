@@ -345,6 +345,13 @@ Confirmation TTL = 1800s
 
 评测覆盖对话、草案、确认保存、故障注入（embedding 服务不可用）、伪造凭证与未确认保存的拒绝路径；每次运行归档完整轨迹 JSON 到 `agent_eval_runs/`（已加入 .gitignore）。
 
+### 两种运行模式
+
+- 默认（夹具模式）：全部 15 个用例在各自独立的临时数据库 / 向量缓存中运行，结束后删除本次创建的资源。
+- `--real-data`：使用生效的 `database.DATABASE_PATH`（可能被 `FEEDBACK_DB_PATH` 覆盖）只读运行，**只执行显式声明 `read_only=True` 且在 `READ_ONLY_CASE_IDS` 白名单里的用例**（A/B/B2/C/D/E/F/G/P1/P2/P3 共 11 个）。P4/P5/P6/P7 含有效保存凭证或写库回调，一律 SKIP 并在报告中写明原因，不计入 PASS。`run_case(isolate=False)` 对未声明的用例直接抛 `DataSafetyError`，是 fail-closed 而不是按名字推断。
+- 真实模式不切换数据库路径、不初始化、不清凭证、不清理仓库里的固定夹具（`_eval_fixture.db`、`_eval_cache/`），写入型缓存重定向到本次独占的临时目录并在退出后删除。
+- 数据安全：运行前记录生效数据库、plans 表、检索埋点文件、真实缓存目录、`knowledge/` 的存在状态 + SHA256 + 大小，运行后逐项比较；任一不一致都会让报告 `ok=False`、`main()` 返回 1。事后比较只是兜底，运行前的只读白名单才是第一道门禁。
+
 ---
 
 ## Model Call Layer：本地 Ollama 与线上 OpenAI 兼容 API

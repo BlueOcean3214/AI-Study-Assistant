@@ -321,8 +321,18 @@ check("run_all 生成报告", report["summary"]["cases"] == 2, f"cases={report['
 check("桩 runner 下无硬性失败", report["summary"]["hard_failures"] == 0, f"{report['summary']}")
 check("桩 runner 下有正常回答", report["cases"][0]["evaluation"]["observed"]["stopped_reason"] == "final_answer")
 check("报告包含模型与上限", report["model"] and report["limits"]["max_tool_calls"] == agent_loop.MAX_TOOL_CALLS)
-check("报告包含数据安全检查", set(report["data_safety"]) == {"real_db_unchanged", "knowledge_unchanged", "real_cache_state_unchanged", "real_plans_unchanged"})
-check("run_all 后真实数据未变", all(report["data_safety"].values()), f"{report['data_safety']}")
+safety = report["data_safety"]
+check("报告包含数据安全检查", set(safety) == {"ok", "failures", "checks"}, f"keys={sorted(safety)}")
+check(
+    "数据安全检查覆盖 database/plans/metrics/real_cache/knowledge 且逐项通过",
+    safety["ok"] is True
+    and safety["failures"] == []
+    and {"database", "plans", "metrics", "real_cache", "knowledge"}
+    <= {item["name"] for item in safety["checks"]}
+    and all(item["ok"] for item in safety["checks"])
+    and all("before" in item and "after" in item for item in safety["checks"]),
+    f"{safety['failures']}",
+)
 check("run_all 清理了夹具", not agent_eval.FIXTURE_DB.exists() and not agent_eval.FIXTURE_CACHE.exists())
 
 # 12. 归档
