@@ -5,7 +5,8 @@
 也可以用 UPLOAD_TEST_BASE_URL 指定一个已经在跑的服务，此时不再自己启动。
 
 覆盖需求：正常上传 / source / chunk_count / 非 txt / 超 2MB / 空文件名 /
-路径穿越 / 上传后立即可检索 / /ask 与其它接口未受影响。
+路径穿越 / 上传后立即可检索 / /ask 与其它接口未受影响 /
+PDF 文档级状态（完整 PDF = ok、混合型 PDF = partial 并给出缺页、全扫描 PDF = failed）。
 
 测试隔离说明：子进程服务用 `stub_app:app` 启动——Embedding 用确定性打桩
 （`stub_embedding.py`），所以「上传后立即可被检索」不依赖本地 Ollama，也不需要
@@ -49,7 +50,42 @@ UPLOAD_CONTENT = (
     "每个树节点最多有两个子树，叶子节点没有子节点。\n"
 ).encode("utf-8")
 
-CREATED_FILES = [UPLOAD_NAME, "evil_test_upload.txt", "evil_win_test_upload.txt"]
+CREATED_FILES = [
+    UPLOAD_NAME,
+    "_test_upload_full.pdf",
+    "_test_upload_mixed.pdf",
+    "_test_upload_scanned.pdf",
+    "evil_test_upload.txt",
+    "evil_win_test_upload.txt",
+]
+
+
+def build_pdf(pages):
+    """pages 里给字符串的写正文，给 None 的留空白页（模拟扫描页）。"""
+    import io
+
+    from reportlab.lib.pagesizes import A4
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+    from reportlab.pdfgen import canvas
+
+    try:
+        pdfmetrics.getFont("STSong-Light")
+    except KeyError:
+        pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=A4)
+    for body in pages:
+        if body is not None:
+            text = pdf.beginText(72, 760)
+            text.setFont("STSong-Light", 12)
+            for line in body.split("\n"):
+                text.textLine(line)
+            pdf.drawText(text)
+        pdf.showPage()
+    pdf.save()
+    return buffer.getvalue()
 
 
 def check(name, condition, detail=""):
@@ -166,10 +202,83 @@ try:
         f"{payload['chunk_count']} == {expected_chunks}",
     )
 
+    # 3.1 完整 PDF：status=ok，页码信息齐全
+    full_pdf = build_pdf(["第一页：极限的定义。", "第二页：连续与可导。"])
+    full = requests.post(
+        f"{base_url}/upload",
+        files={"file": ("_test_upload_full.pdf", full_pdf, "application/pdf")},
+        timeout=60,
+    )
+    check("完整 PDF 上传返回 200", full.status_code == 200, f"status={full.status_code} body={full.text[:120]}")
+    full_payload = full.json()
+    check(
+        "完整 PDF 文档级状态为 ok",
+        full_payload.get("status") == "ok" and full_payload.get("message") == "文档上传成功",
+        f"status={full_payload.get('status')} message={full_payload.get('message')}",
+    )
+    check(
+        "完整 PDF 返回页码统计",
+        (full_payload.get("pages_total"), full_payload.get("pages_with_text")) == (2, 2)
+        and list(full_payload.get("missing_pages") or []) == []
+        and list(full_payload.get("warnings") or []) == [],
+        {key: full_payload.get(key) for key in ("pages_total", "pages_with_text", "missing_pages", "warnings")},
+    )
+    check("完整 PDF 已切出切片", full_payload.get("chunk_count", 0) >= 1, full_payload.get("chunk_count"))
+    (KNOWLEDGE_DIR / "_test_upload_full.pdf").unlink(missing_ok=True)
+
+    # 3.2 混合型 PDF：允许保存可提取页，但必须如实报 partial
+    mixed_pdf = build_pdf(["第一页：有文本层。", None, "第三页：也有文本层。"])
+    mixed = requests.post(
+        f"{base_url}/upload",
+        files={"file": ("_test_upload_mixed.pdf", mixed_pdf, "application/pdf")},
+        timeout=60,
+    )
+    check("混合型 PDF 上传返回 200", mixed.status_code == 200, f"status={mixed.status_code} body={mixed.text[:120]}")
+    mixed_payload = mixed.json()
+    check(
+        "混合型 PDF 不得报成完整解析成功",
+        mixed_payload.get("status") == "partial"
+        and "解析不完整" in (mixed_payload.get("message") or ""),
+        f"status={mixed_payload.get('status')} message={mixed_payload.get('message')}",
+    )
+    check(
+        "混合型 PDF 返回页数与缺页",
+        (mixed_payload.get("pages_total"), mixed_payload.get("pages_with_text")) == (3, 2)
+        and list(mixed_payload.get("missing_pages") or []) == [2],
+        {key: mixed_payload.get(key) for key in ("pages_total", "pages_with_text", "missing_pages")},
+    )
+    check(
+        "混合型 PDF 给出 warnings",
+        len(mixed_payload.get("warnings") or []) == 1
+        and mixed_payload["warnings"][0].get("warning_code") == "missing_pages"
+        and list(mixed_payload["warnings"][0].get("page_numbers") or []) == [2],
+        mixed_payload.get("warnings"),
+    )
+    check("混合型 PDF 仍保存有文本页的切片", mixed_payload.get("chunk_count", 0) >= 1, mixed_payload.get("chunk_count"))
+    check("混合型 PDF 文件确实落盘", (KNOWLEDGE_DIR / "_test_upload_mixed.pdf").exists())
+    (KNOWLEDGE_DIR / "_test_upload_mixed.pdf").unlink(missing_ok=True)
+
+    # 3.3 全扫描 PDF：没有文本层，必须失败且不进索引
+    scanned_pdf = build_pdf([None])
+    scanned = requests.post(
+        f"{base_url}/upload",
+        files={"file": ("_test_upload_scanned.pdf", scanned_pdf, "application/pdf")},
+        timeout=60,
+    )
+    check("全扫描 PDF 被拒绝", scanned.status_code == 400, f"status={scanned.status_code} body={scanned.text[:120]}")
+    scanned_payload = scanned.json()
+    check(
+        "全扫描 PDF 返回失败状态与错误码",
+        scanned_payload.get("status") == "failed"
+        and scanned_payload.get("error_code") == "no_text_layer",
+        f"status={scanned_payload.get('status')} error_code={scanned_payload.get('error_code')}",
+    )
+    check("全扫描 PDF 未落盘", not (KNOWLEDGE_DIR / "_test_upload_scanned.pdf").exists())
+
     # 4. 非 txt 被拒绝
     for bad_name, bad_type in (
-        ("notes.pdf", "application/pdf"),
-        ("word.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ("notes.md", "text/markdown"),
+        ("data.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
         ("pic.png", "image/png"),
         ("photo.jpg", "image/jpeg"),
     ):
@@ -179,8 +288,9 @@ try:
             timeout=30,
         )
         check(
-            f"拒绝非 txt 文件 {bad_name}",
-            bad.status_code == 400 and bad.json().get("message") == "目前只支持 .txt 文件",
+            f"拒绝不支持的文件类型 {bad_name}",
+            bad.status_code == 400
+            and bad.json().get("message") == "目前只支持 .txt / .pdf / .docx 文件",
             f"status={bad.status_code} body={bad.text[:80]}",
         )
 

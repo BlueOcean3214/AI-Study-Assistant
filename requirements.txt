@@ -14,3 +14,6 @@ langchain-openai>=1.7,<2.0
 # LangGraph 计划草案工作流（实验路径）与 LlamaIndex RAG 适配（实验路径）
 langgraph>=1.2,<2.0
 llama-index-core>=0.14,<1.0
+# S1 文档解析：PDF（pypdf）与 DOCX（python-docx，带入 lxml）
+pypdf>=5.0,<8.0
+python-docx>=1.1,<2.0

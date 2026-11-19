@@ -1,18 +1,37 @@
-"""文档导入服务：保存上传的 txt、读取内容、切片，供检索层使用。
+"""文档导入服务：保存上传的文档、读取内容、切片，供检索层使用。
 
-职责划分：
+职责划分（S1 起）：
     save_document(filename, content)   保存到 knowledge/，返回 source（相对路径）
     read_text(path)                    读取 txt（自动兼容 UTF-8 / UTF-8 BOM / GBK）
-    split_into_chunks(text)            文本切片，每片最多 400 字（300~500 区间）
+    split_into_chunks(text)            TXT 文本切片，每片最多 400 字（300~500 区间）
     chunk_text(text, source)           切片并给每片带上 source
-    load_documents() / load_chunks()   递归读取整个知识库
+    load_documents()                   递归读取整个知识库（txt/pdf/docx）
+    load_chunks()                      递归读取并切片，默认仍返回 [{"content","source"}]
+    load_chunk_records()               递归读取并切片，返回带 15 个元数据字段的记录
+    scan_knowledge()                   扫描知识库，返回文档清单 + 结构化问题清单
 
-本模块只使用标准库，不依赖 FastAPI，之后实现上传接口时可以直接调用：
-    source = document_service.save_document(file.filename, await file.read())
+兼容策略：
+    默认返回值与 S1 之前逐键一致（{"content","source"}），富元数据必须显式开启
+    （load_chunks(with_metadata=True) / load_chunk_records()），不改变既有调用方契约。
+
+解析失败处理：
+    单个文件解析失败不会中断整个知识库扫描，但也不会被静默丢弃——
+    scan_knowledge() 会给出 {"source_name","error_code","error_message"} 形式的问题清单。
 """
 
 import re
 from pathlib import Path
+
+from document_chunker import CHUNKER_VERSION, chunk_document
+from document_parser import (
+    PARSER_VERSION,
+    STATUS_PARTIAL,
+    ParseError,
+    SUPPORTED_SUFFIXES,
+    parse_bytes,
+    parse_file,
+    status_for_code,
+)
 
 
 # 用脚本所在目录定位知识库，避免依赖启动时的工作目录
@@ -24,7 +43,10 @@ CHUNK_MAX_CHARS = 400
 # 标题行最大长度：以冒号结尾且不超过这个长度，就认为它是标题（开启新 chunk）
 HEADING_MAX_CHARS = 30
 
-# 只接受 txt
+# 允许的文档后缀（S1 起支持 TXT / PDF / DOCX）
+ALLOWED_SUFFIXES = SUPPORTED_SUFFIXES
+
+# 历史引用：仍指向 txt 后缀，供旧代码判断“纯文本”
 ALLOWED_SUFFIX = ".txt"
 
 # 文件名里不允许出现的字符（含 Windows 保留字符和空字符）
@@ -40,7 +62,16 @@ _SENTENCE_END_PATTERN = re.compile(r"[。！？；!?;]")
 
 
 class DocumentError(RuntimeError):
-    """文档保存或读取失败时抛出的异常。"""
+    """文档保存或读取失败时抛出的异常。
+
+    code 是可选的稳定错误码（目前只在解析失败时透传 ParseError.code），
+    上传接口据此把失败原因告诉调用方，例如 password_required / no_text_layer。
+    """
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.message = message
+        self.code = code
 
 
 def _decode(data):
@@ -75,9 +106,10 @@ def read_text(path):
 
 
 def sanitize_filename(filename):
-    """校验并返回安全的文件名（只允许形如 xxx.txt）。
+    """校验并返回安全的文件名（允许 .txt / .pdf / .docx）。
 
     会拒绝路径分隔符和 .. ，避免上传时把文件写到 knowledge 目录之外。
+    后缀大小写不敏感，返回值保留原始大小写。
     """
 
     if not isinstance(filename, str) or not filename.strip():
@@ -94,13 +126,15 @@ def sanitize_filename(filename):
     if set(name) & _INVALID_FILENAME_CHARS:
         raise DocumentError('文件名包含非法字符 <>:"/\\|?*')
 
-    if not name.lower().endswith(ALLOWED_SUFFIX):
-        raise DocumentError("只支持 .txt 文件")
+    suffix = Path(name).suffix.lower()
+
+    if suffix not in ALLOWED_SUFFIXES:
+        raise DocumentError("目前只支持 .txt / .pdf / .docx 文件")
 
     if len(name) > FILENAME_MAX_CHARS:
         raise DocumentError(f"文件名过长（最多 {FILENAME_MAX_CHARS} 个字符）")
 
-    if not name[: -len(ALLOWED_SUFFIX)].strip():
+    if not name[: -len(suffix)].strip():
         raise DocumentError("文件名缺少名称部分")
 
     return name
@@ -189,54 +223,325 @@ def chunk_text(text, source, max_chars=CHUNK_MAX_CHARS):
     ]
 
 
-def load_documents(directory=None):
-    """递归读取目录下所有 txt，返回 [{"content", "source"}]。
-
-    source 是相对知识库根目录的路径（统一用正斜杠），例如 "math/定积分.txt"。
-    """
+def _iter_parsed(directory):
+    """逐个文件解析，产出 (parsed, issue)。单个文件失败只记 issue，不中断。"""
 
     root = Path(directory) if directory is not None else KNOWLEDGE_PATH
 
-    documents = []
-
     if not root.is_dir():
-        return documents
+        return
 
-    for file in sorted(root.rglob("*.txt")):
+    files = [
+        file
+        for file in sorted(root.rglob("*"))
+        if file.is_file() and file.suffix.lower() in ALLOWED_SUFFIXES
+    ]
+
+    for file in files:
+        source = file.relative_to(root).as_posix()
+
         try:
-            content = _normalize(read_text(file))
-        except DocumentError as error:
-            # 单个文件坏了不影响整个知识库
-            print("跳过无法读取的知识文件:", error)
+            parsed = parse_file(file, source_name=source)
+        except ParseError as error:
+            # 解析失败必须有明确错误和状态，不能静默丢弃
+            print(f"跳过无法解析的知识文件：{source}（{error.code}: {error.message}）")
+            yield None, dict(error.to_issue(), file_type=file.suffix.lower().lstrip("."))
+            continue
+        except OSError as error:
+            print(f"跳过无法读取的知识文件：{source}（{error}）")
+            yield None, {
+                "source_name": source,
+                "file_type": file.suffix.lower().lstrip("."),
+                "error_code": "read_failed",
+                "error_message": str(error),
+            }
             continue
 
+        yield parsed, None
+
+
+def _document_state(parsed):
+    """文档级状态：解析成功（含 partial）时给调用方的完整性信息。"""
+
+    return {
+        "status": parsed.status,
+        "pages_total": parsed.pages_total,
+        "pages_with_text": parsed.pages_with_text,
+        "missing_pages": list(parsed.missing_pages),
+    }
+
+
+def _issue_state(issue):
+    """解析失败时的文档级状态：状态由错误码映射，页码信息一律为空。"""
+
+    return {
+        "status": status_for_code(issue.get("error_code")),
+        "pages_total": None,
+        "pages_with_text": None,
+        "missing_pages": [],
+        "error_code": issue.get("error_code"),
+    }
+
+
+def _document_warnings(parsed):
+    """解析出来了但不完整的情况：目前只有“PDF 部分页没有文本层”。"""
+
+    if parsed.status != STATUS_PARTIAL:
+        return []
+
+    return [
+        {
+            "source_name": parsed.source_name,
+            "warning_code": "missing_pages",
+            "page_numbers": list(parsed.missing_pages),
+            "message": (
+                f"PDF 共 {parsed.pages_total} 页，其中 "
+                f"{len(parsed.missing_pages)} 页没有可提取的文本层"
+                f"（第 {', '.join(str(page) for page in parsed.missing_pages)} 页），"
+                "本阶段不做 OCR"
+            ),
+        }
+    ]
+
+
+def _chunk_records_for(parsed):
+    """把一份已解析文档切成富记录（15 字段 + source）。"""
+
+    txt_splitter = split_into_chunks if parsed.file_type == "txt" else None
+
+    records = []
+
+    for chunk in chunk_document(parsed, CHUNK_MAX_CHARS, txt_splitter):
+        record = chunk.to_record()
+        # source 是历史键名，保留它让检索层无需区分新旧字段
+        record["source"] = chunk.source_name
+        records.append(record)
+
+    return records
+
+
+def load_chunk_records_with_states(directory=None):
+    """一次扫描同时返回富记录与文档级状态表。
+
+    返回 (records, states)：
+        records 与 load_chunk_records() 完全一致（15 字段 + source）
+        states  是 {source: {status, pages_total, pages_with_text, missing_pages}}，
+                解析失败的文件也会有状态，供检索层判断来源文档是否 partial，
+                不必为了拿状态再扫一遍知识库
+
+    注意：状态是“文档级”信息，不写进 Chunk 的 15 字段契约。
+    """
+
+    records = []
+    states = {}
+
+    for parsed, issue in _iter_parsed(directory):
+        if parsed is None:
+            source = issue.get("source_name")
+            states[source] = _issue_state(issue)
+            continue
+
+        states[parsed.source_name] = _document_state(parsed)
+        records.extend(_chunk_records_for(parsed))
+
+    return records, states
+
+
+def inspect_document(source, directory=None):
+    """解析单个文件，返回文档级状态 + 切片数（上传接口用）。
+
+    返回 {"status", "pages_total", "pages_with_text", "missing_pages",
+          "warnings", "chunk_count", "document_id", "parser_version", "chunker_version"}；
+    解析失败抛 DocumentError（带 ParseError.code），调用方据此决定返回 400 还是报错。
+    """
+
+    root = Path(directory) if directory is not None else KNOWLEDGE_PATH
+    file = root / source
+
+    if not file.is_file():
+        raise DocumentError(f"文件不存在：{source}")
+
+    try:
+        parsed = parse_file(file, source_name=source)
+    except ParseError as error:
+        raise DocumentError(
+            f"{source} 解析失败（{error.code}）：{error.message}",
+            code=error.code,
+        ) from error
+
+    chunks = _chunk_records_for(parsed)
+    info = _document_state(parsed)
+    info["warnings"] = _document_warnings(parsed)
+    info["chunk_count"] = len(chunks)
+    info["document_id"] = parsed.document_id
+    info["parser_version"] = parsed.parser_version
+    info["chunker_version"] = CHUNKER_VERSION
+
+    return info
+
+
+def load_documents(directory=None):
+    """递归读取目录下所有支持的文档，返回 [{"content", "source"}]。
+
+    source 是相对知识库根目录的路径（统一用正斜杠），例如 "math/定积分.txt"。
+    PDF / DOCX 的 content 是解析出的全文（块之间空行分隔）。
+    """
+
+    documents = []
+
+    for parsed, _issue in _iter_parsed(directory):
+        if parsed is None:
+            continue
+
+        content = parsed.text()
+
         if content:
-            documents.append(
-                {
-                    "content": content,
-                    "source": file.relative_to(root).as_posix(),
-                }
-            )
+            documents.append({"content": content, "source": parsed.source_name})
 
     return documents
 
 
-def load_chunks(directory=None):
-    """递归读取并切片，返回 [{"content", "source"}]。"""
+def load_chunk_records(directory=None):
+    """递归读取并切片，返回每个切片的完整记录（含 chunk_id 与来源定位）。
 
-    chunks = []
+    记录字段见 document_chunker.CHUNK_FIELDS，另外附带 "source"，
+    方便检索层继续按既有的 source 键组装上下文。
+    需要文档级状态（partial 等）时用 load_chunk_records_with_states()，一次扫描拿两份结果。
+    """
 
-    for document in load_documents(directory):
-        chunks.extend(chunk_text(document["content"], document["source"]))
+    return load_chunk_records_with_states(directory)[0]
 
-    return chunks
+
+def load_chunks(directory=None, with_metadata=False):
+    """递归读取并切片，默认返回 [{"content", "source"}]（与 S1 之前一致）。
+
+    with_metadata=True 时返回带完整元数据的记录（等同 load_chunk_records()）。
+    """
+
+    records = load_chunk_records(directory)
+
+    if with_metadata:
+        return records
+
+    return [{"content": record["content"], "source": record["source"]} for record in records]
+
+
+def chunk_file(source, directory=None):
+    """解析知识库里的单个文件并切片，返回 [Chunk]。
+
+    source 是相对知识库根目录的路径；文件不存在则抛 DocumentError。
+    上传接口用它在保存后统计切片数，不必重扫整个知识库。
+    """
+
+    root = Path(directory) if directory is not None else KNOWLEDGE_PATH
+    file = root / source
+
+    if not file.is_file():
+        raise DocumentError(f"文件不存在：{source}")
+
+    try:
+        parsed = parse_file(file, source_name=source)
+    except ParseError as error:
+        raise DocumentError(f"{source} 解析失败（{error.code}）：{error.message}") from error
+
+    txt_splitter = split_into_chunks if parsed.file_type == "txt" else None
+
+    return chunk_document(parsed, CHUNK_MAX_CHARS, txt_splitter)
+
+
+def scan_knowledge(directory=None):
+    """扫描知识库，返回文档清单、切片数与结构化问题清单。
+
+    返回 {"documents": [...], "issues": [...], "warnings": [...], "chunk_count": int}：
+        documents 覆盖扫描到的每个文件（含解析失败的），每条含
+            source / source_name / file_type / status / document_id / document_hash /
+            chunk_count / bytes / error_code / error_message / parser_version /
+            chunker_version / pages_total / pages_with_text / missing_pages
+            status: ok = 完整解析；partial = 部分页没有文本层（PDF 混合型）；
+                    failed / no_text_layer / empty / skipped_* = 解析失败或跳过
+        issues 只保留解析失败的文件（source_name / error_code / error_message / file_type），
+            方便调用方单独报警；两者不重复叙事，status 一律以此为准。
+        warnings 记录“解析出来了但不完整”的情况（目前只有 PDF 缺文本页），
+            每条含 source_name / warning_code / page_numbers / message；
+            partial 文档一定会同时出现在 documents（status=partial）和 warnings 里，
+            不允许把缺页静默忽略后仍报告完整解析成功。
+    """
+
+    root = Path(directory) if directory is not None else KNOWLEDGE_PATH
+    documents = []
+    issues = []
+    warnings = []
+    chunk_count = 0
+
+    for parsed, issue in _iter_parsed(root):
+        if issue is not None:
+            source = issue.get("source_name")
+            file = root / source if source else None
+            issues.append(issue)
+            documents.append(
+                {
+                    "source": source,
+                    "source_name": source,
+                    "file_type": issue.get("file_type"),
+                    "status": status_for_code(issue.get("error_code")),
+                    "document_id": None,
+                    "document_hash": None,
+                    "chunk_count": 0,
+                    "bytes": file.stat().st_size if file is not None and file.is_file() else None,
+                    "error_code": issue.get("error_code"),
+                    "error_message": issue.get("error_message"),
+                    "parser_version": PARSER_VERSION,
+                    "chunker_version": CHUNKER_VERSION,
+                    "pages_total": None,
+                    "pages_with_text": None,
+                    "missing_pages": [],
+                }
+            )
+            continue
+
+        txt_splitter = split_into_chunks if parsed.file_type == "txt" else None
+        chunks = chunk_document(parsed, CHUNK_MAX_CHARS, txt_splitter)
+        file = root / parsed.source_name
+        chunk_count += len(chunks)
+
+        if parsed.status == STATUS_PARTIAL:
+            warnings.extend(_document_warnings(parsed))
+
+        documents.append(
+            {
+                "source": parsed.source_name,
+                "source_name": parsed.source_name,
+                "file_type": parsed.file_type,
+                "status": parsed.status,
+                "document_id": parsed.document_id,
+                "document_hash": parsed.document_hash,
+                "chunk_count": len(chunks),
+                "bytes": file.stat().st_size if file.is_file() else None,
+                "error_code": None,
+                "error_message": None,
+                "parser_version": parsed.parser_version,
+                "chunker_version": CHUNKER_VERSION,
+                "pages_total": parsed.pages_total,
+                "pages_with_text": parsed.pages_with_text,
+                "missing_pages": list(parsed.missing_pages),
+            }
+        )
+
+    return {
+        "documents": documents,
+        "issues": issues,
+        "warnings": warnings,
+        "chunk_count": chunk_count,
+    }
 
 
 def save_document(filename, content, directory=None, overwrite=False):
-    """把上传的 txt 保存进知识库，返回保存后的 source（相对路径）。
+    """把上传的文档保存进知识库，返回保存后的 source（相对路径）。
 
-    content 可以是 str，也可以是上传接口读到的 bytes（自动识别 UTF-8 / GBK）。
-    保存时会统一换行符为 \n 并去掉首尾空白。
+    txt：content 可以是 str，也可以是 bytes（自动识别 UTF-8 / GBK），
+         保存时统一换行符为 \\n 并去掉首尾空白。
+    pdf/docx：content 必须是原始 bytes，保存时会先解析一次做校验，
+         解析失败直接抛 DocumentError，不会把坏文件写进知识库。
     同名文件内容不同时默认拒绝覆盖，避免误删已有知识；确实要覆盖时传 overwrite=True。
     内容完全相同的重复上传会直接当作成功（幂等）。
     """
@@ -244,30 +549,59 @@ def save_document(filename, content, directory=None, overwrite=False):
     root = Path(directory) if directory is not None else KNOWLEDGE_PATH
 
     source = sanitize_filename(filename)
+    suffix = Path(source).suffix.lower()
 
-    if isinstance(content, (bytes, bytearray)):
-        text = _decode(bytes(content))
-    elif isinstance(content, str):
-        text = content
+    if suffix == ".txt":
+        if isinstance(content, (bytes, bytearray)):
+            text = _decode(bytes(content))
+        elif isinstance(content, str):
+            text = content
+        else:
+            raise DocumentError("content 必须是 str 或 bytes")
+
+        text = _normalize(text)
+
+        if not text:
+            raise DocumentError("文件内容为空，未保存")
+
+        payload = (text + "\n").encode("utf-8")
     else:
-        raise DocumentError("content 必须是 str 或 bytes")
+        if isinstance(content, str):
+            raise DocumentError(f"{suffix} 文件必须以 bytes 上传")
+        if not isinstance(content, (bytes, bytearray)):
+            raise DocumentError("content 必须是 str 或 bytes")
 
-    text = _normalize(text)
+        payload = bytes(content)
 
-    if not text:
-        raise DocumentError("文件内容为空，未保存")
+        if not payload:
+            raise DocumentError("文件内容为空，未保存")
+
+        # 先解析校验，坏文件不落盘
+        try:
+            parse_bytes(payload, source)
+        except ParseError as error:
+            raise DocumentError(
+                f"{source} 解析失败（{error.code}）：{error.message}",
+                code=error.code,
+            ) from error
 
     target = root / source
 
     if target.exists() and not overwrite:
-        if _normalize(read_text(target)) == text:
+        try:
+            existing = target.read_bytes()
+        except OSError as error:
+            raise DocumentError(f"读取已有文件失败：{source}") from error
+
+        if existing == payload:
             return source
+
         raise DocumentError(f"{source} 已存在且内容不同；如需覆盖请传 overwrite=True")
 
     try:
         root.mkdir(parents=True, exist_ok=True)
         # 按字节写入，避免 Windows 把 \n 翻译成 \r\n
-        target.write_bytes((text + "\n").encode("utf-8"))
+        target.write_bytes(payload)
     except OSError as error:
         raise DocumentError(f"保存文件失败：{source}") from error
 
