@@ -115,6 +115,9 @@
 
 - 两人分差 **> 1 分**或 **0/1 相反**的项，进入裁决表 `ratings_adjudicated.csv`，
   由研究负责人裁定并记录 `adjudicator`、`reason`、`decided_utc`。
+- 裁决表的表头模板是同目录的 `ratings_adjudicated.csv`（只有表头，列为
+  `blind_id, item, rater_a_value, rater_b_value, final_value, adjudicator, reason, decided_utc`）；
+  **评分者不要填写这个文件**，它只由研究负责人在收到两人原始表之后维护。
 - 裁决**只写裁决表**，绝不改写原始表；最终表 `ratings_final.csv` 只能由原始表 + 裁决表派生。
 - 评分者之间不协商、不相互改分；κ 按原始行计算，不按裁决后数据计算。
 

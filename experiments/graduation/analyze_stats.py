@@ -134,8 +134,11 @@ EXPECTED_APPLICABLE = {
     "S4_verdict": 12,    # 仅 S6
 }
 
+# blind_id 只允许 32 位小写十六进制（make_blind_pack 的默认生成形态）或严格 UUIDv4；
+# 与 check_ratings.py 保持同一口径，避免同一份评分表一个工具放行、另一个工具拒绝。
 BLIND_ID_RE = re.compile(
-    r"^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+    r"^(?:[0-9a-f]{32}"
+    r"|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})$"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 

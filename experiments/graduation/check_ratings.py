@@ -116,6 +116,14 @@ STRICT_COUNTS = {
     "supplementary": {"blind_ids": 23, "rows": 46, "E7_scored_rows": 30},
 }
 
+# `--mapping` 模式下逐项核对的维度；适用性一律调用 analyze_stats 的冻结矩阵函数，不在这里复制规则。
+MAPPING_FORMAL_ITEMS = ("P1", "P2", "P3", "P4", "S2", "S3_flag", "S4_verdict")
+MAPPING_SUPPLEMENT_ITEMS = ("E1", "E7")
+
+
+class MappingError(RuntimeError):
+    """mapping.csv 本身不可用：与评分表的错误分开报，避免把映射问题误当成评分问题。"""
+
 
 def _read_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
     if not path.is_file():
@@ -309,12 +317,114 @@ def check_file(directory: Path, phase: str, *, strict: bool, allow_empty: bool) 
     return errors
 
 
-def collect_errors(directory: Path, *, strict: bool, allow_empty: bool) -> list[str]:
+def _stats_module():
+    """延迟导入 analyze_stats：复用 mapping 解析与 §5.4.7 冻结适用矩阵，不复制口径。"""
+    here = Path(__file__).resolve().parent
+    if str(here) not in sys.path:
+        sys.path.insert(0, str(here))
+    import analyze_stats  # noqa: PLC0415 —— 只在 --mapping 时加载
+
+    return analyze_stats
+
+
+def _mapping_by_phase(mapping_path: Path) -> dict[str, dict[str, dict]]:
+    """读 mapping.csv 并按 phase 分组；mapping 不合规时统一转成 MappingError。"""
+    stats = _stats_module()
+    try:
+        by_id = stats.load_mapping(mapping_path)
+    except stats.StatsError as error:
+        detail = "；".join(str(item) for item in error.problems[:5])
+        reason = f"{error.detail}{('：' + detail) if detail else ''}"
+        raise MappingError(f"mapping.csv 不可用（{error.code}）：{reason}") from error
+    grouped: dict[str, dict[str, dict]] = {phase: {} for phase in PHASE_FILES}
+    for blind_id, meta in by_id.items():
+        grouped[meta["phase"]][blind_id] = meta
+    return grouped
+
+
+def _item_applicable(stats, phase: str, item: str, meta: dict) -> bool:
+    if phase == "supplementary":
+        return stats._supplement_item_applicable(item, meta)
+    return stats._item_applicable(item, meta["sample_id"])
+
+
+def check_against_mapping(directory: Path, mapping_path: Path, *, allow_empty: bool) -> list[str]:
+    """用 mapping.csv 核对「谁该出现」和「该不该有分」。
+
+    `--strict` 只能数行数与 N/A 行数；把 S7 的 P3=N/A 与非 S7 的分数互换后总数不变，
+    只有对着 mapping 的样本身份逐项比对才能发现。这里检测三类问题：
+    1) 评分表里的 blind_id 不在 mapping 的对应 phase（例如校准材料混进正式表）；
+    2) mapping 里的材料缺行或缺某位评分者；
+    3) 某一项该不适用却给了分，或该适用却记了 N/A。
+    """
+    stats = _stats_module()
+    grouped = _mapping_by_phase(mapping_path)
+    errors: list[str] = []
+    owner = {blind_id: phase for phase, entries in grouped.items() for blind_id in entries}
+    for phase, (filename, _) in PHASE_FILES.items():
+        try:
+            _, rows = _read_csv(directory / filename)
+        except FileNotFoundError as error:
+            errors.append(str(error))
+            continue
+        expected = grouped[phase]
+        seen = {row.get("blind_id", "") for row in rows if row.get("blind_id")}
+        for blind_id in sorted(seen - set(expected)):
+            errors.append(
+                f"{filename} 出现 blind_id={blind_id}，但 mapping.csv 把它归在 "
+                f"phase={owner.get(blind_id, '（缺失）')}：评分表与盲评包不是同一套材料"
+            )
+        if not allow_empty:
+            for blind_id in sorted(set(expected) - seen):
+                errors.append(
+                    f"{filename} 缺 mapping.csv 里的 {phase} 材料 blind_id={blind_id}（每位评分者各一行）"
+                )
+        by_pair = {(row.get("blind_id", ""), row.get("rater_id", "")): row for row in rows}
+        for blind_id, meta in sorted(expected.items()):
+            if blind_id not in seen:
+                continue
+            present = {rater for (sid, rater) in by_pair if sid == blind_id}
+            missing = [rater for rater in sorted(RATER_IDS) if rater not in present]
+            if missing:
+                errors.append(f"{filename} blind_id={blind_id} 缺评分者 {missing}（每位评分者各一行）")
+            items = MAPPING_SUPPLEMENT_ITEMS if phase == "supplementary" else MAPPING_FORMAL_ITEMS
+            for item in items:
+                applicable = _item_applicable(stats, phase, item, meta)
+                for rater_id in sorted(RATER_IDS):
+                    row = by_pair.get((blind_id, rater_id))
+                    if row is None:
+                        continue
+                    value = row.get(item, "")
+                    if value == MISSING_TOKEN:
+                        continue  # 空白已由 _check_value 报过，不重复计数
+                    where = f"{filename} blind_id={blind_id}/{rater_id} {item}"
+                    if applicable and value == NA_TOKEN:
+                        errors.append(f"{where}=N/A：mapping.csv 显示该材料适用该维度，不得记不适用")
+                    elif not applicable and value != NA_TOKEN:
+                        errors.append(
+                            f"{where}={value!r}：mapping.csv 显示该材料不适用该维度"
+                            f"（sample_id={meta['sample_id']}），必须记 N/A"
+                        )
+    return errors
+
+
+def collect_errors(
+    directory: Path,
+    *,
+    strict: bool,
+    allow_empty: bool,
+    mapping_path: Path | None = None,
+) -> list[str]:
     if not directory.is_dir():
         return [f"评分目录不存在：{directory}"]
     errors: list[str] = []
     for phase in PHASE_FILES:
         errors.extend(check_file(directory, phase, strict=strict, allow_empty=allow_empty))
+    if mapping_path is not None:
+        try:
+            errors.extend(check_against_mapping(directory, mapping_path, allow_empty=allow_empty))
+        except MappingError as error:
+            errors.append(str(error))
     return errors
 
 
@@ -323,19 +433,33 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dir", default=str(DEFAULT_DIR), help="评分表目录（默认 experiments/graduation/blind_ratings）")
     parser.add_argument("--strict", action="store_true", help="额外核对份数、两位评分者齐全与不适用矩阵计数")
     parser.add_argument("--allow-empty", action="store_true", help="允许只有表头的空模板（用于交付前自检）")
+    parser.add_argument(
+        "--mapping",
+        default=None,
+        help="盲评包的私有 mapping.csv：核对 blind_id 归属 phase、评分者齐全与逐项 N/A 是否符合 §5.4.7",
+    )
     args = parser.parse_args(argv)
 
     directory = Path(args.dir)
-    errors = collect_errors(directory, strict=args.strict, allow_empty=args.allow_empty)
+    mapping_path = Path(args.mapping) if args.mapping else None
+    errors = collect_errors(
+        directory, strict=args.strict, allow_empty=args.allow_empty, mapping_path=mapping_path
+    )
     for phase, (filename, _) in PHASE_FILES.items():
         status = "FAIL" if any(filename in error for error in errors) else "PASS"
         print(f"[{status}] {phase:<13} {directory / filename}")
+    if mapping_path is not None:
+        failed = any("mapping.csv" in error for error in errors)
+        print(f"[{'FAIL' if failed else 'PASS'}] {"mapping":<13} {mapping_path}")
     if errors:
         print(f"\n发现 {len(errors)} 个问题：")
         for error in errors:
             print(f"  - {error}")
         return 1
-    print(f"\n全部通过（strict={args.strict}, allow_empty={args.allow_empty}）")
+    print(
+        f"\n全部通过（strict={args.strict}, allow_empty={args.allow_empty}, "
+        f"mapping={mapping_path if mapping_path else '未提供'}）"
+    )
     return 0
 
 
