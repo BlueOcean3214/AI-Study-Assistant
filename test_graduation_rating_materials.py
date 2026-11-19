@@ -293,6 +293,66 @@ def test_value_rules() -> None:
     check("补充批次 E7 记 N/A 是合法的", _errors_after(supplement_e7_na) == [], "")
 
 
+def test_blank_is_not_na() -> None:
+    """空白不等于 N/A：允许不适用的列留空必须报错，必填列写 N/A 必须报错。"""
+
+    def p3_blank(directory, formal, calibration, supplement):
+        formal[0]["P3"] = ""
+
+    errors = _errors_after(p3_blank)
+    check("P3 留空被拒绝并提示写 N/A", _expect(errors, "P3 为空：空白不等于 N/A") == "", f"{errors}")
+
+    def s3_blank(directory, formal, calibration, supplement):
+        formal[12]["S3_flag"] = ""
+
+    errors = _errors_after(s3_blank)
+    check("S3_flag 留空被拒绝并提示写 N/A", _expect(errors, "S3_flag 为空：空白不等于 N/A") == "", f"{errors}")
+
+    def s4_blank(directory, formal, calibration, supplement):
+        formal[12]["S4_verdict"] = ""
+
+    errors = _errors_after(s4_blank)
+    check("S4_verdict 留空被拒绝并提示写 N/A", _expect(errors, "S4_verdict 为空：空白不等于 N/A") == "", f"{errors}")
+
+    def e7_blank(directory, formal, calibration, supplement):
+        supplement[0]["E7"] = ""
+
+    errors = _errors_after(e7_blank)
+    check("补充批次 E7 留空被拒绝并提示写 N/A", _expect(errors, "E7 为空：空白不等于 N/A") == "", f"{errors}")
+
+    def p1_na(directory, formal, calibration, supplement):
+        formal[0]["P1"] = "N/A"
+
+    errors = _errors_after(p1_na)
+    check("必填维度写 N/A 被拒绝", _expect(errors, "P1=N/A：P1/P2/P4/S2 必填") == "", f"{errors}")
+
+    def supplement_e1_na(directory, formal, calibration, supplement):
+        supplement[0]["E1"] = "N/A"
+
+    errors = _errors_after(supplement_e1_na)
+    check("补充批次 E1 写 N/A 被拒绝", _expect(errors, "E1=N/A：补充批次每份都要判 E1") == "", f"{errors}")
+
+    def optional_na_tolerated(directory, formal, calibration, supplement):
+        formal[0]["P3"] = "N/A"
+        formal[12]["S3_flag"] = "N/A"
+        formal[12]["S4_verdict"] = "N/A"
+        supplement[0]["E7"] = "N/A"
+
+    check("显式 N/A 在不适用维度仍然通过", _errors_after(optional_na_tolerated) == [], "")
+
+    # strict 下空白不得被当成「不适用」计数：把一行合法 N/A 改成空白，N/A 行数应变成 23。
+    directory = TMP_ROOT / "blank_not_counted_as_na"
+    formal = _formal_rows()
+    target = next(row for row in formal if row.get("P3") == "N/A")
+    target["P3"] = ""
+    _write(directory, "formal", cr.FORMAL_HEADER, formal)
+    _write(directory, "calibration", cr.FORMAL_HEADER, _calibration_rows())
+    _write(directory, "supplementary", cr.SUPPLEMENT_HEADER, _supplement_rows())
+    errors = cr.collect_errors(directory, strict=True, allow_empty=False)
+    check("strict 下留空不计入 P3 的 N/A 行数", _expect(errors, "P3 记 N/A 的行数 23") == "", f"{errors}")
+    check("strict 下留空本身仍作为缺失报错", _expect(errors, "P3 为空：空白不等于 N/A") == "", f"{errors}")
+
+
 def test_strict_counts() -> None:
     def drop_one_blind_id(directory, formal, calibration, supplement):
         target = formal[-1]["blind_id"]
@@ -396,6 +456,7 @@ def main() -> int:
             test_invalid_ids_and_phase,
             test_duplicate_rows,
             test_value_rules,
+            test_blank_is_not_na,
             test_strict_counts,
             test_missing_files_and_failure_code,
             test_header_text_matches_design,

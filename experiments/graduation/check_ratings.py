@@ -7,7 +7,9 @@
 - `blind_id` 只允许 32 位小写十六进制或小写 UUIDv4；
 - `rater_id` 只允许 `rater_a` / `rater_b`，`phase` 必须与文件对应；
 - 每个 `(blind_id, rater_id)` 只能出现一次；
-- 1–5 分列只允许 1/2/3/4/5 或 `N/A`，**不允许 0**；0/1 列只允许 0/1 或 `N/A`；
+- **空白不等于 `N/A`**：只有显式写 `N/A` 才表示该份材料不适用，空字符串一律按缺失值报错；
+- 1–5 分列只允许 1/2/3/4/5，允许不适用的列（P3）可写 `N/A`，**不允许 0**；
+- 0/1 列只允许 0/1，允许不适用的列（S3_flag / E7）可写 `N/A`；必填列（E1）不得写 `N/A`；
 - `S4_verdict` 只允许 `full` / `partial` / `wrong` 或 `N/A`；
 - `notes` 不得出现可反推来源的身份信息；
 - `--strict` 额外核对份数、两位评分者齐全、以及不适用矩阵的计数。
@@ -69,7 +71,15 @@ RATER_IDS = {"rater_a", "rater_b"}
 FIVE_SCALE_COLUMNS = ("P1", "P2", "P3", "P4", "S2")
 BINARY_COLUMNS = ("S3_flag", "E1", "E7")
 S4_VALUES = {"full", "partial", "wrong"}
-NA_VALUES = {"", "N/A"}
+# 只有显式写 `N/A` 才表示「该份材料不适用」；空字符串是缺失值，**绝不等于 N/A**。
+NA_TOKEN = "N/A"
+MISSING_TOKEN = ""
+# §5.4.7 冻结口径里允许记「不适用」的列；未列出的列都是必填。
+OPTIONAL_COLUMNS = {
+    "formal": frozenset({"P3", "S3_flag", "S4_verdict"}),
+    "calibration": frozenset({"P3", "S3_flag", "S4_verdict"}),
+    "supplementary": frozenset({"E7"}),
+}
 
 BLIND_ID_RE = re.compile(
     r"^(?:[0-9a-f]{32}"
@@ -123,8 +133,32 @@ def _identity_leak(notes: str) -> str:
     return ""
 
 
-def _check_value(errors: list[str], where: str, column: str, value: str, allowed: set[str]) -> None:
-    if value in NA_VALUES:
+def _check_value(
+    errors: list[str],
+    where: str,
+    column: str,
+    value: str,
+    allowed: set[str],
+    *,
+    optional: bool,
+    required_missing: str = "",
+    required_na: str = "",
+) -> None:
+    """校验单个维度取值；空白按缺失处理，只有显式的 `N/A` 才算不适用。"""
+    if value == MISSING_TOKEN:
+        if optional:
+            errors.append(
+                f"{where} {column} 为空：空白不等于 N/A，请填写 {sorted(allowed)} 或明确写 N/A"
+            )
+        else:
+            errors.append(
+                required_missing or f"{where} {column} 缺失：必须填写 {sorted(allowed)}（空白不等于 N/A）"
+            )
+        return
+    if value == NA_TOKEN:
+        if optional:
+            return
+        errors.append(required_na or f"{where} {column}=N/A：该维度必填，不能记不适用")
         return
     if value in allowed:
         return
@@ -172,25 +206,50 @@ def check_file(directory: Path, phase: str, *, strict: bool, allow_empty: bool) 
             else:
                 seen[key] = line_no
 
+        optional_columns = OPTIONAL_COLUMNS[phase]
         if phase in ("formal", "calibration"):
             for column in FIVE_SCALE_COLUMNS:
-                value = row.get(column, "")
-                if column != "P3" and value in NA_VALUES:
-                    errors.append(f"{where} {column} 缺失：P1/P2/P4/S2 必须给 1–5 分")
-                    continue
-                _check_value(errors, where, column, value, {"1", "2", "3", "4", "5"})
-            _check_value(errors, where, "S3_flag", row.get("S3_flag", ""), {"0", "1"})
-            _check_value(errors, where, "S4_verdict", row.get("S4_verdict", ""), S4_VALUES)
+                _check_value(
+                    errors,
+                    where,
+                    column,
+                    row.get(column, ""),
+                    {"1", "2", "3", "4", "5"},
+                    optional=column in optional_columns,
+                    required_missing=f"{where} {column} 缺失：P1/P2/P4/S2 必须给 1–5 分",
+                    required_na=f"{where} {column}=N/A：P1/P2/P4/S2 必填，不能记不适用",
+                )
+            _check_value(
+                errors,
+                where,
+                "S3_flag",
+                row.get("S3_flag", ""),
+                {"0", "1"},
+                optional="S3_flag" in optional_columns,
+            )
+            _check_value(
+                errors,
+                where,
+                "S4_verdict",
+                row.get("S4_verdict", ""),
+                S4_VALUES,
+                optional="S4_verdict" in optional_columns,
+            )
             leaked = _identity_leak(row.get("notes", ""))
             if leaked:
                 errors.append(f"{where} {leaked}")
         else:
             for column in ("E1", "E7"):
-                value = row.get(column, "")
-                if column == "E1" and value in NA_VALUES:
-                    errors.append(f"{where} E1 缺失：补充批次每份都要判 E1")
-                    continue
-                _check_value(errors, where, column, value, {"0", "1"})
+                _check_value(
+                    errors,
+                    where,
+                    column,
+                    row.get(column, ""),
+                    {"0", "1"},
+                    optional=column in optional_columns,
+                    required_missing=f"{where} {column} 缺失：补充批次每份都要判 {column}",
+                    required_na=f"{where} {column}=N/A：补充批次每份都要判 {column}，不能记不适用",
+                )
             leaked = _identity_leak(row.get("notes", ""))
             if leaked:
                 errors.append(f"{where} {leaked}")
@@ -210,19 +269,19 @@ def check_file(directory: Path, phase: str, *, strict: bool, allow_empty: bool) 
                 errors.append(f"{filename} blind_id={blind_id} 的评分者为 {sorted(raters)}，应为 rater_a + rater_b")
         if phase in ("formal", "calibration"):
             if "P3_na_rows" in expected:
-                na_rows = sum(1 for row in rows if row.get("P3", "") in NA_VALUES)
+                na_rows = sum(1 for row in rows if row.get("P3", "") == NA_TOKEN)
                 if na_rows != expected["P3_na_rows"]:
                     errors.append(f"{filename} P3 记 N/A 的行数 {na_rows} 与冻结口径 {expected['P3_na_rows']} 不一致（S7 的 12 份 × 2 人）")
             if "S3_flag_scored_rows" in expected:
-                scored = sum(1 for row in rows if row.get("S3_flag", "") not in NA_VALUES)
+                scored = sum(1 for row in rows if row.get("S3_flag", "") not in (MISSING_TOKEN, NA_TOKEN))
                 if scored != expected["S3_flag_scored_rows"]:
                     errors.append(f"{filename} S3_flag 已判行数 {scored} 与冻结口径 {expected['S3_flag_scored_rows']} 不一致（24 份 × 2 人）")
             if "S4_verdict_scored_rows" in expected:
-                scored = sum(1 for row in rows if row.get("S4_verdict", "") not in NA_VALUES)
+                scored = sum(1 for row in rows if row.get("S4_verdict", "") not in (MISSING_TOKEN, NA_TOKEN))
                 if scored != expected["S4_verdict_scored_rows"]:
                     errors.append(f"{filename} S4_verdict 已判行数 {scored} 与冻结口径 {expected['S4_verdict_scored_rows']} 不一致（12 份 × 2 人）")
         if phase == "supplementary":
-            scored = sum(1 for row in rows if row.get("E7", "") not in NA_VALUES)
+            scored = sum(1 for row in rows if row.get("E7", "") not in (MISSING_TOKEN, NA_TOKEN))
             if scored != expected["E7_scored_rows"]:
                 errors.append(f"{filename} E7 已判行数 {scored} 与冻结口径 {expected['E7_scored_rows']} 不一致（15 份 × 2 人）")
 
