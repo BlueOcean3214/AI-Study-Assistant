@@ -1923,6 +1923,88 @@ def test_t44_dry_run_guard_blocks_late_writes():
     ok.unlink()
     print(f"  T44 PASS：dry-run 守卫拦下 {len(blocked)} 类写盘动作，退出后恢复正常")
 
+def test_t46_dry_run_guard_blocks_os_open():
+    """守卫必须覆盖 os.open 的写标志：只判 open(mode=...) 会漏掉这条直写入口。"""
+
+    sb = _make_sandbox("t46")
+    before = _full_tree_state(sb)
+    root = sb.pack_dir.parent
+    probe = root / "os-open-probe.txt"
+    blocked = []
+
+    write_flags = [
+        ("O_WRONLY|O_CREAT", os.O_WRONLY | os.O_CREAT),
+        ("O_RDWR|O_CREAT", os.O_RDWR | os.O_CREAT),
+        ("O_WRONLY|O_APPEND|O_CREAT", os.O_WRONLY | os.O_APPEND | os.O_CREAT),
+        ("O_WRONLY|O_TRUNC|O_CREAT", os.O_WRONLY | os.O_TRUNC | os.O_CREAT),
+        ("O_RDONLY|O_TRUNC", os.O_RDONLY | os.O_TRUNC),
+    ]
+
+    with pack.dry_run_guard():
+        for label, flags in write_flags:
+            try:
+                fd = os.open(probe, flags, 0o644)
+            except pack.DryRunWriteBlocked as exc:
+                assert "dry-run" in str(exc), str(exc)
+                blocked.append(f"os.open({label})")
+            else:
+                os.close(fd)
+                raise AssertionError(f"os.open({label}) 应被 dry-run 守卫拦下")
+
+        # Path.open / tempfile 最终也走 os.open：同一批底层入口必须一并被拦
+        try:
+            with probe.open("wb") as handle:
+                handle.write(b"x")
+        except pack.DryRunWriteBlocked as exc:
+            assert "dry-run" in str(exc), str(exc)
+            blocked.append("Path.open('wb')")
+        else:
+            raise AssertionError("Path.open('wb') 应被 dry-run 守卫拦下")
+
+        try:
+            tempfile.NamedTemporaryFile(dir=str(root))
+        except pack.DryRunWriteBlocked:
+            blocked.append("tempfile.NamedTemporaryFile")
+        else:
+            raise AssertionError("tempfile.NamedTemporaryFile 应被 dry-run 守卫拦下")
+
+        # 低层链接与截断入口：同样是写盘动作，不能被守卫漏掉
+        for label, func in [
+            ("os.link", lambda: os.link(str(sb.manifest), str(root / "os-link-probe.txt"))),
+            (
+                "os.symlink",
+                lambda: os.symlink(str(sb.manifest), str(root / "os-symlink-probe.txt")),
+            ),
+            ("os.truncate", lambda: os.truncate(str(sb.manifest), 0)),
+        ]:
+            try:
+                func()
+            except pack.DryRunWriteBlocked as exc:
+                assert "dry-run" in str(exc), str(exc)
+                blocked.append(label)
+            else:
+                raise AssertionError(f"{label} 应被 dry-run 守卫拦下")
+
+        # 只读路径必须放行，否则守卫会误伤正常的读取与哈希核对
+        with open(sb.manifest, "rb") as handle:
+            head = handle.read(16)
+        assert isinstance(head, bytes) and head, "只读 open 必须放行"
+        fd_ro = os.open(sb.manifest, os.O_RDONLY)
+        try:
+            assert os.read(fd_ro, 8), "只读 os.open 必须放行"
+        finally:
+            os.close(fd_ro)
+
+    assert len(blocked) == 10, blocked
+    assert _full_tree_state(sb) == before, "守卫拦截后磁盘必须完全不变（探针文件不得生成）"
+
+    # 退出守卫后 os.open 必须恢复，否则整进程被搞成永久只读
+    fd_ok = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    os.close(fd_ok)
+    assert probe.is_file(), "守卫退出后 os.open 必须恢复正常"
+    probe.unlink()
+    print(f"  T46 PASS：底层写入入口全部拦下（{len(blocked)} 类），只读放行，退出后恢复")
+
 
 def test_t45_repack_real_run_still_archives():
     """修复不能误伤真实 repack：不带 --dry-run 时归档照旧工作。"""
@@ -1985,6 +2067,7 @@ TESTS = [
     ("T43", test_t43_plain_dry_run_has_no_side_effects),
     ("T44", test_t44_dry_run_guard_blocks_late_writes),
     ("T45", test_t45_repack_real_run_still_archives),
+    ("T46", test_t46_dry_run_guard_blocks_os_open),
 ]
 
 

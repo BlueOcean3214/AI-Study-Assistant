@@ -1801,11 +1801,17 @@ class DryRunWriteBlocked(PackError):
 
 @contextlib.contextmanager
 def dry_run_guard():
-    """dry-run 的硬保护：任何写入、删除、移动、改名都在落盘那一刻被拦下。
+    """dry-run 的进程内守卫：本进程中经 CPython 落盘的写入、删除、移动、改名一律拦下。
 
     只靠「提前 return」不足以保证零副作用——只要将来有人在 `if args.dry_run:` 之前插入
-    一个 mkdir / shutil.rmtree / os.replace / open("w")，dry-run 就又会静默改磁盘。
-    这里把最底层的写入入口替换掉，越权即抛 DryRunWriteBlocked，让缺陷在测试里立刻暴露。
+    一个 mkdir / shutil.rmtree / os.replace / open("w") / os.open(O_CREAT)，dry-run 就又会
+    静默改磁盘。这里把 CPython 最底层的写入入口替换掉（含 os.open 的写标志），越权即抛
+    DryRunWriteBlocked，让缺陷在测试里立刻暴露。
+
+    边界（这是进程内守卫，不是操作系统级沙箱）：只覆盖本进程里经 os / pathlib / shutil /
+    builtins.open / io.open / tempfile 最终落到 os.open 的写盘动作；子进程（例如调用
+    `git`）自己写盘、绕过 CPython 的扩展模块直接写文件、以及进入本守卫之前就已打开的文件
+    句柄，都不在拦截范围内。
     """
 
     saved = {
@@ -1815,6 +1821,10 @@ def dry_run_guard():
         "os_rmdir": os.rmdir,
         "os_mkdir": os.mkdir,
         "os_rename": os.rename,
+        "os_open": os.open,
+        "os_link": os.link,
+        "os_symlink": os.symlink,
+        "os_truncate": os.truncate,
         "path_mkdir": Path.mkdir,
         "path_unlink": Path.unlink,
         "path_rmdir": Path.rmdir,
@@ -1845,6 +1855,18 @@ def dry_run_guard():
             )
         return saved["builtin_open"](file, mode, *args, **kwargs)
 
+    os_write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def _guard_os_open(path, flags, *args, **kwargs):
+        # os.open 是绕过 open(mode="w") 的直写入口：带写标志就会创建/截断/追加文件，
+        # 只判 mode 字符串的 _guard_open 拦不到它（临时文件、fdopen 等底层写法都走这里）。
+        if isinstance(flags, int) and flags & os_write_flags:
+            raise DryRunWriteBlocked(
+                f"dry-run 期间以写标志打开文件（os.open flags={flags!r}, path={path!r}）："
+                "dry-run 必须零副作用，本次已中止，未修改任何文件"
+            )
+        return saved["os_open"](path, flags, *args, **kwargs)
+
     os.replace = _blocked("os.replace")
     os.remove = _blocked("os.remove")
     os.unlink = _blocked("os.unlink")
@@ -1862,6 +1884,10 @@ def dry_run_guard():
     shutil.move = _blocked("shutil.move")
     builtins.open = _guard_open
     io.open = _guard_open
+    os.open = _guard_os_open
+    os.link = _blocked("os.link")
+    os.symlink = _blocked("os.symlink")
+    os.truncate = _blocked("os.truncate")
     try:
         yield
     finally:
@@ -1882,6 +1908,10 @@ def dry_run_guard():
         shutil.move = saved["shutil_move"]
         builtins.open = saved["builtin_open"]
         io.open = saved["io_open"]
+        os.open = saved["os_open"]
+        os.link = saved["os_link"]
+        os.symlink = saved["os_symlink"]
+        os.truncate = saved["os_truncate"]
 
 
 def run_pack(args) -> int:
