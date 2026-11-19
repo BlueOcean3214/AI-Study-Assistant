@@ -890,7 +890,37 @@ def _conclusion_payload(memory_type, value, subject_label, supports, contradicts
     }
 
 
-def _candidate_rows(memory_type, trigger, as_of, key, lower_bound, conn):
+def _window_rows(start, end, max_id, conn, cache=None, with_plan_difficulty=None):
+    """取窗口内反馈行，同一请求内复用同一份结果。
+
+    4 种记忆类型扫的是完全相同的 (时间窗, id 上界)：窗口边界在 Python 侧逐行判定，
+    SQL 只做粗筛，所以复用同一份行不会改变任何判定。行是只读字典（生产代码里没有
+    就地修改），多个调用方共享同一个列表是安全的。cache 为 None 时保持原样每次查询。
+    """
+
+    if cache is None:
+        if with_plan_difficulty is None:
+            return database.list_feedbacks_between(start, end, max_id=max_id, conn=conn)
+        return database.list_feedbacks_with_plan(
+            start, end, max_id, difficulties=[with_plan_difficulty], conn=conn
+        )
+
+    key = (start, end, max_id, with_plan_difficulty)
+
+    if key not in cache:
+        if with_plan_difficulty is None:
+            cache[key] = database.list_feedbacks_between(
+                start, end, max_id=max_id, conn=conn
+            )
+        else:
+            cache[key] = database.list_feedbacks_with_plan(
+                start, end, max_id, difficulties=[with_plan_difficulty], conn=conn
+            )
+
+    return cache[key]
+
+
+def _candidate_rows(memory_type, trigger, as_of, key, lower_bound, conn, cache=None):
     """取本轮候选：窗口内、id ≤ 触发反馈、id > 轮次下界（§5.2 候选规则）。
 
     返回 (rows, plan_difficulties)。SQL 只做粗筛（时间窗向两侧各放宽 1 天、
@@ -901,12 +931,10 @@ def _candidate_rows(memory_type, trigger, as_of, key, lower_bound, conn):
     end = (_parse_ts(as_of) + timedelta(days=1)).isoformat()
 
     if memory_type == "time_pattern":
-        rows = database.list_feedbacks_with_plan(
-            start, end, trigger["id"], difficulties=[key], conn=conn
-        )
+        rows = _window_rows(start, end, trigger["id"], conn, cache, with_plan_difficulty=key)
         plan_difficulties = {row["id"]: row.get("difficulty") for row in rows}
     else:
-        rows = database.list_feedbacks_between(start, end, max_id=trigger["id"], conn=conn)
+        rows = _window_rows(start, end, trigger["id"], conn, cache)
         plan_difficulties = None
 
     selected = []
@@ -1168,15 +1196,20 @@ def _commit_conclusion(memory, conn, info, status=None, extra_fields=None):
     return database.get_memory(memory["id"], conn=conn)
 
 
-def _plan_difficulties_for(rows, conn, subject_key=None):
+def _plan_difficulties_for(rows, conn, subject_key=None, cache=None):
     """给带 plan_id 的反馈补齐 plans.difficulty（time_pattern 的关系判定要用）。
 
     subject_key 非 None 时按 §5.2 做完整有效性校验（plan 存在、难度合法且等于
     subject_key、estimated_minutes > 0），无效行不进返回字典——调用方的
     evaluate 会把它们计成 invalid_plan，既不参与统计也不写正式证据。
+
+    cache 传请求级缓存时与 _plan_difficulty_for_row() 共用同一份 plan 行：
+    两边都按 plan_id 存「plan 字典或 None」，不能存 difficulty，否则另一方会
+    把字符串当成 plan 字典用。plans 在一次 apply_feedback 内不会被改动，
+    所以复用一个请求内的读结果不改变任何判定。
     """
 
-    cache = {}
+    plan_cache = {} if cache is None else cache
     result = {}
 
     for row in rows:
@@ -1190,21 +1223,21 @@ def _plan_difficulties_for(rows, conn, subject_key=None):
             continue
 
         if subject_key is not None:
-            difficulty = _plan_difficulty_for_row(row, subject_key, conn, cache)
+            difficulty = _plan_difficulty_for_row(row, subject_key, conn, plan_cache)
             if difficulty is not None:
                 result[row["id"]] = difficulty
             continue
 
-        if plan_id not in cache:
-            plan = database.get_plan_by_id(plan_id, conn=conn)
-            cache[plan_id] = None if plan is None else plan.get("difficulty")
+        if plan_id not in plan_cache:
+            plan_cache[plan_id] = database.get_plan_by_id(plan_id, conn=conn)
 
-        result[row["id"]] = cache[plan_id]
+        plan = plan_cache[plan_id]
+        result[row["id"]] = None if plan is None else plan.get("difficulty")
 
     return result
 
 
-def _episode_candidates(memory, as_of, end_feedback_id, conn, info=None):
+def _episode_candidates(memory, as_of, end_feedback_id, conn, info=None, cache=None):
     """从原始反馈重算当前轮的有效候选（含 neutral），供更新后的结论重算。
 
     v16 §5.2：窗口 [as_of-30d, as_of]、id <= end_feedback_id、id > 上一轮高水位。
@@ -1234,7 +1267,7 @@ def _episode_candidates(memory, as_of, end_feedback_id, conn, info=None):
     if end_feedback_id is None:
         end_feedback_id = database.max_feedback_id(conn=conn)
 
-    rows = database.list_feedbacks_between(start, end, max_id=end_feedback_id, conn=conn)
+    rows = _window_rows(start, end, end_feedback_id, conn, cache)
     selected = []
 
     for row in rows:
@@ -1244,7 +1277,7 @@ def _episode_candidates(memory, as_of, end_feedback_id, conn, info=None):
             continue
 
         if memory_type == "time_pattern":
-            if _plan_difficulty_for_row(row, memory["subject_key"], conn) is None:
+            if _plan_difficulty_for_row(row, memory["subject_key"], conn, cache) is None:
                 # plan 被删/难度非法或不匹配/预估 <= 0：这条不是本轮有效样本，
                 # 诊断计数要如实记下，不能静默丢掉（PR #4 第三轮 P2-1）。
                 if info is not None:
@@ -1260,7 +1293,7 @@ def _episode_candidates(memory, as_of, end_feedback_id, conn, info=None):
     return selected
 
 
-def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id=None, info=None):
+def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id=None, info=None, cache=None):
     """用当前轮的原始候选重算 value（计数/比率全部重算，禁止 +1）。
 
     v16 §5.2/§5.5：time_pattern 的 samples 是有效样本总数，neutral 也算，但
@@ -1274,11 +1307,13 @@ def _episode_value(memory, as_of, conn, direction, episode=None, end_feedback_id
     probe = dict(memory)
     probe["episode"] = episode
 
-    rows = _episode_candidates(probe, as_of, end_feedback_id, conn, info)
+    rows = _episode_candidates(probe, as_of, end_feedback_id, conn, info, cache)
     plan_difficulties = None
 
     if memory_type == "time_pattern":
-        plan_difficulties = _plan_difficulties_for(rows, conn, memory["subject_key"])
+        plan_difficulties = _plan_difficulties_for(
+            rows, conn, memory["subject_key"], cache
+        )
 
     conclusion = evaluate(memory_type, rows, as_of, plan_difficulties)
     value = dict(conclusion["value"])
@@ -1438,11 +1473,15 @@ def _materialize_all_stale(as_of, conn, info, threshold_days=None):
     return archived
 
 
-def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_label, conn, info):
+def _apply_current_episode(
+    memory, trigger, as_of, memory_type, key, subject_label, conn, info, cache=None
+):
     """当前轮路径：没有记忆时建行，已有 active/weakened 记忆时追加本轮证据。"""
 
     if memory is None:
-        rows, plan_difficulties = _candidate_rows(memory_type, trigger, as_of, key, None, conn)
+        rows, plan_difficulties = _candidate_rows(
+            memory_type, trigger, as_of, key, None, conn, cache
+        )
         conclusion = evaluate(memory_type, rows, as_of, plan_difficulties)
 
         if conclusion["invalid"]:
@@ -1508,7 +1547,7 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
             # 并发下别人刚建过：读回来走已有记忆路径
             existing = database.get_memory_by_key(memory_type, key, conn=conn)
             return _apply_current_episode(
-                existing, trigger, as_of, memory_type, key, subject_label, conn, info
+                existing, trigger, as_of, memory_type, key, subject_label, conn, info, cache
             )
 
         memory = database.get_memory(result["row_id"], conn=conn)
@@ -1533,7 +1572,9 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
     if lower_bound is None:
         lower_bound = database.max_evidence_feedback_id(memory["id"], conn=conn)
 
-    rows, plan_difficulties = _candidate_rows(memory_type, trigger, as_of, key, lower_bound, conn)
+    rows, plan_difficulties = _candidate_rows(
+        memory_type, trigger, as_of, key, lower_bound, conn, cache
+    )
     stored = decode_value(memory["value_json"])
     direction = stored.get("direction")
     relations = {}
@@ -1573,21 +1614,33 @@ def _apply_current_episode(memory, trigger, as_of, memory_type, key, subject_lab
             # 必须重算结论，否则 samples 会永远停在旧值（PR #4 P1-3）；结论变了但
             # 状态没变，按 §5.3.7 不写事件。
             value = _episode_value(
-                memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+                memory,
+                as_of,
+                conn,
+                direction,
+                end_feedback_id=trigger["id"],
+                info=info,
+                cache=cache,
             )
             _prepare_conclusion(memory, as_of, conn, info, value)
             _commit_conclusion(memory, conn, info)
         return None
 
     value = _episode_value(
-        memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+        memory,
+        as_of,
+        conn,
+        direction,
+        end_feedback_id=trigger["id"],
+        info=info,
+        cache=cache,
     )
     _finalize(memory, as_of, conn, info, value, evidence_ids, wrote_supports, wrote_contradicts)
 
     return memory["id"]
 
 
-def _drain_pending(memory, trigger, as_of, conn, info):
+def _drain_pending(memory, trigger, as_of, conn, info, cache=None):
     """active/weakened 下消费遗留 pending（§5.3.3.1）。
 
     用当前轮已固定的 direction 判 relation，不重算方向、不重评门槛。
@@ -1606,7 +1659,9 @@ def _drain_pending(memory, trigger, as_of, conn, info):
     plan_difficulties = {}
 
     if memory["memory_type"] == "time_pattern":
-        plan_difficulties = _plan_difficulties_for(valid, conn, memory["subject_key"])
+        plan_difficulties = _plan_difficulties_for(
+            valid, conn, memory["subject_key"], cache
+        )
 
     evidence_ids = []
     consumed_ids = []
@@ -1661,14 +1716,26 @@ def _drain_pending(memory, trigger, as_of, conn, info):
             # samples/median 的一部分（§5.2/§5.5），样本口径变了就要重算结论，
             # 只是不写事件（§5.3.7：本批没写证据就不写 pending_drained）。
             value = _episode_value(
-                memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+                memory,
+                as_of,
+                conn,
+                direction,
+                end_feedback_id=trigger["id"],
+                info=info,
+                cache=cache,
             )
             _prepare_conclusion(memory, as_of, conn, info, value)
             _commit_conclusion(memory, conn, info)
         return 0
 
     value = _episode_value(
-        memory, as_of, conn, direction, end_feedback_id=trigger["id"], info=info
+        memory,
+        as_of,
+        conn,
+        direction,
+        end_feedback_id=trigger["id"],
+        info=info,
+        cache=cache,
     )
     _finalize(
         memory,
@@ -1689,7 +1756,7 @@ def _drain_pending(memory, trigger, as_of, conn, info):
     return len(evidence_ids)
 
 
-def _try_promote(memory, trigger, as_of, conn, info):
+def _try_promote(memory, trigger, as_of, conn, info, cache=None):
     """单事务内的原子晋升（§5.3.3 八步）：pending → 新轮正式证据。"""
 
     if memory is None or memory["status"] not in ("resolved", "archived"):
@@ -1713,7 +1780,10 @@ def _try_promote(memory, trigger, as_of, conn, info):
         return False
 
     plan_difficulties = _plan_difficulties_for(
-        rows, conn, memory["subject_key"] if memory["memory_type"] == "time_pattern" else None
+        rows,
+        conn,
+        memory["subject_key"] if memory["memory_type"] == "time_pattern" else None,
+        cache,
     )
     conclusion = evaluate(memory["memory_type"], rows, as_of, plan_difficulties)
 
@@ -1763,7 +1833,13 @@ def _try_promote(memory, trigger, as_of, conn, info):
     probe["episode"] = episode
     probe["episode_start_feedback_id"] = episode_start_feedback_id
     value = _episode_value(
-        probe, as_of, conn, value["direction"], episode=episode, end_feedback_id=trigger["id"]
+        probe,
+        as_of,
+        conn,
+        value["direction"],
+        episode=episode,
+        end_feedback_id=trigger["id"],
+        cache=cache,
     )
 
     payload = _conclusion_payload(
@@ -1809,7 +1885,7 @@ def _try_promote(memory, trigger, as_of, conn, info):
     _write_event(memory["id"], event_type, detail, as_of, conn, info)
 
     refreshed = database.get_memory(memory["id"], conn=conn)
-    _drain_pending(refreshed, trigger, as_of, conn, info)
+    _drain_pending(refreshed, trigger, as_of, conn, info, cache)
 
     return True
 
@@ -1822,6 +1898,8 @@ def apply_feedback(trigger, as_of=None, conn=None):
 
     as_of = as_of or trigger["created_at"]
     info = _new_info()
+    # 一次调用内 4 种记忆类型扫的是同一个反馈窗口：共用一份行，避免 6 次同 SQL 全表扫。
+    cache = {}
 
     for memory_type in MEMORY_TYPES:
         key, subject_label = subject_key_for(memory_type, trigger, conn=conn)
@@ -1832,20 +1910,21 @@ def apply_feedback(trigger, as_of=None, conn=None):
         memory = database.get_memory_by_key(memory_type, key, conn=conn)
 
         if memory is not None:
-            _drain_pending(memory, trigger, as_of, conn, info)
+            _drain_pending(memory, trigger, as_of, conn, info, cache)
             memory = database.get_memory_by_key(memory_type, key, conn=conn)
-            _materialize_stale(memory, as_of, conn, info)
-            memory = database.get_memory_by_key(memory_type, key, conn=conn)
+            # 第三次读只为拿归档后的新状态：只有真的归档了才需要。
+            if _materialize_stale(memory, as_of, conn, info):
+                memory = database.get_memory_by_key(memory_type, key, conn=conn)
 
         if memory is not None and memory["status"] in ("resolved", "archived"):
             if database.get_evidence(memory["id"], trigger["id"], conn=conn):
                 info["already_evidenced"] += 1
                 continue
             if _append_pending(memory, trigger, as_of, conn, info):
-                _try_promote(memory, trigger, as_of, conn, info)
+                _try_promote(memory, trigger, as_of, conn, info, cache)
         else:
             _apply_current_episode(
-                memory, trigger, as_of, memory_type, key, subject_label, conn, info
+                memory, trigger, as_of, memory_type, key, subject_label, conn, info, cache
             )
 
     return {"ok": True, "info": info}
@@ -1885,15 +1964,22 @@ def update_from_feedback(feedback_id):
     created_memories = []
     updated_memories = []
 
-    for memory_id in created_ids:
-        descriptor = _memory_descriptor(database.get_memory(memory_id))
-        if descriptor:
-            created_memories.append(descriptor)
+    # 两条循环只是取业务键/展示名：复用同一个连接，不要每条记忆另开一次。
+    if created_ids or updated_ids:
+        with database._db() as read_conn:
+            for memory_id in created_ids:
+                descriptor = _memory_descriptor(
+                    database.get_memory(memory_id, conn=read_conn)
+                )
+                if descriptor:
+                    created_memories.append(descriptor)
 
-    for memory_id in updated_ids:
-        descriptor = _memory_descriptor(database.get_memory(memory_id))
-        if descriptor:
-            updated_memories.append(descriptor)
+            for memory_id in updated_ids:
+                descriptor = _memory_descriptor(
+                    database.get_memory(memory_id, conn=read_conn)
+                )
+                if descriptor:
+                    updated_memories.append(descriptor)
 
     return {
         "ok": True,
