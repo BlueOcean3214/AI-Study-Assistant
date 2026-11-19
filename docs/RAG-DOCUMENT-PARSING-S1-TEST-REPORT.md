@@ -1,7 +1,7 @@
 # S1 文档解析与来源定位 · 测试报告
 
 > 生成时间：2026-11-18｜分支：`rag/document-parsing-s1`（基线 `c0c425b`，即当时 `origin/main`）
-> 本版为 v1.3（第二轮独立审查修复后重跑）。上一版 v1.2 记录 119 项断言；本版 `test_document_parser.py` 扩到 145 项。
+> 本版为 v1.3（第二轮独立审查修复后重跑）。上一版 v1.2 记录 119 项断言；本版 `test_document_parser.py` 扩到 145 项。2026-11-19 第三轮审查后仅修正 `document_id` 语义表述，代码与测试未改，各项数字不变。
 > 报告原则：只写实际跑过的结果。**跳过的、没验证的、基线本来失败的，都按原样标出，不计入通过。**
 
 ---
@@ -124,7 +124,7 @@
 | # | 要求 | 实现位置 |
 |---|---|---|
 | 1 | 统一 15 字段 chunk 数据契约 | `document_chunker.CHUNK_FIELDS` / `Chunk.to_record()` |
-| 2 | 文件级 `document_hash` + 版本化 `document_id`（路径摘要 16 位） | `document_parser.document_id_for` / `ParsedDocument` |
+| 2 | 文件级 `document_hash` + `document_id`（安全文件名 + 16 位路径摘要 + 内容哈希前 8 位；不含解析器/切片器版本，版本只进入 `chunk_id` 的 `h`） | `document_parser.document_id_for` / `ParsedDocument` |
 | 3 | 可复现、非下标式的 `chunk_id` | `document_chunker.make_chunk_id`（含 `occurrence`） |
 | 4 | PDF 物理页码 + 印刷页码分离 | `_parse_pdf` / `_printed_page_number` |
 | 5 | PDF 跨页 chunk 记录完整来源范围 | `_span_of` + `source_spans` |
@@ -141,7 +141,8 @@
 ### 4.2 已测试通过（有断言支撑，见 §2）
 
 - `chunk_id` 复现性、内容/配置/版本变化导致的 id 换代（含 `s1.1`→`s1.2` 换代）。
-- `document_id` 含 16 位路径摘要：不同目录同名同内容不碰撞，同一路径不同写法归一，`#` 分隔符安全编码。
+- `document_id` 含 16 位路径摘要：不同目录同名同内容得到不同 ID（16 位即 64 bit 截断哈希，碰撞概率极低，但不是数学保证），同一路径不同写法归一，`#` 分隔符安全编码。
+- 版本常量只影响 `chunk_id`：`PARSER_VERSION` / `CHUNKER_VERSION` 进入 `h` 的哈希输入，本身不进入 `document_id`。`s1.1`→`s1.2` 时 `document_id` 确实变了，但原因是对路径摘要从 8 位加长到 16 位，不是版本号参与计算。
 - PDF 单页多段真实字符偏移、跨页各页独立 span、DOCX 块内偏移口径与表格块 span 对齐。
 - 混合型 PDF 的 `partial` 状态与 `missing_pages`/`warnings` 记录（扫描层、`inspect_document`、`/upload`、检索 `document_status` 四处一致）。
 - 加密 PDF 三态：普通 / 空口令可解析 / 打开密码报 `password_required`。

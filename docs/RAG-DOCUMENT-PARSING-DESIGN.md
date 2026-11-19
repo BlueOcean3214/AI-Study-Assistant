@@ -1,6 +1,6 @@
 # S1 文档解析与来源定位设计说明
 
-> 版本：v1.3（2026-11-18，第二轮独立审查修复后修订：解析器/切片器升到 `s1.2`、`document_id` 路径摘要 8→16 位、加密 PDF 判断顺序与 `password_required`、`/upload` 透出文档级状态、富元数据检索透出 `document_status`）｜分支：`rag/document-parsing-s1`（基线 `origin/main` = `c0c425b`）
+> 版本：v1.3（2026-11-18，第二轮独立审查修复后修订：解析器/切片器升到 `s1.2`、`document_id` 路径摘要 8→16 位、加密 PDF 判断顺序与 `password_required`、`/upload` 透出文档级状态、富元数据检索透出 `document_status`；2026-11-19 第三轮审查后仅修正 `document_id` 语义表述——不含版本号、截断摘要不声称数学唯一，算法与常量未改）｜分支：`rag/document-parsing-s1`（基线 `origin/main` = `c0c425b`）
 > 范围：TXT / 可提取文本的 PDF / DOCX 的解析、切片、chunk_id 与来源定位。不含 OCR、不含 Rerank、不改长期记忆逻辑。
 > 本文档先落数据契约，再描述实现；所有描述均对应当前分支已提交的代码，未实现的内容集中在 §11「后续工作」，不写成本阶段已具备。
 
@@ -33,7 +33,7 @@
 
 | # | 字段 | 类型 | 含义 | 生成规则 |
 |---|---|---|---|---|
-| 1 | `document_id` | str | 文档稳定标识（含路径命名空间与版本） | `f"{安全文件名}-{路径摘要}-{document_hash[:8]}"`（`document_parser.document_id_for`）；路径摘要 = `sha256(规范化相对路径)[:16]`（`PATH_DIGEST_CHARS = 16`，s1.2 起由 8 位放宽到 16 位）；内容或相对路径任一变化即变 |
+| 1 | `document_id` | str | 文档稳定标识（安全文件名 + 16 位路径摘要 + 内容哈希前缀；**不含解析器/切片器版本**） | `f"{安全文件名}-{路径摘要}-{document_hash[:8]}"`（`document_parser.document_id_for`）；路径摘要 = `sha256(规范化相对路径)[:16]`（`PATH_DIGEST_CHARS = 16`，s1.2 起由 8 位放宽到 16 位）；内容或相对路径任一变化即变。`PARSER_VERSION` / `CHUNKER_VERSION` 不参与 `document_id`，只进入 `chunk_id` 的哈希输入（见 §3、§7） |
 | 2 | `document_hash` | str | 源文件字节 SHA-256（64 位小写十六进制） | `hashlib.sha256(raw_bytes).hexdigest()`，按原始字节算，与编码无关 |
 | 3 | `source_name` | str | 知识库内相对路径（正斜杠） | 如 `probability/条件概率.pdf` |
 | 4 | `file_type` | str | `txt` / `pdf` / `docx` | 由后缀小写决定 |
@@ -51,7 +51,8 @@
 
 补充约束：
 
-- **`document_id` 必须带路径命名空间**：只靠「文件名 + 内容哈希」会让两个不同目录下的同名同内容文件碰撞成同一 ID，进而让 `chunk_id` 也碰撞、让 `rag_service` 的按 `chunk_id` 去重把两个来源合并掉。因此 ID 里必须有规范化相对路径（`normalize_source_name`：反斜杠→`/`、`posixpath.normpath`、首尾空白与 `./` 归一）。同一相对路径 + 同一内容 + 同一版本 → ID 稳定；不同相对路径 → ID 必不同。
+- **`document_id` 带路径命名空间，但不含版本**：只靠「文件名 + 内容哈希」会让两个不同目录下的同名同内容文件落到同一 ID，进而让 `chunk_id` 也相同、让 `rag_service` 的按 `chunk_id` 去重把两个来源合并掉。因此 ID 里必须有规范化相对路径（`normalize_source_name`：反斜杠→`/`、`posixpath.normpath`、首尾空白与 `./` 归一）。同一相对路径 + 同一内容 → ID 稳定，与 `PARSER_VERSION` / `CHUNKER_VERSION` 无关；解析或切片规则升级只改 `chunk_id` 的 `h`，不会改 `document_id`。
+- **截断摘要提供的是极低碰撞概率，不是数学唯一**：路径摘要是 16 位十六进制（64 bit）截断哈希，`chunk_id` 里的 `h` 是 10 位十六进制（40 bit）截断哈希。不同相对路径得到同一摘要是极小概率事件（约 2⁻⁶⁴ 量级），不能声称「绝不碰撞」；同一文档内 `chunk_id` 首先由 `locator` 区分，只有 `locator` 相同（重复内容）的片才依赖 `h` 与 `occurrence`，此处的截断碰撞概率约 2⁻⁴⁰，实际可忽略但不为零。跨文档溯源应以 `source_name` 为准，`document_id` 是稳定标识而非防伪凭据。
 - **ID 分隔符安全编码**：`chunk_id = document_id#locator#h` 用 `#` 做分隔符，而文件名允许 `#`/`%`。`document_chunker._encode_id_component()` 对 `document_id` 与 `locator` 先 `%`→`%25`、`#`→`%23`，保证 `chunk_id.split("#")` 恒为 3 段、前缀恒等于未编码的 `document_id`。
 - **印刷页码不写进 `page_number`**：两者含义不同（PDF 物理页序 vs 书页上印的号），混用会破坏跨版本对照。
 - `source_spans` 在实现中**每片至少一条**（片由块组成，块必有定位），因此不存在「空 span 的降级路径」，也不需要额外的降级标记字段。
@@ -71,6 +72,8 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 ```
 
 示例：`条件概率-3f2a91bc4d5e6f70-9d1e00aa#p12#7c1d90e3a4`（`条件概率`=安全文件名，`3f2a91bc4d5e6f70`=16 位路径摘要，`9d1e00aa`=`document_hash[:8]`）
+
+`h` 是 10 位十六进制（40 bit）截断摘要，`document_id` 里的路径摘要是 16 位（64 bit）；两者用于区分而不是用于防伪，只能表述为「碰撞概率极低」，不能表述为数学上绝对唯一。版本号（`PARSER_VERSION` / `CHUNKER_VERSION`）只出现在 `h` 的哈希输入里，不出现在 `document_id` 中。
 
 性质与理由：
 
@@ -198,7 +201,7 @@ chunk_id   = f"{document_id}#{locator}#{h}"
 ## 7. 版本与可复现
 
 - `PARSER_VERSION = "s1.2"`（`document_parser`）、`CHUNKER_VERSION = "s1.2"`（`document_chunker`），均作为模块常量导出并写入每条记录。
-- 两者任一升级 → 所有 chunk_id 换代；升级必须重跑评测并记录新 manifest。
+- 两者任一升级 → 所有 `chunk_id` 换代（`document_id` 不变：它只由规范化相对路径与文件内容决定）；升级必须重跑评测并记录新 manifest。
 - 版本历史：
   - `s1.1`：第一轮审查后（`document_id` 加路径命名空间、`chunk_id` 分隔符编码、PDF 真实字符偏移、混合型 PDF `partial`）。
   - `s1.2`：第二轮审查后（`document_id` 路径摘要 8→16 位、加密 PDF 先判 `is_encrypted` 再按 `decrypt("")` 返回值定成败并新增 `password_required`）。**路径摘要变长会改 `document_id`，`parser_version` 与 `chunker_version` 又都进入 `chunk_id` 的哈希输入，因此同一文件在 s1.2 下 chunk_id 整批换代**——这是刻意的，用于区分旧索引。
