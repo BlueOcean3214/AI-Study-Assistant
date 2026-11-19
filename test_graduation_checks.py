@@ -986,6 +986,56 @@ def test_auto_prompt_archive_roundtrip():
         parsed = ca.parse_prompt_archive(_archive("系统", raw))[1]
         check(f"T17 原文 {count} 个尾随换行不多剥不少剥", parsed == raw, repr(parsed))
 
+    # SYSTEM 原文末尾带换行：归档层在 SYSTEM 后面追加的 "\n\n" 会让换行连成一串，
+    # 解析必须仍然原样保留 SYSTEM 的尾随换行（早先认为这里会切分歧义，用测试核实）。
+    for count in (1, 2, 3):
+        system_with_newline = "你是学习方法助手，回答要具体。" + "\n" * count
+        user_text = "请解释条件概率的意思。"
+        parsed_system, parsed_user = ca.parse_prompt_archive(_archive(system_with_newline, user_text))
+        check(f"T17 SYSTEM 末尾 {count} 个换行 → SYSTEM 逐字符还原",
+              parsed_system == system_with_newline, repr(parsed_system))
+        check(f"T17 SYSTEM 末尾 {count} 个换行 → USER 逐字符还原",
+              parsed_user == user_text, repr(parsed_user))
+        check(f"T17 SYSTEM 末尾 {count} 个换行 → 哈希可重算一致",
+              bp.prompt_sha256(parsed_system, parsed_user)
+              == bp.prompt_sha256(system_with_newline, user_text), "")
+
+    # SYSTEM 与 USER 同时以换行结尾：两端都不许多剥、也不许少剥。
+    both_ends = "系统说明。\n\n"
+    both_user = "用户正文。\n\n\n"
+    parsed_system, parsed_user = ca.parse_prompt_archive(_archive(both_ends, both_user))
+    check("T17 SYSTEM 与 USER 同时带尾随换行 → 两端逐字符还原",
+          (parsed_system, parsed_user) == (both_ends, both_user),
+          repr((parsed_system, parsed_user)))
+
+    # SYSTEM 末尾带换行的真实 writer 归档（不是手拼的格式）：走写盘 → 读回 → 解析。
+    nl_root = TMP_ROOT / "archive-roundtrip-system-newline"
+    nl_system = "你是学习方法助手。\n\n"
+    nl_user = "帮我把这周的计划排一下。"
+    bp.write_sample_output(
+        nl_root,
+        {
+            "sample_id": "S1",
+            "groups": ["A"],
+            "db_path": str(TMP_ROOT / "archive-roundtrip-system-newline.db"),
+            "plan_date": "2026-11-12T21:00:00",
+            "inputs": {},
+            "contents": {},
+            "prompts": {"A": {"system": nl_system, "user": nl_user}},
+            "checks": [],
+        },
+    )
+    nl_archive = (nl_root / "A.txt").read_text(encoding="utf-8")
+    nl_parsed_system, nl_parsed_user = ca.parse_prompt_archive(nl_archive)
+    check("T17 真实 writer + SYSTEM 末尾换行：SYSTEM 逐字符还原",
+          nl_parsed_system == nl_system, repr(nl_parsed_system))
+    check("T17 真实 writer + SYSTEM 末尾换行：USER 逐字符还原",
+          nl_parsed_user == nl_user, repr(nl_parsed_user))
+    nl_row = {"prompt_sha256": bp.prompt_sha256(nl_system, nl_user)}
+    nl_verified, nl_error = ca.verify_prompt_hash(nl_archive, nl_row)
+    check("T17 真实 writer + SYSTEM 末尾换行：verify_prompt_hash 通过",
+          nl_error is None and nl_verified == nl_row["prompt_sha256"], (nl_verified, nl_error))
+
     # 归档格式缺少结束换行：按格式异常 fail-closed，不得静默接受。
     no_trailer = ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP + "用户请求"
     try:
