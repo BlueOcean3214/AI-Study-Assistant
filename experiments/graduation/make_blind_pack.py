@@ -38,6 +38,8 @@ results.jsonl、feedback.db、seed、Gold、Prompt 与设计文档。
 from __future__ import annotations
 
 import argparse
+import builtins
+import contextlib
 import csv
 import hashlib
 import io
@@ -1793,7 +1795,143 @@ def _resolve_workdir(raw: Path, label: str) -> Path:
     return raw.resolve()
 
 
+class DryRunWriteBlocked(PackError):
+    """dry-run 期间出现了写入/删除/移动动作（内部错误，必须显式失败而不是静默生效）。"""
+
+
+@contextlib.contextmanager
+def dry_run_guard():
+    """dry-run 的进程内守卫：本进程中经 CPython 落盘的写入、删除、移动、改名一律拦下。
+
+    只靠「提前 return」不足以保证零副作用——只要将来有人在 `if args.dry_run:` 之前插入
+    一个 mkdir / shutil.rmtree / os.replace / open("w") / os.open(O_CREAT)，dry-run 就又会
+    静默改磁盘。这里把 CPython 最底层的写入入口替换掉（含 os.open 的写标志），越权即抛
+    DryRunWriteBlocked，让缺陷在测试里立刻暴露。
+
+    边界（这是进程内守卫，不是操作系统级沙箱）：只覆盖本进程里经 os / pathlib / shutil /
+    builtins.open / io.open / tempfile 最终落到 os.open 的写盘动作；子进程（例如调用
+    `git`）自己写盘、绕过 CPython 的扩展模块直接写文件、以及进入本守卫之前就已打开的文件
+    句柄，都不在拦截范围内。
+    """
+
+    saved = {
+        "os_replace": os.replace,
+        "os_remove": os.remove,
+        "os_unlink": os.unlink,
+        "os_rmdir": os.rmdir,
+        "os_mkdir": os.mkdir,
+        "os_rename": os.rename,
+        "os_open": os.open,
+        "os_link": os.link,
+        "os_symlink": os.symlink,
+        "os_truncate": os.truncate,
+        "path_mkdir": Path.mkdir,
+        "path_unlink": Path.unlink,
+        "path_rmdir": Path.rmdir,
+        "path_write_text": Path.write_text,
+        "path_write_bytes": Path.write_bytes,
+        "path_touch": Path.touch,
+        "shutil_rmtree": shutil.rmtree,
+        "shutil_copy2": shutil.copy2,
+        "shutil_move": shutil.move,
+        "builtin_open": builtins.open,
+        "io_open": io.open,
+    }
+
+    def _blocked(what):
+        def _raise(*_args, **_kwargs):
+            raise DryRunWriteBlocked(
+                f"dry-run 期间发生写盘动作（{what}）：dry-run 必须零副作用，"
+                "本次已中止，未修改任何文件"
+            )
+
+        return _raise
+
+    def _guard_open(file, mode="r", *args, **kwargs):
+        if isinstance(mode, str) and any(flag in mode for flag in "wax+"):
+            raise DryRunWriteBlocked(
+                f"dry-run 期间以写模式打开文件（open mode={mode!r}, path={file!r}）："
+                "dry-run 必须零副作用，本次已中止，未修改任何文件"
+            )
+        return saved["builtin_open"](file, mode, *args, **kwargs)
+
+    os_write_flags = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+
+    def _guard_os_open(path, flags, *args, **kwargs):
+        # os.open 是绕过 open(mode="w") 的直写入口：带写标志就会创建/截断/追加文件，
+        # 只判 mode 字符串的 _guard_open 拦不到它（临时文件、fdopen 等底层写法都走这里）。
+        if isinstance(flags, int) and flags & os_write_flags:
+            raise DryRunWriteBlocked(
+                f"dry-run 期间以写标志打开文件（os.open flags={flags!r}, path={path!r}）："
+                "dry-run 必须零副作用，本次已中止，未修改任何文件"
+            )
+        return saved["os_open"](path, flags, *args, **kwargs)
+
+    os.replace = _blocked("os.replace")
+    os.remove = _blocked("os.remove")
+    os.unlink = _blocked("os.unlink")
+    os.rmdir = _blocked("os.rmdir")
+    os.mkdir = _blocked("os.mkdir")
+    os.rename = _blocked("os.rename")
+    Path.mkdir = _blocked("Path.mkdir")
+    Path.unlink = _blocked("Path.unlink")
+    Path.rmdir = _blocked("Path.rmdir")
+    Path.write_text = _blocked("Path.write_text")
+    Path.write_bytes = _blocked("Path.write_bytes")
+    Path.touch = _blocked("Path.touch")
+    shutil.rmtree = _blocked("shutil.rmtree")
+    shutil.copy2 = _blocked("shutil.copy2")
+    shutil.move = _blocked("shutil.move")
+    builtins.open = _guard_open
+    io.open = _guard_open
+    os.open = _guard_os_open
+    os.link = _blocked("os.link")
+    os.symlink = _blocked("os.symlink")
+    os.truncate = _blocked("os.truncate")
+    try:
+        yield
+    finally:
+        os.replace = saved["os_replace"]
+        os.remove = saved["os_remove"]
+        os.unlink = saved["os_unlink"]
+        os.rmdir = saved["os_rmdir"]
+        os.mkdir = saved["os_mkdir"]
+        os.rename = saved["os_rename"]
+        Path.mkdir = saved["path_mkdir"]
+        Path.unlink = saved["path_unlink"]
+        Path.rmdir = saved["path_rmdir"]
+        Path.write_text = saved["path_write_text"]
+        Path.write_bytes = saved["path_write_bytes"]
+        Path.touch = saved["path_touch"]
+        shutil.rmtree = saved["shutil_rmtree"]
+        shutil.copy2 = saved["shutil_copy2"]
+        shutil.move = saved["shutil_move"]
+        builtins.open = saved["builtin_open"]
+        io.open = saved["io_open"]
+        os.open = saved["os_open"]
+        os.link = saved["os_link"]
+        os.symlink = saved["os_symlink"]
+        os.truncate = saved["os_truncate"]
+
+
 def run_pack(args) -> int:
+    # 冲突组合必须在任何数据读取、目录创建、归档、删除之前就拒绝。
+    # 历史缺陷：归档调用（archive_previous_outputs）排在 `if args.dry_run:` 之前，
+    # 而归档的最后一步是 shutil.rmtree(活动包目录)，于是 `--dry-run --repack`
+    # 会把旧包删掉——dry-run 的承诺是「不写文件」，这条组合根本不该被接受。
+    if args.dry_run and args.repack:
+        raise PackError(
+            "拒绝执行：--dry-run 与 --repack 不能同时使用。--dry-run 的承诺是只抽样与校验、"
+            "不写不删任何文件；--repack 会先归档再删除活动包目录。请二选一：只验抽样用 "
+            "--dry-run，真正重打包去掉 --dry-run。本次未写入或删除任何文件"
+        )
+    if args.dry_run:
+        with dry_run_guard():
+            return _run_pack(args)
+    return _run_pack(args)
+
+
+def _run_pack(args) -> int:
     runs_dir = Path(args.runs_dir).resolve() if args.runs_dir else RUNS_DIR
     private_dir = _resolve_workdir(
         Path(args.private_dir) if args.private_dir else DEFAULT_PRIVATE_DIR, "私有目录"
@@ -2043,7 +2181,8 @@ def parse_args(argv=None):
     parser.add_argument("--runs-dir", default=None, help="runs/ 目录（默认 experiments/graduation/runs）")
     parser.add_argument("--pack-dir", default=None, help="盲评包输出目录")
     parser.add_argument("--private-dir", default=None, help="私有映射目录")
-    parser.add_argument("--repack", action="store_true", help="允许覆盖 mapping.csv（会归档旧映射）")
+    parser.add_argument("--repack", action="store_true",
+                        help="允许覆盖 mapping.csv（会先把旧产物成套归档再替换；不能与 --dry-run 同用）")
     parser.add_argument("--dry-run", action="store_true", help="只做抽样与校验，不写文件")
     return parser.parse_args(argv)
 
