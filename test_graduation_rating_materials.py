@@ -353,6 +353,85 @@ def test_blank_is_not_na() -> None:
     check("strict 下留空本身仍作为缺失报错", _expect(errors, "P3 为空：空白不等于 N/A") == "", f"{errors}")
 
 
+def test_applicability_consistency() -> None:
+    """同一 blind_id 的两位评分者在可选列上必须同为 N/A 或同为已评分（只比适用性，不比分数）。"""
+
+    def errors_with(mutation, *, strict: bool = True) -> list[str]:
+        directory = TMP_ROOT / f"applicability_{len(PASSED) + len(FAILED)}"
+        formal = _formal_rows()
+        calibration = _calibration_rows()
+        supplement = _supplement_rows()
+        mutation(formal, calibration, supplement)
+        _write(directory, "formal", cr.FORMAL_HEADER, formal)
+        _write(directory, "calibration", cr.FORMAL_HEADER, calibration)
+        _write(directory, "supplementary", cr.SUPPLEMENT_HEADER, supplement)
+        return cr.collect_errors(directory, strict=strict, allow_empty=False)
+
+    def pick(rows: list[dict[str, str]], index: int, rater: str) -> dict[str, str]:
+        blind_id = _blind_id(index)
+        for item in rows:
+            if item["blind_id"] == blind_id and item["rater_id"] == rater:
+                return item
+        raise AssertionError(f"合成数据缺少 blind_id={blind_id} / {rater} 的行")
+
+    def set_value(rows: list[dict[str, str]], index: int, rater: str, column: str, value: str):
+        pick(rows, index, rater)[column] = value
+
+    # 1. 合法数据在 strict 下不应出现适用性错误（避免误报）。
+    baseline = errors_with(lambda *_: None)
+    check("合法数据在 strict 下仍全部通过", baseline == [], f"实际 {baseline[:4]}")
+
+    # 2. 一方 N/A、另一方有分 → 必须拦下，且错误里给出两位评分者的原值。
+    mismatch = errors_with(lambda formal, *_: set_value(formal, 12, "rater_b", "P3", "N/A"))
+    check("一方 P3 写 N/A、另一方给分被判失败", _expect(mismatch, "P3 适用性不一致") == "", f"{mismatch[:4]}")
+    check(
+        "适用性不一致的错误带出双方原值",
+        _expect(mismatch, "rater_a='3' / rater_b='N/A'") == "",
+        f"{mismatch[:4]}",
+    )
+
+    # 3. 两人分数不同（3 vs 4）只属评分分歧，不属适用性冲突 → 通过。
+    different_scores = errors_with(
+        lambda formal, *_: (set_value(formal, 12, "rater_a", "P3", "3"), set_value(formal, 12, "rater_b", "P3", "4"))
+    )
+    check("两人 P3 分数不同（3 vs 4）不被判为适用性不一致", different_scores == [], f"{different_scores[:4]}")
+
+    # 4. 两人都写 N/A → 通过。
+    both_na = errors_with(
+        lambda formal, *_: (set_value(formal, 0, "rater_a", "P3", "N/A"), set_value(formal, 0, "rater_b", "P3", "N/A"))
+    )
+    check("两人都写 N/A 通过", both_na == [], f"{both_na[:4]}")
+
+    # 5. 二分类 0 vs 1 → 允许（交后续一致性分析），不算适用性冲突。
+    binary_split = errors_with(lambda formal, *_: set_value(formal, 12, "rater_b", "S3_flag", "1"))
+    check("S3_flag 两人 0 vs 1 允许（不算适用性冲突）", binary_split == [], f"{binary_split[:4]}")
+
+    # 6. 空白仍按缺失报错，且不重复报成适用性不一致。
+    blank = errors_with(lambda formal, *_: set_value(formal, 12, "rater_b", "P3", ""))
+    check("空白仍报缺失", _expect(blank, "空白不等于 N/A") == "", f"{blank[:4]}")
+    check("空白不重复报成适用性不一致", _expect(blank, "适用性不一致") != "", f"{blank[:4]}")
+
+    # 7. 配对缺失（只剩一位评分者）走评分者缺失，不误报适用性。
+    def drop_rater_b(formal, *_) -> None:
+        blind_id = _blind_id(12)
+        formal[:] = [item for item in formal if not (item["blind_id"] == blind_id and item["rater_id"] == "rater_b")]
+
+    missing_pair = errors_with(drop_rater_b)
+    check("配对缺失仍报评分者不齐", _expect(missing_pair, "应为 rater_a + rater_b") == "", f"{missing_pair[:4]}")
+    check("配对缺失不额外报适用性不一致", _expect(missing_pair, "适用性不一致") != "", f"{missing_pair[:4]}")
+
+    # 8. 补充批次只查 E7：一方 N/A、另一方有分被拒；两人同为 N/A 通过。
+    supplement_mismatch = errors_with(lambda _formal, _calibration, supplement: set_value(supplement, 200, "rater_b", "E7", "N/A"))
+    check("补充批次 E7 一方 N/A 另一方给分被判失败", _expect(supplement_mismatch, "E7 适用性不一致") == "", f"{supplement_mismatch[:4]}")
+    supplement_both_na = errors_with(
+        lambda _formal, _calibration, supplement: (
+            set_value(supplement, 215, "rater_a", "E7", "N/A"),
+            set_value(supplement, 215, "rater_b", "E7", "N/A"),
+        )
+    )
+    check("补充批次两人 E7 都写 N/A 通过", supplement_both_na == [], f"{supplement_both_na[:4]}")
+
+
 def test_strict_counts() -> None:
     def drop_one_blind_id(directory, formal, calibration, supplement):
         target = formal[-1]["blind_id"]
@@ -457,6 +536,7 @@ def main() -> int:
             test_duplicate_rows,
             test_value_rules,
             test_blank_is_not_na,
+            test_applicability_consistency,
             test_strict_counts,
             test_missing_files_and_failure_code,
             test_header_text_matches_design,

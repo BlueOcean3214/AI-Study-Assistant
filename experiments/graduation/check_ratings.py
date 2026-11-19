@@ -12,7 +12,9 @@
 - 0/1 列只允许 0/1，允许不适用的列（S3_flag / E7）可写 `N/A`；必填列（E1）不得写 `N/A`；
 - `S4_verdict` 只允许 `full` / `partial` / `wrong` 或 `N/A`；
 - `notes` 不得出现可反推来源的身份信息；
-- `--strict` 额外核对份数、两位评分者齐全、以及不适用矩阵的计数。
+- `--strict` 额外核对份数、两位评分者齐全、不适用矩阵的计数，以及同一 `blind_id` 两位评分者的
+  **适用性状态一致**（只比“是否写了 `N/A`”，不比分数；**不能替代** `blind_private/mapping.csv`
+  的逐样本适用矩阵核对，真正的源样本适用性仍须在盲评包私有映射审计阶段验证）。
 
 用法：
 
@@ -267,6 +269,25 @@ def check_file(directory: Path, phase: str, *, strict: bool, allow_empty: bool) 
             raters = {row.get("rater_id", "") for row in rows if row.get("blind_id") == blind_id}
             if raters != RATER_IDS:
                 errors.append(f"{filename} blind_id={blind_id} 的评分者为 {sorted(raters)}，应为 rater_a + rater_b")
+        # 适用性状态一致：同一 blind_id 的两位评分者在可选字段上必须「同为 N/A」或「同为已评分」。
+        # 只比适用性、不比分数（3 vs 4 允许；0 vs 1 也允许，属于一致性分析要处理的分歧）；
+        # 一方 N/A、另一方有分 = 两人对同一份材料是否适用判断冲突，必须拦下。
+        # 空白已在逐行校验里报过「空白不等于 N/A」，这里跳过，避免同一问题重复计数。
+        by_pair = {(row.get("blind_id", ""), row.get("rater_id", "")): row for row in rows}
+        for blind_id in sorted(blind_ids):
+            for column in sorted(OPTIONAL_COLUMNS[phase]):
+                values = {
+                    rater_id: by_pair.get((blind_id, rater_id), {}).get(column, MISSING_TOKEN)
+                    for rater_id in sorted(RATER_IDS)
+                }
+                if MISSING_TOKEN in values.values():
+                    continue
+                if len({value == NA_TOKEN for value in values.values()}) > 1:
+                    errors.append(
+                        f"{filename} blind_id={blind_id} 的 {column} 适用性不一致："
+                        f"rater_a={values['rater_a']!r} / rater_b={values['rater_b']!r}；"
+                        "两位评分者必须同为 N/A 或同为有评分（分数可以不同）"
+                    )
         if phase in ("formal", "calibration"):
             if "P3_na_rows" in expected:
                 na_rows = sum(1 for row in rows if row.get("P3", "") == NA_TOKEN)
