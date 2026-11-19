@@ -729,10 +729,16 @@ def test_status_accounting():
 # ---------------------------------------------------------------------------
 
 def _write_prompt(run_dir, sample_id, group, system, user):
+    """按真实归档格式写 Prompt 文件（含 build_prompts.write_sample_output 追加的结束换行）。"""
+
     path = Path(run_dir) / "prompts" / str(sample_id) / f"{group}.txt"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
-        ca.PROMPT_SYSTEM_PREFIX + system + ca.PROMPT_USER_SEP + user,
+        ca.PROMPT_SYSTEM_PREFIX
+        + system
+        + ca.PROMPT_USER_SEP
+        + user
+        + ca.PROMPT_ARCHIVE_TRAILER,
         encoding="utf-8",
     )
     return path
@@ -869,7 +875,9 @@ def test_grounding():
     check("T11 真实 check_grounding 的违例原样进 FAIL",
           status == "FAIL" and "声称依据知识库" in detail, (status, detail))
 
-    archive = ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP + "用户"
+    archive = (
+        ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP + "用户" + ca.PROMPT_ARCHIVE_TRAILER
+    )
     check("T11 parse_prompt_archive 安全拆回 (system, user)",
           ca.parse_prompt_archive(archive) == ("系统", "用户"),
           ca.parse_prompt_archive(archive))
@@ -883,8 +891,16 @@ def test_grounding():
         check("T11 USER 分隔符出现两次 → ValueError（不做截断式切分）", False, "没有报错")
 
     for label, bad, expected in (
-        ("SYSTEM 为空", ca.PROMPT_SYSTEM_PREFIX + ca.PROMPT_USER_SEP + "用户", "SYSTEM 内容为空"),
-        ("USER 为空", ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP, "USER 内容为空"),
+        (
+            "SYSTEM 为空",
+            ca.PROMPT_SYSTEM_PREFIX + ca.PROMPT_USER_SEP + "用户" + ca.PROMPT_ARCHIVE_TRAILER,
+            "SYSTEM 内容为空",
+        ),
+        (
+            "USER 为空",
+            ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP + ca.PROMPT_ARCHIVE_TRAILER,
+            "USER 内容为空",
+        ),
     ):
         try:
             ca.parse_prompt_archive(bad)
@@ -936,6 +952,117 @@ def test_grounding():
 # ---------------------------------------------------------------------------
 # T12 check_auto：manifest 不可信必须在算指标前终止
 # ---------------------------------------------------------------------------
+
+def _archive(system, user):
+    """按归档器真实格式拼一份 Prompt 归档文本（USER 原文后追加一个结束换行）。"""
+
+    return (
+        ca.PROMPT_SYSTEM_PREFIX + system + ca.PROMPT_USER_SEP + user + ca.PROMPT_ARCHIVE_TRAILER
+    )
+
+
+def test_auto_prompt_archive_roundtrip():
+    cases = (
+        ("普通 USER 内容", "请解释条件概率的意思。"),
+        ("USER 末尾恰有一个换行", "请解释条件概率的意思。\n"),
+        ("USER 末尾有三个换行", "请解释条件概率的意思。\n\n\n"),
+        ("USER 末尾有空格", "请解释条件概率的意思。  "),
+        ("USER 末尾是空格加换行", "请解释条件概率的意思。 \n \n"),
+        ("USER 内部含分隔符文字但不构成分隔符行", "第一段\n===== USER ===== 不是分隔符\n最后一段"),
+    )
+
+    for label, user in cases:
+        try:
+            system, parsed_user = ca.parse_prompt_archive(_archive("系统提示", user))
+        except ValueError as error:
+            check(f"T17 {label} 解析不抛错", False, str(error))
+            continue
+        check(f"T17 {label} 原文逐字符还原", parsed_user == user, repr(parsed_user))
+        check(f"T17 {label} SYSTEM 原文逐字符还原", system == "系统提示", repr(system))
+
+    # 归档层只追加一个换行：末尾有 N 个换行的原文，解析后仍是 N 个（不多剥也不少剥）。
+    for count in (1, 2, 3, 5):
+        raw = "正文" + "\n" * count
+        parsed = ca.parse_prompt_archive(_archive("系统", raw))[1]
+        check(f"T17 原文 {count} 个尾随换行不多剥不少剥", parsed == raw, repr(parsed))
+
+    # 归档格式缺少结束换行：按格式异常 fail-closed，不得静默接受。
+    no_trailer = ca.PROMPT_SYSTEM_PREFIX + "系统" + ca.PROMPT_USER_SEP + "用户请求"
+    try:
+        ca.parse_prompt_archive(no_trailer)
+    except ValueError as error:
+        check("T17 缺少归档结束换行 → ValueError（fail-closed）",
+              "结束换行" in str(error), str(error))
+    else:
+        check("T17 缺少归档结束换行 → ValueError（fail-closed）", False, "没有报错")
+
+    # 只有结束换行、没有 USER 原文：仍判内容为空。
+    try:
+        ca.parse_prompt_archive(_archive("系统", ""))
+    except ValueError as error:
+        check("T17 USER 仅有结束换行 → ValueError（内容为空）",
+              "USER 内容为空" in str(error), str(error))
+    else:
+        check("T17 USER 仅有结束换行 → ValueError（内容为空）", False, "没有报错")
+
+    # 分隔符缺失 / 重复 仍拒绝解析。
+    for label, bad, expected in (
+        ("缺少 USER 分隔符", ca.PROMPT_SYSTEM_PREFIX + "系统用户" + ca.PROMPT_ARCHIVE_TRAILER, "0 次"),
+        (
+            "USER 分隔符重复",
+            _archive("系统", "用户") + ca.PROMPT_USER_SEP + "重复" + ca.PROMPT_ARCHIVE_TRAILER,
+            "2 次",
+        ),
+    ):
+        try:
+            ca.parse_prompt_archive(bad)
+        except ValueError as error:
+            check(f"T17 {label} → ValueError", expected in str(error), str(error))
+        else:
+            check(f"T17 {label} → ValueError", False, "没有报错")
+
+    # 真实 writer（build_prompts.write_sample_output）→ 解析 → 真实 prompt_sha256 必须一致。
+    real_root = TMP_ROOT / "archive-roundtrip"
+    system = "你是学习方法助手。"
+    user = "我最近总是记不住公式。\n能给我一个复习计划吗？\n"
+    build = {
+        "sample_id": "S1",
+        "groups": ["A"],
+        "db_path": str(TMP_ROOT / "archive-roundtrip.db"),
+        "plan_date": "2026-11-12T21:00:00",
+        "inputs": {},
+        "contents": {},
+        "prompts": {"A": {"system": system, "user": user}},
+        "checks": [],
+    }
+    bp.write_sample_output(real_root, build)
+    archive_text = (real_root / "A.txt").read_text(encoding="utf-8")
+    parsed_system, parsed_user = ca.parse_prompt_archive(archive_text)
+    check("T17 真实 writer 归档：SYSTEM 逐字符还原", parsed_system == system, repr(parsed_system))
+    check("T17 真实 writer 归档：USER 逐字符还原（保留原文尾随换行）",
+          parsed_user == user, repr(parsed_user))
+    expected_sha = bp.prompt_sha256(system, user)
+    check("T17 解析结果能重算出原始 Prompt 哈希",
+          bp.prompt_sha256(parsed_system, parsed_user) == expected_sha,
+          (bp.prompt_sha256(parsed_system, parsed_user), expected_sha))
+
+    row = {"prompt_sha256": expected_sha}
+    verified, error = ca.verify_prompt_hash(archive_text, row)
+    check("T17 verify_prompt_hash 对未改动的归档返回一致值",
+          error is None and verified == expected_sha, (verified, error))
+
+    # 内容真被改过就必须不匹配：修复只脱归档层换行，不掩盖篡改。
+    tampered = archive_text.replace("复习计划", "复习时表")
+    check("T17 归档内容被改写后哈希不再一致", tampered != archive_text, "替换未生效")
+    verified, error = ca.verify_prompt_hash(tampered, row)
+    check("T17 归档内容被改写 → verify_prompt_hash 返回 (None, 不一致)",
+          verified is None and "不一致" in str(error), (verified, error))
+
+    # 行里没有 prompt_sha256：仍然无法确认，不给通过。
+    verified, error = ca.verify_prompt_hash(archive_text, {})
+    check("T17 行缺 prompt_sha256 → (None, 缺字段说明)",
+          verified is None and "prompt_sha256" in str(error), (verified, error))
+
 
 def _manifest_entry(run_dir, run_name):
     results = run_dir / "results.jsonl"
@@ -1640,6 +1767,7 @@ def main():
         test_auto_y1_group_denominator()
         test_status_accounting()
         test_grounding()
+        test_auto_prompt_archive_roundtrip()
         test_grounding_memory_expectation()
         test_auto_manifest_failclosed()
         test_memory_payload_item_validation()
