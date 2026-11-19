@@ -1803,6 +1803,142 @@ def test_t41_staging_path_must_be_directory():
     print("  T41 PASS：暂存路径被文件/链接占用时报 PackError（exit 2）且无副作用")
 
 
+def _full_tree_state(sb: Sandbox) -> dict:
+    """活动包 + 三个私有文件 + archive 的完整指纹，用来证明「零副作用」。"""
+
+    state = {}
+    state["pack_exists"] = sb.pack_dir.exists()
+    state["pack"] = _active_tree_hashes(sb)
+    state["private"] = {
+        path.name: _sha(path)
+        for path in sb.private_dir.iterdir()
+        if path.is_file()
+    } if sb.private_dir.is_dir() else {}
+    state["archive"] = sorted(
+        path.relative_to(sb.private_dir).as_posix()
+        for path in (sb.private_dir / "archive").rglob("*")
+    ) if (sb.private_dir / "archive").is_dir() else []
+    state["staging"] = sorted(
+        path.name
+        for path in sb.pack_dir.parent.glob(".*staging*")
+    ) if sb.pack_dir.parent.is_dir() else []
+    state["all_paths"] = sorted(
+        p.relative_to(sb.root).as_posix()
+        for p in sb.root.rglob("*")
+        if p.is_file() and ".git" not in p.parts
+    )
+    return state
+
+
+def test_t42_dry_run_repack_is_rejected_without_side_effects():
+    """--dry-run --repack 必须在任何读数据/归档/删除之前拒绝，旧包与私有文件哈希不变。
+
+    这是本 PR 修的漏洞：归档调用排在 `if args.dry_run:` 之前，而归档最后会
+    `shutil.rmtree(活动包目录)`，于是 dry-run 会把旧包删掉。
+    """
+
+    sb = _make_sandbox("t42")
+    _build_and_snapshot(sb, "2026-11-17T09:00:00Z")
+    before = _full_tree_state(sb)
+    assert before["pack_exists"] and before["pack"], "前置：应当已有一整套旧产物"
+    assert set(before["private"]) == set(pack.PRIVATE_FILES), before["private"]
+
+    code, out, err = _main(sb, ["--dry-run", "--repack"])
+    assert code == 2, f"必须拒绝（exit 2），实际 {code}\nstdout={out}\nstderr={err}"
+    assert "dry-run" in err and "repack" in err, err
+    assert "未写入或删除任何文件" in err, err
+    after = _full_tree_state(sb)
+    assert after == before, "拒绝 --dry-run --repack 时磁盘必须逐字节不变"
+    assert not (sb.private_dir / "archive").exists() or not after["archive"], after["archive"]
+    print("  T42 PASS：--dry-run --repack 在读取/归档/删除前被拒，旧包与私有文件逐字节不变")
+
+    # 顺序无关：把 --repack 放前面也必须同样拒绝
+    code2, _, err2 = _main(sb, ["--repack", "--dry-run"])
+    assert code2 == 2 and _full_tree_state(sb) == before, (code2, err2)
+    print("  T42b PASS：参数顺序不影响拒绝结果，磁盘仍不变")
+
+
+def test_t43_plain_dry_run_has_no_side_effects():
+    """普通 --dry-run（无 --repack）在任何目录状态下都必须零副作用。"""
+
+    # 情形 1：全新目录，什么都没有
+    fresh = _make_sandbox("t43-fresh")
+    before = _full_tree_state(fresh)
+    code, out, _ = _main(fresh, ["--dry-run"])
+    assert code == 0, f"普通 dry-run 应成功，实际 {code}"
+    assert "未写任何文件" in out, out
+    assert _full_tree_state(fresh) == before, "全新目录下 dry-run 必须零副作用"
+
+    # 情形 2：已有完整旧产物、**不加** --repack：应被 stale 检查拒绝，且不改磁盘
+    old = _make_sandbox("t43-old")
+    _build_and_snapshot(old, "2026-11-17T10:00:00Z")
+    before_old = _full_tree_state(old)
+    code2, _, err2 = _main(old, ["--dry-run"])
+    assert code2 == 2, (code2, err2)
+    assert "未归档的旧运行产物" in err2, err2
+    assert _full_tree_state(old) == before_old, "被拒时磁盘必须不变"
+
+    # 情形 3：已有完整旧产物 + --dry-run --repack → 拒绝且不变（与 T42 互补，这里验全新快照）
+    before_old2 = _full_tree_state(old)
+    code3, _, err3 = _main(old, ["--dry-run", "--repack"])
+    assert code3 == 2 and "不能同时使用" in err3, (code3, err3)
+    assert _full_tree_state(old) == before_old2
+    print("  T43 PASS：普通 dry-run 在三种目录状态下都零副作用，且拒绝时不改盘")
+
+
+def test_t44_dry_run_guard_blocks_late_writes():
+    """守卫必须能抓住「将来有人在 dry-run 之前插入写盘」这类回归。"""
+
+    sb = _make_sandbox("t44")
+    before = _full_tree_state(sb)
+
+    # 直接在守卫里做各种写盘动作，逐个确认被拦下
+    blocked = []
+
+    def attempt(label, func):
+        try:
+            func()
+        except pack.DryRunWriteBlocked as exc:
+            assert "dry-run" in str(exc), str(exc)
+            blocked.append(label)
+        else:
+            raise AssertionError(f"{label} 应被 dry-run 守卫拦下")
+
+    with pack.dry_run_guard():
+        target = sb.pack_dir.parent / "guard-probe.txt"
+        attempt("Path.write_text", lambda: target.write_text("x", encoding="utf-8"))
+        attempt("Path.mkdir", lambda: (sb.pack_dir.parent / "guard-dir").mkdir())
+        attempt("open(..., 'w')", lambda: open(target, "w", encoding="utf-8"))
+        attempt("shutil.rmtree", lambda: shutil.rmtree(sb.runs_dir, ignore_errors=True))
+        attempt("os.replace", lambda: os.replace(target, target))
+        attempt("shutil.copy2", lambda: shutil.copy2(sb.manifest, target))
+
+    assert len(blocked) == 6, blocked
+    assert _full_tree_state(sb) == before, "守卫拦截后磁盘必须完全不变"
+
+    # 守卫退出后必须恢复正常写入能力（不能把进程搞成永久只读）
+    ok = sb.pack_dir.parent / "after-guard.txt"
+    ok.write_text("ok\n", encoding="utf-8", newline="\n")
+    assert ok.read_text(encoding="utf-8") == "ok\n"
+    ok.unlink()
+    print(f"  T44 PASS：dry-run 守卫拦下 {len(blocked)} 类写盘动作，退出后恢复正常")
+
+
+def test_t45_repack_real_run_still_archives():
+    """修复不能误伤真实 repack：不带 --dry-run 时归档照旧工作。"""
+
+    sb = _make_sandbox("t45")
+    _build_and_snapshot(sb, "2026-11-17T11:00:00Z")
+    old_mapping_sha = _sha(sb.private_dir / "mapping.csv")
+    with _clock("2026-11-17T11:00:01Z"):
+        _build(sb, ["--repack"])
+    archive = sb.private_dir / "archive" / "pack-20261117T110001Z"
+    assert archive.is_dir(), "真实 repack 仍必须成套归档"
+    assert _sha(archive / "private" / "mapping.csv") == old_mapping_sha
+    assert _sha(sb.private_dir / "mapping.csv") != old_mapping_sha, "活动 mapping 应换成新的一套"
+    print("  T45 PASS：不带 --dry-run 的真实 repack 归档行为未被修复破坏")
+
+
 TESTS = [
     ("T1", test_t1_private_outside_repo),
     ("T2", test_t2_pack_equals_private),
@@ -1845,6 +1981,10 @@ TESTS = [
     ("T39", test_t39_manifest_header_is_validated_before_rows),
     ("T40", test_t40_pack_dir_must_not_live_in_runs_dir),
     ("T41", test_t41_staging_path_must_be_directory),
+    ("T42", test_t42_dry_run_repack_is_rejected_without_side_effects),
+    ("T43", test_t43_plain_dry_run_has_no_side_effects),
+    ("T44", test_t44_dry_run_guard_blocks_late_writes),
+    ("T45", test_t45_repack_real_run_still_archives),
 ]
 
 
