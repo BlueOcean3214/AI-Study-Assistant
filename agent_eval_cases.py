@@ -179,6 +179,7 @@ def p7_after_run(run_result):
 EVAL_CASES = [
     {
         "id": "A_history_only",
+        "read_only": True,
         "message": "看看我最近 7 天的学习情况。",
         "tags": ["history"],
         "seed": "difficult_history",
@@ -189,6 +190,7 @@ EVAL_CASES = [
     },
     {
         "id": "B_analysis_advice",
+        "read_only": True,
         "message": "我最近定积分总学不完，你分析一下原因，并告诉我接下来应该怎么学。",
         "tags": ["history", "advice"],
         "seed": "difficult_history",
@@ -199,6 +201,7 @@ EVAL_CASES = [
     },
     {
         "id": "B2_history_plus_knowledge",
+        "read_only": True,
         "message": "先看看我最近 7 天的学习情况，再结合知识库告诉我定积分接下来应该怎么学。",
         "tags": ["history", "knowledge", "chain"],
         "seed": "difficult_history",
@@ -208,6 +211,7 @@ EVAL_CASES = [
     },
     {
         "id": "C_general_concept",
+        "read_only": True,
         "message": "什么是 Embedding？请用一句话回答。",
         "tags": ["no_tool_expected"],
         "seed": "easy_history",
@@ -217,6 +221,7 @@ EVAL_CASES = [
     },
     {
         "id": "D_search_unavailable",
+        "read_only": True,
         "message": "先看看我最近 7 天的学习情况，再结合知识库告诉我定积分接下来应该怎么学。",
         "tags": ["error_path"],
         "seed": "difficult_history",
@@ -230,6 +235,7 @@ EVAL_CASES = [
     },
     {
         "id": "E_knowledge_only",
+        "read_only": True,
         "message": "知识库里说定积分第一步应该做什么？",
         "tags": ["knowledge"],
         "seed": "easy_history",
@@ -241,6 +247,7 @@ EVAL_CASES = [
     },
     {
         "id": "F_empty_history",
+        "read_only": True,
         "message": "我最近学得怎么样？",
         "tags": ["history", "empty_data"],
         "seed": "empty_history",
@@ -251,6 +258,7 @@ EVAL_CASES = [
     },
     {
         "id": "G_chitchat",
+        "read_only": True,
         "message": "你好，你是谁？",
         "tags": ["no_tool_expected"],
         "seed": "easy_history",
@@ -260,6 +268,7 @@ EVAL_CASES = [
     },
     {
         "id": "P1_plan_draft_basic",
+        "read_only": True,
         "message": "帮我根据最近的学习情况，制定明天的学习计划草案。",
         "tags": ["plan_draft"],
         "mode": "plan_draft",
@@ -271,6 +280,7 @@ EVAL_CASES = [
     },
     {
         "id": "P2_plan_draft_knowledge",
+        "read_only": True,
         "message": "结合知识库和我最近的反馈，帮我制定明天的学习计划草案。",
         "tags": ["plan_draft", "knowledge", "chain"],
         "mode": "plan_draft",
@@ -282,6 +292,7 @@ EVAL_CASES = [
     },
     {
         "id": "P3_plan_draft_search_failed",
+        "read_only": True,
         "message": "结合知识库和我最近的反馈，帮我制定明天的学习计划草案。",
         "tags": ["plan_draft", "error_path"],
         "mode": "plan_draft",
@@ -293,6 +304,7 @@ EVAL_CASES = [
     },
     {
         "id": "P4_confirmation_required",
+        "read_only": False,
         "message": (
             "请把下面这份学习计划直接保存到 2026-10-06，如果保存不了请告诉我原因：\n"
             + json.dumps(P5_PLAN, ensure_ascii=False)
@@ -307,6 +319,7 @@ EVAL_CASES = [
     },
     {
         "id": "P5_save_confirmed",
+        "read_only": False,
         "message": p5_message,
         "setup": p5_setup,
         "tags": ["save_plan", "confirmation", "chain"],
@@ -319,6 +332,7 @@ EVAL_CASES = [
     },
     {
         "id": "P6_plan_confirmation_flow",
+        "read_only": False,
         "message": "帮我根据最近的学习情况，制定今天的学习计划草案。",
         "tags": ["plan_draft", "confirmation", "chain"],
         "mode": "plan_draft",
@@ -330,6 +344,7 @@ EVAL_CASES = [
     },
     {
         "id": "P7_unconfirmed_plan_cannot_save",
+        "read_only": False,
         "message": "帮我根据最近的学习情况，制定今天的学习计划草案。",
         "tags": ["plan_draft", "confirmation", "error_path"],
         "mode": "plan_draft",
@@ -353,3 +368,31 @@ def get_case(case_id):
 
 def case_ids():
     return [case["id"] for case in EVAL_CASES]
+
+
+def read_only_case_ids():
+    """真实数据模式的显式只读 allowlist（fail-closed）。
+
+    只有 ``read_only is True`` 的用例才算只读；字段缺失、写成字符串、
+    或者没写，一律视为「有写入能力」，不允许进入真实数据库模式。
+    这里只认显式声明，不按 id/名字/标签推断，避免新用例默认被当成安全。
+    """
+
+    ids = []
+
+    for case in EVAL_CASES:
+        flag = case.get("read_only")
+
+        if not isinstance(flag, bool):
+            raise ValueError(
+                f"用例 {case.get('id')!r} 缺少布尔 read_only 声明："
+                "真实数据模式按 fail-closed 处理，禁止隐式放行"
+            )
+
+        if flag:
+            ids.append(case["id"])
+
+    return frozenset(ids)
+
+
+READ_ONLY_CASE_IDS = read_only_case_ids()

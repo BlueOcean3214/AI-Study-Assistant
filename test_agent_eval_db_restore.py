@@ -214,17 +214,20 @@ def main():
             f"reset_calls={reset_calls}",
         )
 
-        # ---- 5) isolate=False ----
+        # ---- 5) isolate=False（真实数据模式） ----
         def forbidden(*_args, **_kwargs):
-            raise AssertionError("isolate=False 不得切换路径或初始化/播种夹具库")
+            raise AssertionError("isolate=False 不得切换数据库或初始化/播种夹具库")
 
         database.init_db = forbidden
         agent_eval.seed_database = forbidden
+        original_metrics = rag_service._log_retrieval_metrics
         reset_calls.clear()
         try:
             with agent_eval.isolated_environment({"seed": "difficult_history"}, isolate=False):
                 inside_db = Path(database.DATABASE_PATH)
                 inside_cache = Path(vector_cache.CACHE_DIR)
+                inside_metrics = rag_service._log_retrieval_metrics
+                inside_cache_exists = inside_cache.is_dir()
         finally:
             database.init_db = original_init_db
             agent_eval.seed_database = original_seed_database
@@ -235,11 +238,34 @@ def main():
             f"inside={inside_db}",
         )
         check(
-            "isolate=False 不切换缓存路径",
-            inside_cache == sandbox_cache and Path(vector_cache.CACHE_DIR) == sandbox_cache,
+            "isolate=False 把缓存重定向到本次运行独占的临时目录",
+            inside_cache != sandbox_cache
+            and inside_cache_exists
+            and sandbox_cache not in inside_cache.parents
+            and agent_eval.PROJECT_DIR not in inside_cache.parents,
             f"inside={inside_cache}",
         )
-        check("isolate=False 不清空 rag 缓存", reset_calls == [], f"reset_calls={reset_calls}")
+        check(
+            "isolate=False 退出后缓存目录恢复进入前的值",
+            Path(vector_cache.CACHE_DIR) == sandbox_cache,
+            f"vector_cache.CACHE_DIR={vector_cache.CACHE_DIR}",
+        )
+        check(
+            "isolate=False 退出后删除临时缓存目录",
+            not inside_cache.exists(),
+            f"inside={inside_cache}",
+        )
+        check(
+            "isolate=False 期间关闭检索埋点、退出后恢复",
+            inside_metrics is not original_metrics
+            and rag_service._log_retrieval_metrics is original_metrics,
+            f"inside={inside_metrics}",
+        )
+        check(
+            "isolate=False 仍在路径恢复之后调用一次 reset_cache",
+            reset_calls == [(sandbox_db, sandbox_cache)],
+            f"reset_calls={reset_calls}",
+        )
 
         # ---- 6) 仓库固定夹具文件没被碰 ----
         check(
