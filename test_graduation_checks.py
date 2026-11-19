@@ -1505,6 +1505,110 @@ def test_grounding_memory_expectation():
           status == "FAIL" and "不应注入长期记忆" in detail, (status, detail))
 
 
+def test_m3_empty_five_zero():
+    """T-M3：S7-empty 必须 memories/distinct_keys/injected/pendings/events 五项全 0 才算通过。
+
+    回归点：旧实现只看 len(memories)==0，pending 缓冲或事件表有残留时 M3 仍记 1、
+    CHECK.M3 仍 PASS，而样本总体 FAIL——把「未做完」当成「通过」。
+    """
+
+    config = seed_fixture.load_config(None)
+    db_path = TMP_ROOT / "m3-empty.db"
+    make_db(db_path, [], [], feedback_ids=[])
+    empty_sample = sample("S7-empty")
+    clean = {"memories": [], "pendings": 0, "events": []}
+
+    good = cm.verify_sample(empty_sample, clean, db_path, config, {"ok": True})
+    m3 = good["m3"]
+    check("T-M3 S7-empty 五项全 0 → M3 score=1",
+          m3["kind"] == "empty" and m3["ok"] is True and m3["score"] == 1, m3)
+    check("T-M3 通过理由写明五零判据来源",
+          str(m3["detail"].get("criterion", "")).startswith("verify_sample"), m3["detail"])
+    good_checks = [
+        entry for entry in cm.metric_status_checks(good)
+        if entry["section"] == "M3" and entry["metric"] == "无证据样本约束"
+    ]
+    check("T-M3 干净样本 CHECK.M3 = PASS",
+          bool(good_checks) and good_checks[0]["status"] == cm.STATUS_PASS, good_checks)
+
+    cases = (
+        ("待定缓冲残留", {**clean, "pendings": 2}, "pendings="),
+        ("事件表残留", {**clean, "events": [{"feedback_id": 1, "kind": "inject"}]}, "历史数据污染"),
+    )
+
+    for name, mutated, hint in cases:
+        dirty = cm.verify_sample(empty_sample, mutated, db_path, config, {"ok": True})
+        m3 = dirty["m3"]
+        check(f"T-M3 S7-empty {name} → M3 score=0 且 ok=False",
+              m3["score"] == 0 and m3["ok"] is False, m3)
+        reasons = [
+            entry["reason"] for entry in cm.metric_status_checks(dirty)
+            if entry["section"] == "M3" and entry["metric"] == "无证据样本约束"
+        ]
+        check(f"T-M3 S7-empty {name} → CHECK.M3 FAIL 且理由点出{hint}",
+              bool(reasons) and hint in reasons[0], reasons)
+        check(f"T-M3 S7-empty {name} 同时计入 Gold 核验失败数",
+              dirty["failure_count"] > 0, dirty["failure_count"])
+
+
+def test_auto_p95_nearest_rank():
+    """T-p95：最近秩法 = ceil(0.95n)，取升序第『最近秩』个值（1-based）。"""
+
+    check("T-p95 n=140 取第 133 小（ceil(133.0)=133）",
+          ca.p95(list(range(1, 141))) == 133, ca.p95(list(range(1, 141))))
+    check("T-p95 n=20 取第 19 小（ceil(19.0)=19）",
+          ca.p95(list(range(1, 21))) == 19, ca.p95(list(range(1, 21))))
+    check("T-p95 n=8 取第 8 小（ceil(7.6)=8，即最大值）",
+          ca.p95(list(range(1, 9))) == 8, ca.p95(list(range(1, 9))))
+    check("T-p95 空序列返回 None（调用方写 N/A）", ca.p95([]) is None, ca.p95([]))
+    check("T-p95 单值返回该值", ca.p95([7]) == 7, ca.p95([7]))
+    check("T-p95 排序后取值（n=4 → ceil(3.8)=4，即最大值 9）",
+          ca.p95([9, 1, 5, 3]) == 9, ca.p95([9, 1, 5, 3]))
+
+
+def test_auto_y1_group_denominator():
+    """T-Y1：分组 Y1 分母只算可判定行；组内出现 UNAVAILABLE 就记 N/A（与总体同口径）。"""
+
+    def analysis(group, y1, grounding="PASS"):
+        return {
+            "group": group,
+            "y1": y1,
+            "simulated": None,
+            "request_count": 1,
+            "elapsed_seconds": 1.0,
+            "failed": y1 == "INVALID",
+            "prompt_tokens": 10,
+            "grounding": grounding,
+        }
+
+    analyses = [
+        analysis("A", "VALID"),
+        analysis("A", "VALID"),
+        analysis("A", "INVALID"),
+        analysis("B", "VALID"),
+        analysis("B", "UNAVAILABLE"),
+    ]
+
+    rows = ca.metric_rows_for_scope("main", analyses)
+    y1_group = {
+        row["group"]: row for row in rows
+        if row["metric"] == "Y1_structural_saveable_rate" and row["group"] != "all"
+    }
+    check("T-Y1 每个分组各有一行 Y1", set(y1_group) == {"A", "B"}, sorted(y1_group))
+    check("T-Y1 组内全可判定时按 PASS/(PASS+FAIL) 计算",
+          y1_group["A"]["value"] == round(2 / 3, 4) and y1_group["A"]["denominator"] == 3,
+          y1_group["A"])
+    check("T-Y1 组内含 UNAVAILABLE 时记 N/A，不把它塞进分母",
+          y1_group["B"]["value"] == "N/A" and y1_group["B"]["denominator"] == 1, y1_group["B"])
+    check("T-Y1 组内 N/A 行在 note 里说明原因",
+          "夹具不可用" in y1_group["B"]["note"] and "已通过 1" in y1_group["B"]["note"],
+          y1_group["B"]["note"])
+    overall = [row for row in rows
+               if row["metric"] == "Y1_structural_saveable_rate" and row["group"] == "all"][0]
+    check("T-Y1 总体口径同样是 N/A（与分组一致）",
+          overall["value"] == "N/A", overall)
+
+
 def _force_rmtree(target):
     """Windows 上临时目录里的只读文件会让 rmtree 静默失败，先解除只读再重试。"""
 
@@ -1526,11 +1630,14 @@ def main():
         test_m1()
         test_m2()
         test_m3()
+        test_m3_empty_five_zero()
         test_m4()
         test_pooled_and_csv()
         test_scan()
         test_read_rows()
         test_auto_analysis()
+        test_auto_p95_nearest_rank()
+        test_auto_y1_group_denominator()
         test_status_accounting()
         test_grounding()
         test_grounding_memory_expectation()

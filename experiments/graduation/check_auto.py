@@ -33,6 +33,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import re
 import statistics
 import sys
@@ -108,14 +109,19 @@ def mean(values):
 
 
 def p95(values):
-    """最近秩法 P95（不做插值，避免与论文口径不一致）。"""
+    """最近秩法 P95（不做插值，避免与论文口径不一致）。
+
+    最近秩 = ceil(0.95 × n)，取升序第「最近秩」个值（1-based）。
+    旧实现用 `round(0.95*n + 0.5) - 1`，在 0.95*n 恰为整数（n 为 20 的倍数，例如主实验
+    n=140 → 133）时会因 Python 银行家舍入多进一位，取到比最近秩高一档的值。
+    """
 
     if not values:
         return None
     ordered = sorted(values)
-    rank = max(1, int(round(0.95 * len(ordered) + 0.5)) - 1)
-    rank = min(rank, len(ordered) - 1)
-    return ordered[rank]
+    rank = math.ceil(0.95 * len(ordered))
+    rank = min(max(rank, 1), len(ordered))
+    return ordered[rank - 1]
 
 
 def is_number(value):
@@ -893,9 +899,19 @@ def metric_rows_for_scope(scope, analyses):
         group_verifiable = group_pass + group_fail
         group_valid = sum(1 for a in subset if a["y1"] == "VALID")
         group_invalid = sum(1 for a in subset if a["y1"] == "INVALID")
-        value = round(group_valid / len(subset), 4) if group_invalid or group_valid else "N/A"
-        add("Y1_structural_saveable_rate", value, len(subset), len(subset), group=group,
-            unit="ratio", note="按组拆分")
+        group_na = sum(1 for a in subset if a["y1"] == "UNAVAILABLE")
+        group_denom = group_valid + group_invalid
+        # 与总体口径一致：组内只要出现夹具不可用的行，这一组的 Y1 就记 N/A 而不是
+        # 把它塞进分母算出一个偏低的比率（否则「S5 只有 4/5 可判定」会被读成 80% 通过）。
+        if group_na:
+            y1_value = "N/A"
+            y1_note = (f"按组拆分；{group_na} 行夹具不可用，无法调用 validate_plan_for_save()；"
+                       f"已通过 {group_valid}、未通过 {group_invalid}")
+        else:
+            y1_value = round(group_valid / group_denom, 4) if group_denom else "N/A"
+            y1_note = "按组拆分"
+        add("Y1_structural_saveable_rate", y1_value, len(subset), group_denom, group=group,
+            unit="ratio", note=y1_note)
         add("grounding_pass_rate",
             round(group_pass / group_verifiable, 4) if group_verifiable else "N/A",
             group_verifiable, group_verifiable, group=group, unit="ratio",

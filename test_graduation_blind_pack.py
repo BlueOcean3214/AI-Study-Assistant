@@ -1728,6 +1728,81 @@ def test_t39_manifest_header_is_validated_before_rows():
     print("  T39 PASS：表头重复/缺列/空文件两侧都 fail-closed，纯表头空清单仍合法")
 
 
+def test_t40_pack_dir_must_not_live_in_runs_dir():
+    """包目录/私有目录与实验 run 目录不得互相包含：正式 results.jsonl 只读。"""
+
+    # 0) 规则本身：三种关系都要拒，正常的兄弟目录要放行
+    runs = TMP_ROOT / "t40-rules" / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    _expect_pack_error(
+        lambda: pack.ensure_not_within_runs(runs, runs, "活动包目录"), "不能就是实验 run 目录"
+    )
+    _expect_pack_error(
+        lambda: pack.ensure_not_within_runs(runs / "blind_pack", runs, "活动包目录"), "位于实验 run 目录内"
+    )
+    _expect_pack_error(
+        lambda: pack.ensure_not_within_runs(runs.parent, runs, "活动包目录"), "实验 run 目录位于活动包目录内"
+    )
+    pack.ensure_not_within_runs(runs.parent / "blind_pack", runs, "活动包目录")
+
+    # 1) pack_dir 落在 runs_dir 里 → 拒绝，run 文件与私有目录都没被动过
+    sb = _make_sandbox("t40-inside")
+    sb.pack_dir = sb.runs_dir / "blind_pack"
+    before = _tree_hashes(sb.runs_dir)
+    code, _, err = _main(sb)
+    assert code == 2, (code, err)
+    assert "冲突" in err and "位于实验 run 目录内" in err, err
+    assert _tree_hashes(sb.runs_dir) == before, "拒绝时不得改动 run 目录"
+    assert not sb.pack_dir.exists(), "拒绝时不得在 run 目录里建包目录"
+    assert not sb.private_dir.exists(), "拒绝时不得写私有文件"
+
+    # 2) pack_dir 就是 runs_dir → 拒绝（--repack 会把 run 目录当旧包搬走）
+    sb2 = _make_sandbox("t40-equal")
+    sb2.pack_dir = sb2.runs_dir
+    before2 = _tree_hashes(sb2.runs_dir)
+    code, _, err = _main(sb2, extra=("--repack",))
+    assert code == 2, (code, err)
+    assert "不能就是实验 run 目录" in err, err
+    assert _tree_hashes(sb2.runs_dir) == before2, "拒绝时 run 目录必须原样"
+
+    # 3) private_dir 落在 runs_dir 里 → 拒绝（否则私有材料落进被 Git 忽略的 runs/）
+    sb3 = _make_sandbox("t40-private")
+    sb3.private_dir = sb3.runs_dir / "blind_private"
+    before3 = _tree_hashes(sb3.runs_dir)
+    code, _, err = _main(sb3)
+    assert code == 2, (code, err)
+    assert "私有目录" in err and "位于实验 run 目录内" in err, err
+    assert _tree_hashes(sb3.runs_dir) == before3
+    print("  T40 PASS：包/私有目录与 run 目录互相包含时在任何写盘前拒绝，run 目录指纹不变")
+
+
+def test_t41_staging_path_must_be_directory():
+    """发布暂存路径被普通文件占用时给结构化错误，不能抛未捕获 OSError（退出码 1）。"""
+
+    sb = _make_sandbox("t41")
+    staging = sb.pack_dir.parent / f".{sb.pack_dir.name}.staging-20261116T000000Z"
+    with _clock("2026-11-16T00:00:00Z"):
+        sb.pack_dir.parent.mkdir(parents=True, exist_ok=True)
+        staging.write_text("occupied\n", encoding="utf-8", newline="\n")
+        code, _, err = _main(sb)
+        assert code == 2, (code, err)
+        assert "不是目录" in err, err
+        assert staging.read_text(encoding="utf-8") == "occupied\n", "占用文件不得被删除或改写"
+        assert not sb.pack_dir.exists(), "拒绝时不得发布包目录"
+
+    # 链接形态同样应在写盘前被拒
+    sb2 = _make_sandbox("t41-link")
+    staging2 = sb2.pack_dir.parent / f".{sb2.pack_dir.name}.staging-20261116T000000Z"
+    with _clock("2026-11-16T00:00:00Z"):
+        sb2.pack_dir.parent.mkdir(parents=True, exist_ok=True)
+        _make_dir_link(staging2, TMP_ROOT / "t41-no-such-target")
+        code, _, err = _main(sb2)
+        assert code == 2, (code, err)
+        assert "符号链接" in err, err
+        assert not sb2.pack_dir.exists()
+    print("  T41 PASS：暂存路径被文件/链接占用时报 PackError（exit 2）且无副作用")
+
+
 TESTS = [
     ("T1", test_t1_private_outside_repo),
     ("T2", test_t2_pack_equals_private),
@@ -1768,6 +1843,8 @@ TESTS = [
     ("T37", test_t37_pack_dir_type_checked_before_writing),
     ("T38", test_t38_manifest_drive_letter_survives_normalization),
     ("T39", test_t39_manifest_header_is_validated_before_rows),
+    ("T40", test_t40_pack_dir_must_not_live_in_runs_dir),
+    ("T41", test_t41_staging_path_must_be_directory),
 ]
 
 

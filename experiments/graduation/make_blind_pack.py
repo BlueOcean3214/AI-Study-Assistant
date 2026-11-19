@@ -790,6 +790,29 @@ def ensure_path_layout(pack_dir: Path, private_dir: Path) -> None:
         raise PackError(f"路径冲突：{label}：{outer} / {inner}")
 
 
+def ensure_not_within_runs(target: Path, runs_dir: Path, label: str) -> None:
+    """目录不得与实验 run 目录互相包含。
+
+    正式实验结果（runs/<run>/results.jsonl）是只读证据：包目录若落在 runs/ 内，
+    --repack 归档旧包时会把 run 目录当成旧包内容搬进归档；私有目录若落在 runs/ 内，
+    mapping.csv 会写进被 .gitignore 的目录里，泄露与丢失都无人察觉。
+    """
+
+    target_real = Path(target).resolve()
+    runs_real = Path(runs_dir).resolve()
+    if target_real == runs_real:
+        raise PackError(f"{label} 不能就是实验 run 目录：{runs_real}")
+    for outer, inner, reason in (
+        (runs_real, target_real, f"{label} 位于实验 run 目录内"),
+        (target_real, runs_real, f"实验 run 目录位于{label}内"),
+    ):
+        try:
+            inner.relative_to(outer)
+        except ValueError:
+            continue
+        raise PackError(f"路径冲突：{reason}：{outer} / {inner}")
+
+
 # --------------------------------------------------------------------------
 # 输出
 # --------------------------------------------------------------------------
@@ -1026,7 +1049,10 @@ def build_items(seed: int, runs_dir: Path | None = None):
         raise PackError("校准 6 份与正式 84 份存在交集，必须重抽")
 
     s7_picked = select_s7empty(s7_rows, seed)
-    subj_all = [Pick(item, selection_hash(seed, DOMAIN_FORMAL, item.sample_id, item.group, item.repeat_index)) for item in subj_rows]
+    # C/D-subj 整批全取、不做抽样（同 B0）：selection_hash 留空。
+    # 这里曾经套用 DOMAIN_FORMAL 计算一份「正式批次抽样键」，但该批从未按抽签入选，
+    # mapping/selection_audit 里写出一个 formal 域的哈希会被读成「这是主实验抽样结果」。
+    subj_all = [Pick(item, "") for item in subj_rows]
 
     def make(phase, batch, picks, evaluate_e7):
         return [
@@ -1592,6 +1618,8 @@ def archive_previous_outputs(
     if staging.is_symlink():
         raise PackError(f"步骤 2/{staging} 是符号链接，拒绝写入，请人工确认后清理")
     if staging.exists():
+        if not staging.is_dir():
+            raise PackError(f"步骤 2/归档 staging {staging} 已存在且不是目录，请人工确认后清理")
         shutil.rmtree(staging)
     staging.mkdir()
     staging_real = staging.resolve(strict=True)
@@ -1785,6 +1813,10 @@ def run_pack(args) -> int:
     source_report = verify_snapshot(snapshot_before, manifest)
 
     ensure_path_layout(pack_dir, private_dir)
+    # 包目录与实验 run 目录必须互不包含：否则 --repack 归档旧包时会把正式 results.jsonl
+    # 一起搬走，或把可分发材料写进被 .gitignore 的 runs/ 里而无人发现。放在任何写盘之前判。
+    ensure_not_within_runs(pack_dir, runs_dir, "活动包目录")
+    ensure_not_within_runs(private_dir, runs_dir, "私有目录")
     gate_evidence = ensure_private_gate(private_dir)
     # 统一前置检查：三个私有文件与活动包目录都必须在写入任何文件之前判掉，
     # 不能只查 mapping.csv（mapping 被删而旧包还在时，旧包会被新私有文件配上）。
@@ -1912,7 +1944,12 @@ def run_pack(args) -> int:
 
     stamp = generated_utc.replace(":", "").replace("-", "")
     staging_dir = pack_dir.parent / f".{pack_dir.name}.staging-{stamp}"
+    if _is_link_like(staging_dir):
+        raise PackError(f"发布暂存路径是符号链接/联接，拒绝在此落地：{staging_dir}")
     if staging_dir.exists():
+        if not staging_dir.is_dir():
+            # 普通文件（或残留的错误产物）不能用 rmtree，直接报结构化错误而不是 traceback
+            raise PackError(f"发布暂存路径已存在且不是目录：{staging_dir}")
         shutil.rmtree(staging_dir)
     private_written = False
     try:

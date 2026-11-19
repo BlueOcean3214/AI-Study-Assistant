@@ -354,7 +354,7 @@ def verify_sample(sample, dump, db_path, config, rebuild):
         "m2": evidence_audit(
             sample, db_path, dump["memories"], seed_feedback_ids(db_path)
         ),
-        "m3": s7_checks(sample, dump["memories"]),
+        "m3": s7_checks(sample, dump["memories"], empty_check=empty_check),
         "m4": state_audit(sample, dump["memories"], injected),
     }
 
@@ -630,18 +630,39 @@ def pooled_scores(results, config):
     return result
 
 
-def s7_checks(sample, memories):
+def s7_checks(sample, memories, empty_check=None):
     """M3：无证据样本的「不编造」检查。
 
-    - S7-empty：|P|=0 记 1，否则 0；
+    - S7-empty：memories/distinct_keys/injected/pendings/events 五项全 0 记 1，否则 0；
     - S7：每条记忆的 content 必须以「初步观察：」开头且 strength ≤ 0.6。
+
+    empty_check 由 verify_sample() 第 7 步给出（含五零明细）。只判 len(memories)==0 会把
+    pending 缓冲区或事件表残留的空样本误判成通过，因此只要拿到了 empty_check 就以它为准；
+    不传时（例如单独调用本函数）退回「记录数为 0」的弱判据，并在 detail 里标注未核项。
     """
 
     sample_id = sample["sample_id"]
     live = active_memories(memories)
 
     if sample_id == EMPTY_SAMPLE:
-        ok = len(memories) == 0
+        detail = {
+            "all_rows": len(memories),
+            "active": len(live),
+            "distinct_keys": len(
+                {(item["memory_type"], item["subject_key"]) for item in memories}
+            ),
+        }
+
+        if empty_check is not None:
+            detail.update(empty_check.get("detail") or {})
+            ok = bool(empty_check.get("ok"))
+            source = "verify_sample.五零判定"
+        else:
+            ok = len(memories) == 0
+            source = "仅记录数（未核 pending/事件表）"
+
+        detail["criterion"] = source
+
         return {
             "kind": "empty",
             "applicable": True,
@@ -649,13 +670,7 @@ def s7_checks(sample, memories):
             "n": 0,
             "rows": [],
             "score": 1 if ok else 0,
-            "detail": {
-                "all_rows": len(memories),
-                "active": len(live),
-                "distinct_keys": len(
-                    {(item["memory_type"], item["subject_key"]) for item in memories}
-                ),
-            },
+            "detail": detail,
         }
 
     if sample_id == S7_SAMPLE:
@@ -982,17 +997,31 @@ def metric_status_checks(item):
             _status_check("M3", "无证据样本约束", STATUS_NA, False, m3["detail"]["reason"])
         )
     elif m3["ok"]:
+        if m3["kind"] == "empty":
+            criterion = m3["detail"].get("criterion", "")
+            empty_reason = "S7-empty 零记忆"
+            if criterion:
+                empty_reason += f"（判据：{criterion}）"
+        else:
+            empty_reason = "S7 全部带「初步观察：」前缀且 strength ≤ 0.6"
         checks.append(
-            _status_check("M3", "无证据样本约束", STATUS_PASS, True,
-                          "S7-empty 零记忆" if m3["kind"] == "empty" else "S7 全部带「初步观察：」前缀且 strength ≤ 0.6")
+            _status_check("M3", "无证据样本约束", STATUS_PASS, True, empty_reason)
         )
     else:
         if m3["kind"] == "empty":
             detail = m3["detail"]
+            counters = {
+                name: detail[name]
+                for name in ("memories", "distinct_keys", "injected", "pendings", "events")
+                if name in detail
+            }
             reason = (
-                "S7-empty 仍生成了记忆："
-                + "、".join(f"{name}={value}" for name, value in detail.items())
+                "S7-empty 空样本的五项（memories/distinct_keys/injected/pendings/events）"
+                "未全部为 0："
+                + "、".join(f"{name}={value}" for name, value in counters.items())
             )
+            if detail.get("events"):
+                reason += "（事件表残留表明空样本曾被历史数据污染）"
         else:
             bad = [row for row in m3["rows"] if not row["ok"]]
             reason = m3["detail"].get("reason") or (
@@ -1537,10 +1566,15 @@ def metric_rows(results, config, scan=None, summary=None):
 
         m3 = item["m3"]
         if m3["kind"] == "empty":
+            counters = "、".join(
+                f"{name}={m3['detail'][name]}"
+                for name in ("memories", "distinct_keys", "injected", "pendings", "events")
+                if name in m3["detail"]
+            )
             add(
                 scope, sample_id, "M3.s7empty_zero_memories", m3["score"],
                 m3["detail"]["active"], 0, "verdict",
-                f"全部行 {m3['detail']['all_rows']}；|P|=0 记 1",
+                f"{counters}；五项全 0 记 1（{m3['detail'].get('criterion', '')}）",
             )
         elif m3["kind"] == "s7":
             add(
@@ -1951,9 +1985,15 @@ def render_report(results, config, scan=None, summary=None):
         scope = "主实验" if _scope_of(item["sample_id"], config) == "main" else "补充"
 
         if m3["kind"] == "empty":
+            counters = "、".join(
+                f"{name}={m3['detail'][name]}"
+                for name in ("memories", "distinct_keys", "injected", "pendings", "events")
+                if name in m3["detail"]
+            )
             lines.append(
-                f"| {scope} | {item['sample_id']} | |P|=0 | {'通过（1）' if m3['ok'] else '失败（0）'} | "
-                f"全部记忆行 {m3['detail']['all_rows']} 条，active {m3['detail']['active']} 条 |"
+                f"| {scope} | {item['sample_id']} | |P|=0 五项 | "
+                f"{'通过（1）' if m3['ok'] else '失败（0）'} | "
+                f"{counters}（{m3['detail'].get('criterion', '')}） |"
             )
         elif m3["kind"] == "s7":
             for row in m3["rows"]:

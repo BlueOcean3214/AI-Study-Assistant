@@ -44,3 +44,6 @@ experiments/graduation/runs/
 
 # 盲评私有映射目录：blind_id 与样本身份的对应关系只能本地留存，绝不入库
 experiments/graduation/blind_private/
+
+# 盲评包发布暂存目录（make_blind_pack.py 写 .blind_pack.staging-<时间戳>，发布成功即改名为 blind_pack/）
+experiments/graduation/.blind_pack.staging-*/
