@@ -1,0 +1,20 @@
+{
+  "protocol_version": "v4.5",
+  "protocol_doc": "docs/GRADUATION-EXPERIMENT-DESIGN.md",
+  "blind_sampling_seed": 2026111301,
+  "algorithm_version": "sha256-domain-separated-selection-v1",
+  "selection_domains": {
+    "formal": "blind-main-selection",
+    "calibration": "blind-calibration-selection",
+    "supplementary_s7empty": "blind-s7empty-selection"
+  },
+  "selection_key_template": "sha256(\"{seed}|{domain}|{sample_id}|{group}|{repeat_index}\")",
+  "blind_id_format": "uuid4-lowercase-and-32-lowercase-hex (secrets/os.urandom only)",
+  "created_utc": "2026-11-13T07:35:00Z",
+  "frozen": true,
+  "notes": [
+    "This file holds ONLY sampling parameters. It must never contain sample identities, blind_ids, selected rows or any sampling result.",
+    "seed is frozen for the graduation thesis experiment; changing it invalidates every selection_audit.csv ever produced.",
+    "selection_domains are the pre-image prefixes of the SHA-256 selection key; they are part of the algorithm version."
+  ]
+}
