@@ -1576,14 +1576,79 @@ def mcnemar_exact(pairs):
 # ---------------------------------------------------------------------------
 
 
+RESULTS_FILE_NAME = "results.jsonl"
+
+
+def _path_parts(value):
+    """把 mapping 里的相对路径拆成组件；文件匹配只按组件逐段相等，不做字符串包含。"""
+
+    text = "" if value is None else str(value).strip()
+    if not text:
+        return []
+    parts = []
+    for chunk in re.split(r"[\\/]+", text):
+        chunk = chunk.strip()
+        if chunk in ("", "."):
+            continue
+        if chunk == "..":
+            raise StatsError("bad-mapping", f"mapping 的路径含上跳段 '..'：{text!r}")
+        parts.append(chunk)
+    return parts
+
+
+def _results_file_candidates(entries, meta):
+    """按 source_run_dir 的目录组件 + source_file 定位候选结果文件。"""
+
+    run_parts = _path_parts(meta.get("source_run_dir"))
+    file_name = str(meta.get("source_file") or "").strip() or RESULTS_FILE_NAME
+    hits = []
+    for entry in entries:
+        path = entry["path"]
+        if path.name != file_name:
+            continue
+        parents = list(path.parts[:-1])
+        if not run_parts or len(parents) < len(run_parts):
+            continue
+        if [part for part in parents[-len(run_parts):]] != run_parts:
+            continue
+        hits.append(entry)
+    return hits
+
+
 def load_results(paths, mapping):
-    """读 results.jsonl，按 mapping 的 source_result_row_sha256 建索引。"""
-    index = {}
-    file_hashes = {}
-    for path in paths:
-        path = Path(path)
-        text = _read_text(path, "results.jsonl")
-        file_hashes[str(path)] = sha256_bytes(text.encode("utf-8"))
+    """读 results.jsonl，并把 mapping 记录的源文件 SHA-256 与实际文件逐条核对。
+
+    匹配规则：mapping 的 source_run_dir 必须与结果文件的父目录逐段相等（不做字符串
+    包含判断），source_file 必须等于文件名；命中必须唯一。以下情况一律 fail-closed，
+    不产出任何统计：
+    - 结果文件缺失、重复传入同一文件（results-file-missing / results-file-duplicate）
+    - 同一 mapping 行命中多个候选文件（results-file-ambiguous）
+    - 文件实际 SHA-256 与 mapping 记录不一致或 mapping 记录格式非法
+      （results-file-hash-mismatch）
+    - 传入的结果文件没有被任何 mapping 行引用（results-file-unused）
+    - 行哈希找不到、跨文件重复、行字段与 mapping 不一致（results-mapping-mismatch）
+    """
+
+    entries = []
+    seen = set()
+    for raw in paths:
+        path = Path(raw)
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            raise StatsError("results-file-duplicate", f"重复传入同一结果文件：{path}")
+        seen.add(key)
+        if not path.is_file():
+            raise StatsError("results-file-missing", f"结果文件不存在或不是文件：{path}")
+        entries.append({"path": path, "digest": sha256_file(path), "rows": {}})
+    if not entries:
+        raise StatsError("results-file-missing", "没有传入任何 results.jsonl")
+
+    for entry in entries:
+        path = entry["path"]
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except OSError as error:
+            raise StatsError("bad-results", f"读取 {path} 失败：{error}") from error
         for lineno, line in enumerate(text.splitlines(), start=1):
             if not line.strip():
                 continue
@@ -1596,35 +1661,97 @@ def load_results(paths, mapping):
             if not isinstance(row, dict):
                 raise StatsError("bad-results", f"{path}:{lineno} 不是 JSON 对象")
             row_hash = row_sha256(row)
-            index[row_hash] = {"row": row, "file": str(path), "line": lineno}
-    # mapping 引用的每一行都必须能在 results 里找到（fail-closed）
-    problems = []
+            if row_hash in entry["rows"]:
+                raise StatsError(
+                    "bad-results",
+                    f"{path}:{lineno} 与第 {entry['rows'][row_hash]['line']} 行内容"
+                    f"完全相同（重复记录），无法唯一定位",
+                )
+            entry["rows"][row_hash] = {"row": row, "file": str(path), "line": lineno}
+
+    problems = {"hash": [], "ambiguous": [], "missing": [], "unused": [], "rows": []}
+    referenced = set()
+    index = {}
+    row_owner = {}
     for blind_id, meta in mapping.items():
-        key = meta["source_result_row_sha256"]
-        if key not in index:
-            problems.append(
-                f"mapping.csv blind_id={blind_id}：source_result_row_sha256={key} "
-                f"在给定的 results.jsonl 中找不到（文件 {meta['source_file']}）"
+        candidates = _results_file_candidates(entries, meta)
+        if not candidates:
+            problems["missing"].append(
+                f"mapping.csv blind_id={blind_id}：找不到 source_run_dir="
+                f"{meta.get('source_run_dir')!r} / source_file={meta.get('source_file')!r} "
+                f"对应的结果文件（给定 {len(entries)} 个文件）"
             )
             continue
-        hit = index[key]
+        if len(candidates) > 1:
+            problems["ambiguous"].append(
+                f"mapping.csv blind_id={blind_id}：匹配到 {len(candidates)} 个结果文件"
+                "（" + "、".join(str(entry["path"]) for entry in candidates) + "）"
+            )
+            continue
+        entry = candidates[0]
+        referenced.add(id(entry))
+        expected = str(meta.get("source_results_file_sha256") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            problems["hash"].append(
+                f"mapping.csv blind_id={blind_id}：source_results_file_sha256 不是 64 位"
+                f"十六进制（{meta.get('source_results_file_sha256')!r}）"
+            )
+            continue
+        if entry["digest"] != expected:
+            problems["hash"].append(
+                f"mapping.csv blind_id={blind_id}：源文件 {entry['path']} 的实际"
+                f" SHA-256={entry['digest']} 与 mapping 记录的 {expected} 不一致"
+            )
+            continue
+        key = meta["source_result_row_sha256"]
+        hit = entry["rows"].get(key)
+        if hit is None:
+            problems["rows"].append(
+                f"mapping.csv blind_id={blind_id}：source_result_row_sha256={key} "
+                f"在源文件 {entry['path']} 中找不到"
+            )
+            continue
+        owner = row_owner.get(key)
+        if owner is not None and owner is not entry:
+            problems["rows"].append(
+                f"mapping.csv blind_id={blind_id}：行哈希 {key} 同时出现在 "
+                f"{owner['path']} 与 {entry['path']}，无法唯一定位"
+            )
+            continue
+        row_owner[key] = entry
+        index[key] = {"row": hit["row"], "file": str(entry["path"]), "line": hit["line"]}
         row = hit["row"]
         for field in ("sample_id", "group"):
-            want = meta["sample_id" if field == "sample_id" else "group"]
+            want = meta[field]
             if row.get(field) != want:
-                problems.append(
+                problems["rows"].append(
                     f"mapping.csv blind_id={blind_id}：results 行 {field}="
                     f"{row.get(field)!r} 与 mapping 的 {want!r} 不一致"
                 )
         if meta["source_prompt_sha256"] and row.get("prompt_sha256") != meta["source_prompt_sha256"]:
-            problems.append(
+            problems["rows"].append(
                 f"mapping.csv blind_id={blind_id}：prompt_sha256 与 mapping 记录不一致"
             )
-        if hit["file"] != meta["source_file"] and meta["source_file"] not in hit["file"]:
-            pass  # 路径可来自不同根，不按字符串强比；哈希一致即可
-    if problems:
-        raise StatsError("results-mapping-mismatch",
-                         f"mapping 与 results 有 {len(problems)} 处不一致", problems)
+
+    for entry in entries:
+        if id(entry) not in referenced:
+            problems["unused"].append(
+                f"传入的结果文件没有被任何 mapping 行引用：{entry['path']}"
+            )
+
+    ordered = [
+        ("hash", "results-file-hash-mismatch"),
+        ("ambiguous", "results-file-ambiguous"),
+        ("missing", "results-file-missing"),
+        ("unused", "results-file-unused"),
+        ("rows", "results-mapping-mismatch"),
+    ]
+    flat = [item for kind, _ in ordered for item in problems[kind]]
+    if flat:
+        code = next(code for kind, code in ordered if problems[kind])
+        raise StatsError(code, f"results 与 mapping 核对有 {len(flat)} 处问题", flat)
+
+    file_hashes = {str(entry["path"]): entry["digest"] for entry in entries}
     return index, file_hashes
 
 
