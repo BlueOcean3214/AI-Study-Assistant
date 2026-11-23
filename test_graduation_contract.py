@@ -16,6 +16,7 @@
 不碰 blind_private/、不改冻结文档。所有文件都落在 tempfile 临时目录里。
 """
 
+import csv
 import hashlib
 import json
 import sys
@@ -897,6 +898,253 @@ def test_partial_record_legacy_still_warning(run_dir, api):
           and any("身份可识别 1 行" in note for note in report.notes), report.notes)
 
 # ---------------------------------------------------------------------------
+# 7.6 全流程预检：批次不可判定、计划逐字段同源、B0 legacy 目录规则（第五轮复审）
+#
+# 7.5 的七个场景都只调 check_results()，所以「目录名判不出批次」与「B0 目录名规则」
+# 这两条路径没被真正走过：前者对应任务一（batch 不能因为无从推断就冒充契约缺口），
+# 后者对应任务四（legacy WARNING 必须真的由 b0-* 目录触发）。
+# 这里全部改走 run_preflight()：跑真实 CLI 主流程，输入是真实 run_one() 记录。
+# ---------------------------------------------------------------------------
+
+PLAN_FIELD_AUDIT = ("plan_seq", "seed", "scheme", "algorithm_version")
+
+
+def _repo(root, dirname):
+    """临时仓库骨架：返回 (repo_root, runs_dir, run_dir)。"""
+
+    repo_root = Path(root) / "repo"
+    runs_dir = repo_root / "experiments" / "graduation" / "runs"
+    run_dir = runs_dir / dirname
+    run_dir.mkdir(parents=True)
+    return repo_root, runs_dir, run_dir
+
+
+def _write_manifest(repo_root, entries):
+    """按磁盘当前内容写清单；entries = [(batch, path, records)]。"""
+
+    repo_root = Path(repo_root)
+    manifest = repo_root / "docs" / "GRADUATION-EXPERIMENT-FILE-MANIFEST.csv"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["batch", "batch_desc", "relative_path", "file",
+                         "size_bytes", "sha256", "records"])
+        for batch, path, records in entries:
+            path = Path(path)
+            relative = path.resolve().relative_to(repo_root.resolve()).as_posix()
+            writer.writerow([batch, "合成数据（" + batch + "）", relative, path.name,
+                             path.stat().st_size,
+                             hashlib.sha256(path.read_bytes()).hexdigest(), records])
+    return manifest
+
+
+def _write_plan(run_dir, plan):
+    path = Path(run_dir) / plan_schedule.PLAN_NAME
+    path.write_text(json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8", newline="\n")
+    return path
+
+
+def _tamper_row(path, field, value, *, index=0):
+    """只改一行的某一個字段，其余字段（含 plan_sha256）保持原样。"""
+
+    rows = _rows_of(path)
+    rows[index][field] = value
+    Path(path).write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in rows), encoding="utf-8", newline="\n")
+    return rows[index]
+
+
+def _planned_case(root, *, tamper=None):
+    """一个计划齐备的运行目录：plan.json + 真实生产器记录 + 清单。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, "main-20261113T061051Z")
+    plan = _plan_for(rounds=5)          # §5.1 冻结轮数，strict 校验才不误报
+    api = _make_api(repo_root)
+    # 计划里的 5 个任务全部跑完：计划完成度才是 PASS，篡改用例才有基准
+    for repeat_index in range(5):
+        _produce(run_dir, api, repeat_index=repeat_index,
+                 plan_sha256=plan["plan_sha256"])
+    _write_plan(run_dir, plan)
+    results_path = run_dir / run_experiment.RESULTS_NAME
+    if tamper is not None:
+        _tamper_row(results_path, *tamper)
+    manifest = _write_manifest(repo_root, (
+        ("main", Path(run_dir) / plan_schedule.PLAN_NAME,
+         len(plan_schedule.plan_tasks(plan))),
+        ("main", results_path, len(_rows_of(results_path))),
+    ))
+    return repo_root, runs_dir, manifest, plan
+
+
+def _flow(repo_root, runs_dir, manifest):
+    return preflight_experiment_data.run_preflight(runs_dir, manifest, repo_root)
+
+
+def _field_fails(report, field):
+    return [item for item in _fails(report) if item.target.endswith(" · " + field)]
+
+
+def _findings(report, level, needle):
+    return [item for item in report.findings
+            if item.level == level and needle in item.target]
+
+
+def test_flow_unknown_batch(root):
+    """任务一：目录名判不出批次 + 记录里没有 batch —— 只报 UNKNOWN，不报 FAIL。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, "run-no-batch-marker")
+    record, path = _produce(run_dir, _make_api(repo_root), plan_sha256=None)
+    manifest = _write_manifest(repo_root, (("main", path, len(_rows_of(path))),))
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+
+    check("7.6-未知批次：全流程给出 UNKNOWN（覆盖｜批次无法判定）",
+          any(item.level == "UNKNOWN" and item.area == "覆盖"
+              and item.actual == "无法判定" for item in report.findings),
+          [item.render() for item in report.findings
+           if item.level == "UNKNOWN"])
+    check("7.6-未知批次：没有针对 batch 的 FAIL（无从推断 ≠ 契约缺口）",
+          not any(item.target.endswith(" · batch") for item in _fails(report)),
+          [item.target for item in _fails(report)])
+    check("7.6-未知批次：其余 7 个不可恢复字段仍然逐字段 FAIL",
+          len(_gap_fails(report)) == 7
+          and len(_fails(report)) == 7, [item.target for item in _fails(report)])
+    check("7.6-未知批次：batch 也不出现在缺口字段列表里",
+          _field_fails(report, "batch") == []
+          and not any(item.reason.startswith("1 行缺失") and "batch" in item.target
+                      for item in report.findings),
+          [item.target for item in report.findings if "batch" in item.target])
+    check("7.6-未知批次：行仍被当成真实执行记录（身份可识别 1 行）",
+          "身份可识别 1 行" in notes, notes)
+    check("7.6-未知批次：未把未知批次静默记成某个已知批次",
+          not any(note.startswith("批次 ") for note in report.notes), report.notes)
+
+
+def test_flow_plan_audit_control(root):
+    """任务三（对照组）：字段与计划一致时，同源审计不产生任何 FAIL。"""
+
+    repo_root, runs_dir, manifest, plan = _planned_case(root)
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    task = plan_schedule.plan_tasks(plan)[0]
+
+    check("7.6-对照组：plan_seq / seed / scheme / algorithm_version 均无 FAIL",
+          all(not _field_fails(report, name) for name in PLAN_FIELD_AUDIT),
+          [item.target for item in _fails(report)])
+    check("7.6-对照组：plan_sha256 同源不产生 FAIL",
+          not _field_fails(report, "plan_sha256"),
+          [item.target for item in _fails(report)])
+    check("7.6-对照组：计划完成度是 PASS（5 个任务全部命中）",
+          _findings(report, "PASS", "计划完成度") != []
+          and not _findings(report, "FAIL", "计划完成度"),
+          [item.render() for item in report.findings if "计划完成度" in item.target])
+    check("7.6-对照组：报告写明做了计划同源逐字段核对",
+          "计划同源核对" in notes and all(name in notes for name in PLAN_FIELD_AUDIT),
+          notes)
+    check("7.6-对照组：7 条契约缺口不因同源通过而消失",
+          len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
+    check("7.6-对照组：计划任务的 plan_seq 就是 0（篡改用例的基准）",
+          task["plan_seq"] == 0, task)
+
+
+def _flow_plan_tamper(root, *, label, field, value, reason_needle):
+    """任务三：单个字段被改成合法值，其余字段（含 plan_sha256）保持正确。"""
+
+    repo_root, runs_dir, manifest, plan = _planned_case(root, tamper=(field, value))
+    report = _flow(repo_root, runs_dir, manifest)
+    task = plan_schedule.plan_tasks(plan)[0]
+    hits = _field_fails(report, field)
+
+    check("7.6-" + label + "：被识别（同源审计独立 FAIL）",
+          len(hits) == 1, [item.target for item in _fails(report)])
+    check("7.6-" + label + "：FAIL 落在 " + field + " 字段上",
+          hits and hits[0].target.endswith(" · " + field)
+          and reason_needle in hits[0].reason,
+          [(item.target, item.reason) for item in hits])
+    expected_value = task["plan_seq"] if field == "plan_seq" else plan[field]
+    check("7.6-" + label + "：FAIL 写明实际值与计划预期值",
+          hits and hits[0].actual == repr(value)
+          and str(expected_value) in hits[0].expected,
+          [(item.actual, item.expected) for item in hits])
+    check("7.6-" + label + "：plan_sha256 正确，不跟着误报",
+          not _field_fails(report, "plan_sha256"),
+          [item.target for item in _fails(report)])
+    check("7.6-" + label + "：其他身份字段正确，5 行仍被识别",
+          "身份可识别 5 行" in "\n".join(report.notes), report.notes)
+    check("7.6-" + label + "：7 条契约缺口仍然逐字段 FAIL",
+          len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
+
+
+def test_flow_plan_seq_tamper(root):
+    """只改 plan_seq：类型合法、且在 0..N-1 范围内 —— 只有按身份比对才抓得住。"""
+
+    _flow_plan_tamper(root, label="plan_seq", field="plan_seq", value=2,
+                      reason_needle="执行顺序无法审计")
+
+
+def test_flow_seed_tamper(root):
+    _flow_plan_tamper(root, label="seed", field="seed", value=SEED + 1,
+                      reason_needle="不同源")
+
+
+def test_flow_scheme_tamper(root):
+    _flow_plan_tamper(root, label="scheme", field="scheme", value="other_scheme_v9",
+                      reason_needle="不同源")
+
+
+def test_flow_algorithm_version_tamper(root):
+    _flow_plan_tamper(root, label="algorithm_version", field="algorithm_version",
+                      value="sha256-block-order-v2", reason_needle="不同源")
+
+
+def test_flow_b0_legacy(root):
+    """任务四：真实 b0-* 目录 + 无 plan.json —— legacy 例外只报 WARNING。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, "b0-remainder-20261113T013105Z")
+    record, path = _produce(run_dir, _make_api(repo_root), plan_sha256=None)
+    # 清单必须非空（空清单本身就是 FAIL），但绝不能覆盖 B0 文件本身：
+    # 只放一个与本次核验无关的说明文件，用来证明「未纳入清单」对 legacy 是 WARNING。
+    note = repo_root / "docs" / "synthetic-note.txt"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("合成清单占位文件（不属于任何运行目录）\n", encoding="utf-8")
+    manifest = _write_manifest(repo_root, (("docs", note, None),))
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+
+    check("7.6-B0：目录名按 b0- 规则识别为 legacy",
+          preflight_experiment_data.is_b0_legacy(run_dir)
+          and preflight_experiment_data.expected_batch_for(run_dir, path) == "b0-legacy",
+          [preflight_experiment_data.expected_batch_for(run_dir, path)])
+    check("7.6-B0：B0 文件未纳入清单只报 WARNING，不报 FAIL",
+          _findings(report, "WARNING", "results.jsonl") != []
+          and not _findings(report, "FAIL", "清单覆盖")
+          and not any(item.area == "清单覆盖" and item.level == "FAIL"
+                      for item in report.findings),
+          [item.render() for item in report.findings if item.area == "清单覆盖"])
+    check("7.6-B0：无 plan.json 只报 WARNING（缺计划不是 FAIL）",
+          [item for item in report.findings
+           if item.area == "计划" and item.level == "WARNING"] != []
+          and not [item for item in report.findings
+                   if item.area == "计划" and item.level == "FAIL"],
+          [item.render() for item in report.findings if item.area == "计划"])
+    check("7.6-B0：plan_sha256 缺失仅按 legacy 规则报 WARNING",
+          len([item for item in report.findings
+               if item.level == "WARNING" and "plan_sha256" in item.target]) == 1
+          and not _field_fails(report, "plan_sha256"),
+          [item.render() for item in report.findings if "plan_sha256" in item.target])
+    check("7.6-B0：7 个契约缺口仍保留 FAIL",
+          len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
+    check("7.6-B0：legacy 目录没有 manifest 记录数可核（不误判清单 FAIL）",
+          not any(item.area == "清单" and item.level == "FAIL"
+                  for item in report.findings),
+          [item.render() for item in report.findings if item.area == "清单"])
+    check("7.6-B0：legacy 行仍被计入执行证据",
+          "身份可识别 1 行" in notes, notes)
+
+
+# ---------------------------------------------------------------------------
 # 8. 消费者二：打包器
 # ---------------------------------------------------------------------------
 
@@ -1080,6 +1328,18 @@ def _run_all():
             ("case-plan-legacy", test_partial_record_legacy_still_warning),
         ):
             runner(root / name / "run", _make_api(root / name))
+
+        # 7.6：全流程预检（批次不可判定 / 计划逐字段同源 / B0 legacy 目录规则）
+        for name, runner in (
+            ("case-flow-unknown", test_flow_unknown_batch),
+            ("case-flow-plan-ok", test_flow_plan_audit_control),
+            ("case-flow-plan-seq", test_flow_plan_seq_tamper),
+            ("case-flow-seed", test_flow_seed_tamper),
+            ("case-flow-scheme", test_flow_scheme_tamper),
+            ("case-flow-algorithm", test_flow_algorithm_version_tamper),
+            ("case-flow-b0", test_flow_b0_legacy),
+        ):
+            runner(root / name)
 
         # 8：打包器
         test_packer(path)

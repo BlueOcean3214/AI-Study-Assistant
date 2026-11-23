@@ -343,14 +343,20 @@ def check_results(report, results_path, plan, expected_batch=None):
     对生产器行，「执行证据」与「§7.1 契约完整性」是两个独立维度：
 
     - 执行证据（这一行是否真的跑过）由身份四元组、批次归属、是否属于
-      plan.json、plan_sha256 是否同源来证明；只要这些字段能导出来就照常核对，
-      与 7 个不可恢复字段缺不缺无关。
+      plan.json、以及结果行与计划任务是否同源来证明；只要这些字段能导出来就照常
+      核对，与 7 个不可恢复字段缺不缺无关。同源核对按身份定位计划任务后逐字段比对
+      plan_seq / seed / scheme / algorithm_version / plan_sha256（设计 §5.3）。
     - 契约完整性由 29 个字段是否齐备来判定，缺口逐字段 FAIL（按字段聚合，
       不逐行刷屏），并单独计数。
 
     因此结果行即使 `is_complete()` 为假也**不会**被整体跳过：缺口照报，
     身份照进集合比较与计划覆盖统计。反过来也不允许用「部分成功」换任何
     §7.1 合规 PASS。
+
+    批次（batch）另有一条边界：调用方给出 expected_batch 时按目录可信规则逐条比对；
+    目录名与记录都判不出批次（expected_batch=None）时，batch 只是「无法判定」，
+    不是生产器的契约缺口 —— 此时不报 FAIL、不猜批次，由 run_preflight 统一报
+    UNKNOWN；其余字段的失败照常保留。
     """
 
     area = "结果记录"
@@ -360,6 +366,25 @@ def check_results(report, results_path, plan, expected_batch=None):
     seen = {}
     plan_ids = plan_schedule.plan_identities(plan) if plan else None
     plan_sha = plan.get("plan_sha256") if plan else None
+    # 计划任务索引：身份四元组 → 计划任务。设计 §5.3 要求 plan_seq 是计划的全局连续
+    # 序号，seed/scheme/algorithm_version/plan_sha256 用来证明结果行与计划同源；这些
+    # 比对必须按身份找到「那一条任务」再比，不能只看 plan_seq 是不是 int、在不在范围里。
+    plan_task_by_identity = {}
+    plan_seed = plan.get("seed") if plan is not None else None
+    plan_scheme = plan.get("scheme") if plan is not None else None
+    plan_algorithm_version = plan.get("algorithm_version") if plan is not None else None
+    if plan is not None and isinstance(plan.get("blocks"), list):
+        plan_experiment_id = plan.get("experiment_id")
+        for plan_block in plan["blocks"]:
+            if not isinstance(plan_block, dict):
+                continue
+            for plan_task in plan_block.get("tasks") or ():
+                if not isinstance(plan_task, dict):
+                    continue
+                plan_task_by_identity[
+                    (plan_experiment_id, plan_block.get("sample_id"),
+                     plan_task.get("group"), plan_task.get("repeat_index"))
+                ] = plan_task
     legacy_plan_warned = False
     invalid_rows = 0
     producer_rows = 0
@@ -424,8 +449,14 @@ def check_results(report, results_path, plan, expected_batch=None):
             normalized = result_schema.normalize_record(
                 row, batch=expected_batch, run_dir=results_path.parent)
             failures = normalized.failures()
-            failed_fields = set(failures)
-            for name in sorted(failures):
+            # expected_batch=None 表示目录名与记录都给不出批次（批次本身不可判定）。
+            # normalize_record 此时只能把 batch 记成「调用方未给出」，但这不是生产器的
+            # 契约缺口：批次归属由 run_preflight 的目录规则判定，判定不出来时已经单独
+            # 报 UNKNOWN。这里既不报 FAIL，也不把未知批次当成某个已知批次。
+            batch_undecidable = expected_batch is None
+            undecidable = {"batch"} if batch_undecidable else set()
+            failed_fields = set(failures) - undecidable
+            for name in sorted(failed_fields):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
                            "可确定性导出", failures[name],
                            "生产器记录该字段无法按冻结设计导出", CONTRACT_BASIS)
@@ -537,6 +568,31 @@ def check_results(report, results_path, plan, expected_batch=None):
                 report.add("FAIL", area, f"{label}:{lineno} · 身份",
                            "属于 plan.json 的任务", repr(identity),
                            "结果行不在计划中", basis)
+            # --- 计划同源：按身份定位计划任务后逐字段比对 ---
+            # 只比「记录真的给了值」的字段：取不到的字段已按 §7.1 缺口 FAIL，不重复报。
+            # 每个字段独立 FAIL，7 个不可恢复字段的缺口不能吞掉其中任何一条。
+            task = plan_task_by_identity.get(identity) if identity_ok else None
+            if task is not None:
+                expected_seq = task.get("plan_seq")
+                actual_seq = row.get("plan_seq")
+                if _is_int(actual_seq) and actual_seq != expected_seq:
+                    report.add("FAIL", area, f"{label}:{lineno} · plan_seq",
+                               f"plan.json 中该身份的 plan_seq={expected_seq!r}"
+                               f"（计划全局连续序号）", repr(actual_seq),
+                               "结果行的执行序号与计划任务不一致，执行顺序无法审计", basis)
+                for name, expected_value in (
+                    ("seed", plan_seed),
+                    ("scheme", plan_scheme),
+                    ("algorithm_version", plan_algorithm_version),
+                ):
+                    actual_value = row.get(name)
+                    if actual_value is None:
+                        continue
+                    if actual_value != expected_value:
+                        report.add("FAIL", area, f"{label}:{lineno} · {name}",
+                                   repr(expected_value), repr(actual_value),
+                                   f"结果行的 {name} 与同目录 plan.json 不一致（不同源）",
+                                   basis)
         else:
             _warn_legacy_plan(plan_sha_value)
 
@@ -565,6 +621,11 @@ def check_results(report, results_path, plan, expected_batch=None):
             f"{label}：{producer_rows} 行来自 run_experiment.py（生产器 schema），"
             f"经 result_schema 标准化为 §7.1 视图；{derived_rows} 行完整导出，"
             f"{gap_rows} 行存在无法恢复的字段")
+        if plan is not None:
+            report.notes.append(
+                f"{label}：计划同源核对 —— 按身份定位计划任务后逐字段比对 plan_seq / "
+                f"seed / scheme / algorithm_version / plan_sha256；只有记录真的给出了值"
+                f"才比较，取不到的字段仍按 §7.1 缺口 FAIL")
         report.notes.append(
             f"{label}：标准化覆盖 {len(result_schema.DIRECT_FIELDS)} 个直供字段、"
             f"{len(result_schema.DERIVED_FIELDS)} 个可确定性派生字段；"

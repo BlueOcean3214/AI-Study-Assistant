@@ -1,7 +1,7 @@
-# DSBot 记忆实验 · 生产者—消费者字段契约报告（PR #26 第四轮）
+# DSBot 记忆实验 · 生产者—消费者字段契约报告（PR #26 第五轮）
 
 - 分支：`feat/graduation-preflight-integrity`
-- 基线提交：`c1d717f2603a627bb80331bf42a124272eb8000d`（第三轮交付，本轮在其上修复并追加测试）
+- 基线提交：`317737d4e6d8485637ae35c9c28942d6e572d6bf`（第四轮交付，第五轮在其上修复并追加测试）
 - 冻结口径：`docs/GRADUATION-EXPERIMENT-DESIGN.md` v4.5（本报告未修改该文件）
 - 取证范围：只读源码与合成数据。未读取或修改真实 `runs/`、`feedback.db`、`blind_private/`，未生成盲评包，未执行真实 `--repack`。
 - 运行环境：本机 PowerShell + `F:\somethingProject\dsbot\.venv\Scripts\python.exe`，非 CI。
@@ -13,7 +13,8 @@
 3. 统计器的 `condition` 比较已改为"由源记录 `group` 派生"，与打包器 `SourceRow.condition = self.group` 同口径；mapping 与源记录任一侧被篡改都会报 `results-mapping-mismatch`。
 4. 预检对生产器记录走标准化路径：可派生字段照常核验，7 个不可恢复字段逐字段 FAIL（不降级为 WARNING），设计原生记录仍走原严格路径（回归用例证明未放宽）。
 5. 第三轮复审指出的阻断问题已修：预检不再因「这一行凑不齐 29 字段」就整行跳过。**执行证据**（身份四元组、批次归属、是否属于 plan.json、plan_sha256 是否同源）与 **§7.1 契约完整性**（29 字段是否齐备）现在是两个独立维度：缺口照报 FAIL，执行证据照常核验，报告里分开计数（第五节）。
-6. 新增生产者—消费者契约测试 27 个用例、265 项断言：真实跑 `run_one()` → 真实 `append_jsonl()` 落盘 → 依次过预检、打包器、统计器。7 套测试全绿（详见第七、八节）。
+6. 新增生产者—消费者契约测试 34 个用例、308 项断言：真实跑 `run_one()` → 真实 `append_jsonl()` 落盘 → 依次过预检、打包器、统计器。7 套测试全绿（详见第八、九节）。
+7. 第四轮复审的两处遗留已在第五轮修掉：**批次不可判定**不再冒充契约缺口（只报 UNKNOWN，其余字段失败照常保留）；**结果行与计划文件的逐字段同源审计**补齐 `plan_seq`/`seed`/`scheme`/`algorithm_version`，其中 `plan_seq` 必须按实验身份定位到计划任务再比 —— 只查「是不是整数 / 在不在范围内 / 连不连续」抓不到那类篡改。B0 legacy 的 WARNING 现在由真实 `b0-*` 目录走完整流程验证（第六节）。
 
 本轮没有让预检报告"变绿"：真实数据的预检结论仍是 FAIL，因为生产器确实没有记录那 7 个字段。本轮的产出是"能把这件事准确查出来、并且证明查得对"。
 
@@ -163,19 +164,82 @@ A 的 notes 原文（节选）：
 ```
 
 这张表正好回答复审的两个担心：7 个缺口确实还在 FAIL（第 4 列恒为 7），而真实跑过的行也确实被认出来了（身份列表非空、计划完成度 PASS、同源被单独判定）。
-## 六、代码修改清单
+
+## 六、批次边界与计划同源审计（第五轮修复）
+
+### 6.1 批次不可判定不是契约缺口
+
+第四轮把「执行证据」与「契约完整性」分开后，`batch` 落进了一个尴尬位置：它既是可派生字段（目录名或记录提供），又会在目录名判不出批次时被标准化层记成「派生失败」。`check_results()` 随后按 `failures()` 提前报了一条 `… · batch` 的 FAIL —— 而实际上生产器记录里**根本没有** `batch` 字段，目录名也不含批次前缀时，谁都无法给出这个值。这等于把「无从推断」当成「记录缺字段」，属于假 FAIL。
+
+修复（`preflight_experiment_data.check_results`）：
+
+- `batch_undecidable = expected_batch is None`；此时 `undecidable = {"batch"}`，逐字段 FAIL 用 `set(failures) - undecidable` 减去它；
+- `normalized.missing()` 的聚合循环保持 `if name in failures: continue`，所以 `batch` 不会混进「缺口字段」列表；
+- 关键点：**不是**把未知批次当成某个已知批次，也不是静默吞掉 —— 批次判定仍由 `run_preflight()` 统一报 `UNKNOWN（覆盖｜目录名｜可判定的批次｜无法判定）`，并且 notes 里不会出现「批次 X：N 条记录」这类假归属；
+- 目录名能判定批次时（`expected_batch != None`），批次照旧逐条比对，覆盖检查照旧执行；
+- 其他字段的失败一条都不抑制 —— 测试里 7 个不可恢复字段仍逐字段 FAIL。
+
+新增全流程用例 `test_flow_unknown_batch`：临时 `runs/` 下建一个不匹配任何 `BATCH_PREFIXES` 的目录，用真实 `run_one()` 产出记录（记录里没有 batch），经 `run_preflight()` 完整跑一遍，断言 UNKNOWN 存在、无 `· batch` FAIL、7 个缺口 FAIL 仍在、没有把未知批次记成已知批次。
+
+### 6.2 plan_seq 必须按身份比，不能只查形态
+
+冻结设计 §5.3 里 `plan_seq` 是计划中的**全局连续序号**，用于顺序审计；`seed`/`scheme`/`algorithm_version`/`plan_sha256` 用于核对结果行与计划文件是否同源。第四轮只核了 `plan_sha256`，其余四个字段只在 `check_plan()` 里核计划自身 —— 结果行的这四个值其实没人看。
+
+修复：`check_results()` 在拿到 plan 后先建索引
+
+```text
+plan_task_by_identity[(plan.experiment_id, block.sample_id, task.group, task.repeat_index)] = task
+```
+
+然后按每条结果行的身份取任务：
+
+| 字段 | 预期值来源 | 不一致时的判定 |
+| --- | --- | --- |
+| `plan_seq` | 该身份对应任务的 `plan_seq`（不是「是不是整数」「在不在 0..N−1」「连不连续」） | FAIL `… · plan_seq`，理由「结果行的执行序号与计划任务不一致，执行顺序无法审计」 |
+| `seed` | `plan["seed"]` | FAIL `… · seed`，理由「不同源」 |
+| `scheme` | `plan["scheme"]` | FAIL `… · scheme`，理由「不同源」 |
+| `algorithm_version` | `plan["algorithm_version"]` | FAIL `… · algorithm_version`，理由「不同源」 |
+| `plan_sha256` | `plan["plan_sha256"]` | 沿用第四轮规则：null 与不一致各自独立 FAIL |
+
+两条边界：记录**没给**这个字段（值为 None）时不重复报「不一致」——缺口已经由 §7.1 完整性那一路 FAIL 了；plan.json 不存在时整套同源审计不执行（legacy 只走 WARNING）。
+
+### 6.3 负向测试：四种篡改各一条，外加对照组
+
+每种篡改只改一个字段，其余字段（含 `plan_sha256`）保持正确，且都走 `run_preflight()` 全流程（计划 5 个任务全部真实跑完，计划完成度是 PASS，篡改只落在一行上）：
+
+| 用例 | 篡改 | 期望 |
+| --- | --- | --- |
+| `test_flow_plan_audit_control` | 无 | 四个字段 0 FAIL、plan_sha256 0 FAIL、计划完成度 PASS、7 条缺口仍在 |
+| `test_flow_plan_seq_tamper` | `plan_seq: 0 → 2`（整数、且在 0..4 范围内） | 1 条 `· plan_seq` FAIL，写明实际 2 / 预期 0 |
+| `test_flow_seed_tamper` | `seed: 20261113 → 20261114` | 1 条 `· seed` FAIL |
+| `test_flow_scheme_tamper` | `scheme → other_scheme_v9` | 1 条 `· scheme` FAIL |
+| `test_flow_algorithm_version_tamper` | `algorithm_version → sha256-block-order-v2` | 1 条 `· algorithm_version` FAIL |
+
+`plan_seq` 那条特意用「合法整数、合法范围」的值：如果实现只检查类型/范围/连续性，这个篡改会漏过去。
+
+### 6.4 B0 legacy 改用真实 `b0-*` 目录
+
+第四轮的 `test_partial_record_legacy_still_warning` 用的是 `case-plan-legacy/run`，目录名根本不触发 `is_b0_legacy()`，所以「legacy 例外」其实没被验证。第五轮换成真实目录名 `b0-remainder-20261113T013105Z`，并走完整流程（`test_flow_b0_legacy`）：
+
+- 目录名按 `b0-` 规则识别为 legacy，`expected_batch_for()` 返回 `b0-legacy`；
+- 没有 plan.json → 「计划」区域只有 1 条 WARNING，不是 FAIL；
+- B0 文件未纳入清单 → 「清单覆盖」只有 WARNING（清单里另放一个无关说明文件，保证清单非空），不做清单哈希核对；
+- `plan_sha256` 缺失只按 legacy 规则报 1 条 WARNING，没有 FAIL；
+- 7 个契约缺口仍保留 FAIL，行仍计入执行证据。
+
+## 七、代码修改清单
 
 | 文件 | 变更 | 要点 |
 | --- | --- | --- |
 | `experiments/graduation/result_schema.py` | 新增（825 行） | §7.1 标准化层：契约表、derive_condition、parse_prompt_text/messages_sha256/read_prompt_messages、normalize_record/Normalized。stdlib only，不 import 产品代码 |
-| `experiments/graduation/preflight_experiment_data.py` | 第三轮 +92 / −7，第四轮 +74 / −18 | 引入标准化层（`:55`）；`CONTRACT_BASIS`；`check_results` 生产器分支：标准化 → 派生失败逐行 FAIL → 缺口按字段聚合 FAIL → **不再整行跳过**（第四轮删掉 `continue`，改走 `normalized.view()`）→ 视图参与原有类型/批次/身份/重复/计划成员/同源校验；`null_ok`（设计值就是 null 字段不算缺口）；`failed_fields` 避免与按字段缺口重复报；`plan_sha256` 在 plan.json 存在时 null 与不一致各自 FAIL（`:523-541`）；`result_rows`/`identified_rows`/`derived_rows`/`gap_rows`/`gap_fields` 分开计数并写进 notes（`:556-587`）；`_warn_legacy_plan()` 只给无 plan.json 的 legacy 用 |
+| `experiments/graduation/preflight_experiment_data.py` | 第三轮 +92 / −7，第四轮 +74 / −18，第五轮 +69 / −4 | 引入标准化层（`:55`）；`CONTRACT_BASIS`；`check_results` 生产器分支：标准化 → 派生失败逐行 FAIL → 缺口按字段聚合 FAIL → **不再整行跳过**（第四轮删掉 `continue`，改走 `normalized.view()`）→ 视图参与原有类型/批次/身份/重复/计划成员/同源校验；`null_ok`（设计值就是 null 字段不算缺口）；`failed_fields` 避免与按字段缺口重复报；`plan_sha256` 在 plan.json 存在时 null 与不一致各自 FAIL（`:523-541`）；`result_rows`/`identified_rows`/`derived_rows`/`gap_rows`/`gap_fields` 分开计数并写进 notes（`:556-587`）；第五轮：`expected_batch is None` 时把 `batch` 从逐字段 FAIL 集合里减掉（只留 UNKNOWN，既不猜批次也不抑制其他字段）；新增 `plan_task_by_identity` 索引 + `plan_seq`/`seed`/`scheme`/`algorithm_version` 按身份逐字段同源审计；`_warn_legacy_plan()` 只给无 plan.json 的 legacy 用 |
 | `experiments/graduation/analyze_stats.py` | +31 / −1 | 引入 result_schema（`:64`）；`MAPPING_IDENTITY_FIELDS` 去掉 condition 并加注释（`:1624-1634`）；`_compare_mapping_identity` 增加 condition 归属判定（`:1692-1706`） |
 | `test_graduation_stats.py` | +5 / −2 | 合成源行夹具的 group 改为与 condition 相等（真实记录 group 就是 A/B/C/D/C-subj/D-subj/B0）。原夹具 group="G"+... 与打包器 condition=group 冲突，是 STATS EXIT 2 的真因 |
-| `test_graduation_contract.py` | 第三轮新增（905 行），第四轮 +220 行 | 生产者—消费者契约测试，27 个用例 / 265 项断言；第四轮新增第 7.5 节七个「生产器记录 × plan.json 联合核验」场景 |
+| `test_graduation_contract.py` | 第三轮新增（905 行），第四轮 +220 行，第五轮 +260 行 | 生产者—消费者契约测试，34 个用例 / 308 项断言；第四轮新增第 7.5 节七个「生产器记录 × plan.json 联合核验」场景；第五轮新增第 7.6 节七个走 `run_preflight()` 全流程的场景（批次不可判定、四种字段篡改、对照组、真实 `b0-*` legacy） |
 
 未改动：`run_experiment.py`（生产器）、`make_blind_pack.py`（打包器）、`docs/GRADUATION-EXPERIMENT-DESIGN.md`（冻结规范）。
 
-## 七、生产者—消费者契约测试（`test_graduation_contract.py`）
+## 八、生产者—消费者契约测试（`test_graduation_contract.py`）
 
 链路（全部合成数据、临时目录，不触真实数据库/runs/盲评目录）：
 
@@ -186,7 +250,7 @@ A 的 notes 原文（节选）：
 5. 过 `make_blind_pack.read_rows()`（`_validate_row_shape` + `SourceRow.condition`）。
 6. 过 `analyze_stats.load_results()` 的 mapping 核对。
 
-用例（27 个）：
+用例（34 个）：
 
 - 契约表：test_contract_table（29 字段、顺序、12/10/7 分类不重不漏、每字段都有依据/来源/规则）
 - 生产器记录形状：test_producer_record_shape（不含 17 个 §7.1 专属字段、含 final_output/token_usage/raw_output/prompt_ref/elapsed_seconds/success/corrections_used、非设计原生行、落盘后同一份记录）
@@ -203,13 +267,21 @@ A 的 notes 原文（节选）：
   - test_partial_record_duplicate：同一身份两条真实记录 → 重复 FAIL（7+1=8 条），身份只计 1 个，两条都被计数；
   - test_partial_record_batch_misattributed：把 S2 记录放进 suppl-subj 批次 → 生产器行照常带目录推断批次、不产生假 FAIL，但覆盖检查报 FAIL，与 7 条缺口互不屏蔽；
   - test_partial_record_legacy_still_warning：无 plan.json 的 B0 legacy → 只有 1 条 WARNING，仍只 7 条缺口 FAIL，不做计划完成度判定，行仍计入执行证据。
+- 预检全流程（第五轮，第 7.6 节，七个场景 / 43 项断言）：
+  - test_flow_unknown_batch：临时 `runs/` 下建不匹配任何 `BATCH_PREFIXES` 的目录，真实 `run_one()` 记录不带 batch → 只有 1 条 UNKNOWN（覆盖项，「可判定的批次 = 无法判定」），**没有** `· batch` 的 FAIL，7 个契约缺口 FAIL 仍在，notes 写「身份可识别 1 行」而不写「批次 X：N 条」；
+  - test_flow_plan_audit_control：计划 5 个任务全部真实跑完 + 同源 plan.json → 四个字段 0 FAIL、plan_sha256 0 FAIL、计划完成度 PASS、7 条缺口仍在；
+  - test_flow_plan_seq_tamper：只把第 0 行 `plan_seq` 改成 2（合法整数、仍在 0..4 内）→ 1 条 `… · plan_seq` FAIL，写明实际 2 / 预期 0，理由「执行顺序无法审计」；
+  - test_flow_seed_tamper：只改 `seed` → 1 条 `… · seed` FAIL「不同源」；
+  - test_flow_scheme_tamper：只改 `scheme` → 1 条 `… · scheme` FAIL「不同源」；
+  - test_flow_algorithm_version_tamper：只改 `algorithm_version` → 1 条 `… · algorithm_version` FAIL「不同源」；四种篡改下 `plan_sha256` 都不跟着误报，其余 4 行照常通过；
+  - test_flow_b0_legacy：真实目录 `b0-remainder-20261113T013105Z`、无 plan.json、清单里只放无关说明文件 → 目录按 `b0-` 规则识别为 legacy，清单覆盖只 WARNING、计划缺失只 WARNING、`plan_sha256` 恰 1 条 WARNING 且无 FAIL，7 个缺口仍 FAIL，行仍计入执行证据。
 - 打包器：test_packer（读得到、SourceRow.condition == group、行哈希与统计器一致、文件哈希 = 文件字节 SHA-256）
 - 统计器：test_stats_roundtrip（1 mapping ↔ 1 行、命中第 1 行、内容一致、文件哈希记录、cost_metrics 可用）+ test_stats_condition_tamper、test_stats_source_group_tamper、test_stats_source_condition_conflict、test_stats_group_missing、test_stats_mapping_condition_empty
 - 三消费者口径一致：test_consumers_agree（身份四元组、condition 归属、prompt 哈希三处判定同源）
 
-结果：`0 FAILED / 265 PASSED`，退出码 0。
+结果：`0 FAILED / 308 PASSED`，退出码 0。
 
-## 八、测试结果（本机，非 CI）
+## 九、测试结果（本机，非 CI）
 
 | 测试 | 结果 |
 | --- | --- |
@@ -219,15 +291,15 @@ A 的 notes 原文（节选）：
 | `test_graduation_rating_materials.py` | 59 通过 / 0 失败，退出码 0 |
 | `test_graduation_toolchain_e2e.py` | 8/8 PASS，退出码 0 |
 | `test_graduation_experiment_runner.py` | 205 PASSED / 0 FAILED，退出码 0 |
-| `test_graduation_contract.py`（第三轮新增、第四轮扩充） | 265 PASSED / 0 FAILED，退出码 0 |
+| `test_graduation_contract.py`（第三轮新增，第四、五轮扩充） | 308 PASSED / 0 FAILED，退出码 0 |
 
-合计 969 项断言全部通过（第三轮 936 + 第四轮新增 33 项：七个联合核验场景与两处断言修正）。运行前后 `feedback.db` 指纹不变：058368B60D72D649A11B82B4D35474069899C42FAF4759D0168F75C1EADBD725（114688 字节）；`%TEMP%` 无新增 grad_* 残留。
+合计 1012 项断言全部通过（第三轮 936 + 第四轮新增 33 项 + 第五轮新增 43 项：第 7.6 节七个全流程场景）。以上全部为本机运行，非 CI。运行前后 `feedback.db` 指纹不变：058368B60D72D649A11B82B4D35474069899C42FAF4759D0168F75C1EADBD725（114688 字节）；`%TEMP%` 无新增 grad_* 残留。
 
 复现：`cd F:\somethingProject\dsbot-preflight`；`$env:PYTHONIOENCODING="utf-8"`；`& "F:\somethingProject\dsbot\.venv\Scripts\python.exe" test_graduation_contract.py`。
 
-第五节的合成演示用的是临时目录里的脚本（真实 `run_one()` + 合成 plan.json），演示结束后脚本与目录一并删除；`%TEMP%` 仍是 16 个 11-16～11-22 的历史 `grad_*` 目录，数量与取证开始时相同，没有新增残留。
+第五、六两节的合成演示与全流程用例用的是临时目录里的真实 `run_one()` 记录 + 合成 plan.json / 清单（直接调用 `run_preflight()`，不写任何真实目录），演示结束后脚本与目录一并删除；`%TEMP%` 仍是 16 个 11-16～11-22 的历史 `grad_*` 目录，数量与取证开始时相同，没有新增残留。
 
-## 九、仍需负责人决策的事项
+## 十、仍需负责人决策的事项
 
 1. 7 个不可恢复字段怎么办（这是本轮暴露的实质问题，不能靠工具绕开）：
    - A. 接受"现有数据不满足 §7.1"的事实，把预检对这批数据的结论固定为 FAIL，并在论文里如实说明；下一版生产器补齐字段。
@@ -236,5 +308,6 @@ A 的 notes 原文（节选）：
    三项互斥，取舍影响论文口径与工作量，需负责人定。
 2. 若选 A / 做下一版生产器：需要确认补齐方式——run_id 用何种形态（是否允许由 generated_at + sample + group + round 合成）、base_sha 是否取运行开始时的工作树 SHA、knowledge_result_ids/memory_injected/short_term_injected/difficult_flag 是否要新增到 run_one() 的记录里（会改动生产器，本轮未做）。
 3. B0 legacy 的 plan_sha256：无 plan.json 时预检只报 WARNING、需负责人确认。是否仍按"WARNING 可接受"处理？
-4. 冒烟批次是否纳入正式清单：internal-api-smoke-*（round_count=1）是否计入 165 个任务的完成度统计。
-5. validation 的派生是否可接受：本轮依据"起草链只在四项校验全过后才返回 ok=True"把 validation 确定性派生为全 true + corrections_used。如果评审要求"validation 必须由生产器逐项记录"（即不认可派生），那它要并入第 1 条的不可恢复清单。
+4. 批次无法判定（UNKNOWN）的口径：现行规则是「目录名与记录都给不出唯一批次 → 只报 UNKNOWN，不猜批次，也不算契约缺口」。需负责人确认是否要求正式数据必须落进带批次前缀的目录（`main-*` / `suppl-*` / `b0-*`），使 UNKNOWN 在正式预检里等于「需人工处理」，而不是可忽略项。
+5. 冒烟批次是否纳入正式清单：internal-api-smoke-*（round_count=1）是否计入 165 个任务的完成度统计。
+6. validation 的派生是否可接受：本轮依据"起草链只在四项校验全过后才返回 ok=True"把 validation 确定性派生为全 true + corrections_used。如果评审要求"validation 必须由生产器逐项记录"（即不认可派生），那它要并入第 1 条的不可恢复清单。
