@@ -280,8 +280,32 @@ def _count_jsonl(path):
 # ---------------------------------------------------------------------------
 
 
+PLAN_STATE_MISSING = "missing"
+PLAN_STATE_VALID = "valid"
+PLAN_STATE_INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class PlanCheck:
+    """plan.json 的三态核验结果：missing / valid / invalid。
+
+    `invalid` 时 `plan` 可能是已载入的计划（类型/结构/身份问题），也可能是 None
+    （文件损坏、plan_sha256 不自洽）。结果侧只能使用 `valid` 的计划：无效计划不得
+    建立身份索引、不得做计划成员关系或完成度核验，也不能被当作「没有 plan.json」
+    的 legacy 目录而给出 legacy WARNING。
+    """
+
+    state: str
+    plan: dict | None = None
+    detail: str = ""
+
+    @property
+    def valid(self):
+        return self.state == PLAN_STATE_VALID
+
+
 def check_plan(report, plan_path, expected_identities, label, *, strict=True):
-    """plan.json 完整性 + 冻结参数 + 任务身份集合。返回 plan 或 None。
+    """plan.json 完整性 + 冻结参数 + 任务身份集合。返回 PlanCheck 三态结果。
 
     `strict=False` 用于设计 §2.4 之外、不受五轮冻结参数约束的目录（例如冒烟批次）：
     参数偏离冻结值只报 WARNING（需负责人确认），不直接判 FAIL。
@@ -292,13 +316,14 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
     if not plan_path.is_file():
         report.add("FAIL", area, label, "plan.json 存在", "不存在",
                    "缺少计划文件，无法核对执行顺序与身份", basis)
-        return None
+        return PlanCheck(PLAN_STATE_MISSING, None, "plan.json 不存在")
     try:
         plan = plan_schedule.load_plan(plan_path)
     except plan_schedule.PlanIntegrityError as error:
         report.add("FAIL", area, label, "plan_sha256 自洽", str(error),
                    "计划被改动或损坏", basis)
-        return None
+        return PlanCheck(PLAN_STATE_INVALID, None,
+                         f"plan_sha256 不自洽：{error}")
 
     # --- 严格类型：必须早于任何等值比较/身份索引/唯一性 PASS ---
     # Python 里 1.0 == 1、True == 1：改写成等值浮点或布尔再重算 plan_sha256，
@@ -316,7 +341,7 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
                    shown,
                    "plan.json 字段类型不合法：等值比较不能证明类型正确，"
                    "序号/身份唯一性/身份集合核验中止", basis)
-        return plan
+        return PlanCheck(PLAN_STATE_INVALID, plan, "计划类型不合法")
 
     deviations = []
     for field_name, expected in (
@@ -336,6 +361,10 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
                    "该批次不在设计 §2.4 的 165 份内（如冒烟批次），其轮数/参数需负责人确认",
                    basis)
 
+    invalid_reasons = []
+    if deviations and strict:
+        invalid_reasons.append("冻结参数偏离")
+
     # --- 结构完整性：先把「每个任务的身份」展开，结构不全就不再往下给结论 ---
     # plan_tasks()/plan_identities() 直接索引 plan["blocks"]，结构缺失会抛异常，
     # 集合推导还会把重复身份折叠成一个 —— 两者都不能用来做唯一性判定。
@@ -348,18 +377,20 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
                    "blocks/tasks 与身份字段（sample_id/group/repeat_index）齐备",
                    shown,
                    "计划结构不完整，无法为每个任务建立身份；序号与身份唯一性核验中止，不生成看似完整的索引", basis)
-        return plan
+        return PlanCheck(PLAN_STATE_INVALID, plan, "计划结构不完整")
 
     sequences = [entry["plan_seq"] for entry in entries]
     if sequences != list(range(len(entries))):
         report.add("FAIL", area, f"{label} · plan_seq", "0..N-1 连续",
                    f"不连续/重复（N={len(entries)}）", "计划序号断裂", basis)
+        invalid_reasons.append("plan_seq 不连续")
     bad_round = [entry for entry in entries
                  if entry["repeat_index"] != entry["round_index"]]
     if bad_round:
         report.add("FAIL", area, f"{label} · repeat_index",
                    "repeat_index == round_index", f"{len(bad_round)} 个任务不等",
                    "与设计 §5.3 冲突", basis)
+        invalid_reasons.append("repeat_index 与 round_index 不一致")
 
     # --- 身份唯一性：同一身份出现在两个 plan_seq 上，结果行就无法映射到唯一任务 ---
     duplicates = plan_schedule.plan_identity_duplicates(entries)
@@ -370,6 +401,8 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
                    "每个实验身份（experiment_id, sample_id, group, repeat_index）只出现一次",
                    f"重复 {len(items)} 次：{list(identity)}；plan_seq={seqs}",
                    f"同一身份对应多个计划任务（{locations}），结果行匹配其中任意一条都不能证明计划合法，执行顺序不可审计", basis)
+    if duplicates:
+        invalid_reasons.append(f"{len(duplicates)} 个重复身份")
     if not duplicates:
         report.add("PASS", area, f"{label} · 身份唯一性",
                    f"{len(entries)} 个任务身份唯一", "无重复",
@@ -384,11 +417,14 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
                        f"{len(expected_identities)} 个身份",
                        f"缺 {len(missing)}、多 {len(extra)}",
                        f"缺：{missing[:5]}；多：{extra[:5]}", basis)
+            invalid_reasons.append("身份集合与冻结设计不一致")
         else:
             report.add("PASS", area, f"{label} · 身份集合",
                        f"{len(expected_identities)} 个身份", "完全一致",
                        "计划覆盖符合冻结设计", basis)
-    return plan
+    if invalid_reasons:
+        return PlanCheck(PLAN_STATE_INVALID, plan, "；".join(invalid_reasons))
+    return PlanCheck(PLAN_STATE_VALID, plan, "计划核验通过")
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +437,7 @@ def _is_int(value):
 
 
 def check_results(report, results_path, plan, expected_batch=None,
-                  batch_decision=None):
+                  batch_decision=None, *, plan_check=None):
     """逐行核对 results.jsonl 的字段、身份、批次、重复与计划同源关系。
 
     返回**字段类型合法**的身份列表（畸形记录只形成 FAIL，不进入集合比较，
@@ -440,6 +476,12 @@ def check_results(report, results_path, plan, expected_batch=None,
 
     `batch_decision` 为 None 时（直接调用的旧路径）按 expected_batch 退化成
     directory / missing 两态，行为与第五轮一致。
+
+    `plan_check` 是 check_plan() 的三态结果。只有 `valid` 计划参与身份索引、
+    结果行成员关系、同源字段与计划完成度核验；`invalid` 计划保留「计划」区域的
+    原始 FAIL，结果侧只继续做与计划无关的字段核验，并写一条「未做计划核验」的
+    说明 —— 既不能建立索引，也不能被误当作没有 plan.json 的 legacy 而报 WARNING。
+    直接调用（不传 plan_check）时保持旧行为：plan 非 None 即按 valid 处理。
     """
 
     if batch_decision is None:
@@ -449,6 +491,16 @@ def check_results(report, results_path, plan, expected_batch=None,
             expected_batch,
             "" if expected_batch is not None else "调用方未给出批次，目录名也不可判定",
         )
+
+    if plan_check is None:
+        plan_state = PLAN_STATE_VALID if plan is not None else PLAN_STATE_MISSING
+        plan_detail = ""
+    else:
+        plan_state = plan_check.state
+        plan_detail = plan_check.detail
+        plan = plan_check.plan
+    plan_usable = plan_state == PLAN_STATE_VALID
+    plan_missing = plan_state == PLAN_STATE_MISSING
 
     area = "结果记录"
     basis = "设计 §7.1（记录字段）/ §5.3（身份四元组）/ §2.4（覆盖与批次）"
@@ -468,7 +520,7 @@ def check_results(report, results_path, plan, expected_batch=None,
     plan_task_by_identity = {}
     plan_identity_duplicates = {}
     plan_structure_problems = []
-    if plan is not None:
+    if plan_usable:
         plan_map, plan_structure_problems = plan_schedule.plan_identity_map(plan)
         for plan_key, plan_entries in (plan_map or {}).items():
             if len(plan_entries) == 1:
@@ -571,7 +623,7 @@ def check_results(report, results_path, plan, expected_batch=None,
             else:
                 gap_rows += 1
                 # 即使这一行有契约缺口，legacy 缺 plan_sha256 的已知限制仍要告知
-                if plan is None:
+                if plan_missing:
                     _warn_legacy_plan(normalized.value("plan_sha256"))
             row = normalized.view()
             # 设计值本身就是 null 的字段（成功记录的 error、legacy 的 plan_sha256）
@@ -655,7 +707,7 @@ def check_results(report, results_path, plan, expected_batch=None,
             invalid_rows += 1
 
         plan_sha_value = row.get("plan_sha256")
-        if plan is not None:
+        if plan_usable:
             if plan_sha_value is None and "plan_sha256" not in failed_fields:
                 # 只有「记录根本没给」才走这条：设计 §7.1 要求每条结果行带 plan_sha256，
                 # 有 plan.json 时可据此核对同源；null 不是可以忽略的缺省值。
@@ -696,7 +748,7 @@ def check_results(report, results_path, plan, expected_batch=None,
                                    repr(expected_value), repr(actual_value),
                                    f"结果行的 {name} 与同目录 plan.json 不一致（不同源）",
                                    basis)
-        else:
+        elif plan_missing:
             _warn_legacy_plan(plan_sha_value)
 
     if batch_decision.state == BATCH_STATE_UNTRUSTED_RECORDS:
@@ -748,7 +800,7 @@ def check_results(report, results_path, plan, expected_batch=None,
             f"{label}：{producer_rows} 行来自 run_experiment.py（生产器 schema），"
             f"经 result_schema 标准化为 §7.1 视图；{derived_rows} 行完整导出，"
             f"{gap_rows} 行存在无法恢复的字段")
-        if plan is not None:
+        if plan_usable:
             report.notes.append(
                 f"{label}：计划同源核对 —— 按身份定位计划任务后逐字段比对 plan_seq / "
                 f"seed / scheme / algorithm_version / plan_sha256；只有记录真的给出了值"
@@ -758,6 +810,11 @@ def check_results(report, results_path, plan, expected_batch=None,
             f"{len(result_schema.DERIVED_FIELDS)} 个可确定性派生字段；"
             f"不可恢复字段 {len(result_schema.UNRECOVERABLE_FIELDS)} 个，"
             f"逐字段见上（缺 {sorted(gap_fields)}）")
+    if plan_state == PLAN_STATE_INVALID:
+        reason = plan_detail or "原因见「计划」区域"
+        report.notes.append(
+            f"{label}：plan.json 校验失败（{reason}），结果侧未建立计划身份索引，"
+            f"未做计划成员关系、同源字段与计划完成度核验")
     if plan_structure_problems:
         report.notes.append(
             f"{label}：计划结构不完整（{len(plan_structure_problems)} 处），未建立身份索引；"
@@ -1140,17 +1197,21 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                        batch_decision.detail,
                        "清单里有这个文件但没有合法 batch，正式批次无法确认；"
                        "不得回退到记录自述", BATCH_BASIS)
-        plan = None
         if plan_path.is_file():
-            plan = check_plan(report, plan_path, None, label, strict=design_batch)
+            plan_check = check_plan(report, plan_path, None, label,
+                                    strict=design_batch)
         else:
             report.add("WARNING", "计划", label, "plan.json 存在", "缺失",
                        "无计划的目录按 legacy 处理；若需要续跑会被拒绝",
                        "设计 §5.3")
+            plan_check = PlanCheck(PLAN_STATE_MISSING, None, "plan.json 不存在")
 
-        identities = check_results(report, results_path, plan,
+        # 计划有效性贯穿到结果侧：invalid 计划不得建立身份索引，也不得因 plan=None
+        # 被当作 legacy。missing 才走 legacy 路径。
+        identities = check_results(report, results_path, plan_check.plan,
                                    expected_batch=expected_batch,
-                                   batch_decision=batch_decision)
+                                   batch_decision=batch_decision,
+                                   plan_check=plan_check)
         experiment_ids = {row[0] for row in identities}
         if expected_batch is not None:
             by_batch.setdefault(expected_batch, []).extend(identities)

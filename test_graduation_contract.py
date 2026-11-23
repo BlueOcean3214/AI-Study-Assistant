@@ -1501,6 +1501,12 @@ def test_flow_plan_identity_control(root):
           not [item for item in _fails(report)
                if item.target.endswith(" · 计划类型")],
           [item.target for item in _fails(report)])
+    completion = [item for item in report.findings
+                  if item.level == "PASS" and item.target.endswith(" · 计划完成度")]
+    check("7.7-对照组：5 条结果拿满「计划完成度」PASS",
+          len(completion) == 1 and completion[0].actual == "全部有结果",
+          [item.render() for item in report.findings
+           if "计划完成度" in item.target])
 
 
 def test_flow_plan_manifest_batch_mismatch(root):
@@ -1591,6 +1597,76 @@ def test_flow_plan_type_float_round_count(root):
         plan["round_count"] = float(plan["round_count"])
 
     _plan_type_case(root, "main-20261113T061051Z", mutate, needle="round_count")
+
+
+def _invalid_plan_full_case(root, dirname, mutate, *, needle):
+    """第八轮：无效计划 + 完整 5 条结果，计划失败状态必须贯穿结果侧。
+
+    计划类型不合法时，结果侧不得建立身份索引，也不得把 plan=None 误当 legacy。
+    这里让 5 条结果全部合法（只是计划本身非法），因此任何「计划完成度 PASS」
+    「身份命中」或 legacy WARNING 都只能来自被错误放行的无效计划。
+    """
+
+    repo_root, runs_dir, run_dir = _repo(root, dirname)
+    plan = _plan_for(rounds=5)
+    mutate(plan)
+    plan["plan_sha256"] = plan_schedule.plan_digest(plan)
+    _write_plan(run_dir, plan)
+    api = _make_api(repo_root)
+    path = None
+    for repeat_index in range(5):
+        _record, path = _produce(run_dir, api, repeat_index=repeat_index,
+                                 plan_sha256=plan["plan_sha256"])
+    manifest = _write_manifest(repo_root, (
+        ("main", Path(run_dir) / plan_schedule.PLAN_NAME,
+         len(plan_schedule.plan_tasks(plan))),
+        ("main", path, len(_rows_of(path))),
+    ))
+    report = _flow(repo_root, runs_dir, manifest)
+    label = "7.9-无效计划（" + needle + "）"
+    notes = "\n".join(report.notes)
+    fails = [item for item in _fails(report)
+             if item.target.endswith(" · 计划类型")]
+
+    check(label + "：5 条完整结果都写入了 results.jsonl",
+          len(_rows_of(path)) == 5, len(_rows_of(path)))
+    check(label + "：恰好一条计划类型 FAIL", len(fails) == 1,
+          [item.render() for item in _fails(report)])
+    check(label + "：没有任何「计划完成度」PASS",
+          not [item for item in report.findings
+               if item.level == "PASS" and item.target.endswith(" · 计划完成度")],
+          [item.render() for item in report.findings
+           if "计划完成度" in item.target])
+    check(label + "：没有任何「身份唯一性」PASS",
+          not [item for item in report.findings
+               if item.level == "PASS" and "身份唯一性" in item.target],
+          [item.render() for item in report.findings
+           if item.level == "PASS" and "身份唯一性" in item.target])
+    check(label + "：没有依赖无效计划索引的「身份命中」结论",
+          "身份命中" not in notes, report.notes)
+    check(label + "：不把无效计划当 legacy（没有 legacy plan_sha256 WARNING）",
+          not [item for item in report.findings
+               if item.level == "WARNING" and "plan_sha256" in item.target],
+          [item.render() for item in report.findings
+           if item.level == "WARNING" and "plan_sha256" in item.target])
+    check(label + "：结果侧说明未建立计划身份索引",
+          "plan.json 校验失败" in notes and "未建立计划身份索引" in notes,
+          report.notes)
+
+
+def test_flow_invalid_plan_full_plan_seq(root):
+    def mutate(plan):
+        plan_schedule.plan_tasks(plan)[1]["plan_seq"] = 1.0
+
+    _invalid_plan_full_case(root, "main-20261113T061051Z", mutate,
+                            needle="plan_seq")
+
+
+def test_flow_invalid_plan_full_seed(root):
+    def mutate(plan):
+        plan["seed"] = float(plan["seed"])
+
+    _invalid_plan_full_case(root, "main-20261113T061051Z", mutate, needle="seed")
 
 
 # ---------------------------------------------------------------------------
@@ -1816,6 +1892,13 @@ def _run_all():
             ("case-type-bool-round-index", test_flow_plan_type_bool_round_index),
             ("case-type-float-seed", test_flow_plan_type_float_seed),
             ("case-type-float-round-count", test_flow_plan_type_float_round_count),
+        ):
+            runner(root / name)
+
+        # 7.9：无效计划 + 完整 5 条结果，验证失败状态贯穿结果侧（第八轮任务）
+        for name, runner in (
+            ("case-invalid-plan-seq", test_flow_invalid_plan_full_plan_seq),
+            ("case-invalid-plan-seed", test_flow_invalid_plan_full_seed),
         ):
             runner(root / name)
 
