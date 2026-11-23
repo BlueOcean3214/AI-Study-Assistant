@@ -17,7 +17,8 @@
 - plan.json 的 plan_sha256 是否自洽，冻结参数（seed/scheme/algorithm_version/
   block_unit/round_count）是否与设计 §5.1 一致；
 - results.jsonl 是否可解析、字段是否齐全、身份是否重复、行是否属于计划、
-  plan_sha256 是否与同目录计划同源；**每一条记录的 batch 都必须与目录推断值一致**；
+  plan_sha256 是否与同目录计划同源；batch 分四态判定：目录推断、记录一致声明、
+  缺失（UNKNOWN）、冲突/非法值（FAIL），**记录声明与目录不一致必须逐行 FAIL**；
 - 字段类型畸形（list/dict/null 等）只形成结构化 FAIL，不再让集合/身份比较抛异常；
 - 覆盖是否与冻结设计一致：主实验 7 样本 × A/B/C/D × 5 轮 = 140 份，补充
   C/D-subj（S5）10 份、S7-empty × D 5 份，B0 legacy 10 份只记录；
@@ -290,19 +291,46 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
                    "该批次不在设计 §2.4 的 165 份内（如冒烟批次），其轮数/参数需负责人确认",
                    basis)
 
-    tasks = plan_schedule.plan_tasks(plan)
-    sequences = [task.get("plan_seq") for task in tasks]
-    if sequences != list(range(len(tasks))):
+    # --- 结构完整性：先把「每个任务的身份」展开，结构不全就不再往下给结论 ---
+    # plan_tasks()/plan_identities() 直接索引 plan["blocks"]，结构缺失会抛异常，
+    # 集合推导还会把重复身份折叠成一个 —— 两者都不能用来做唯一性判定。
+    entries, structure_problems = plan_schedule.plan_identity_entries(plan)
+    if structure_problems:
+        shown = "；".join(structure_problems[:5])
+        if len(structure_problems) > 5:
+            shown += f"（共 {len(structure_problems)} 处）"
+        report.add("FAIL", area, f"{label} · 计划结构",
+                   "blocks/tasks 与身份字段（sample_id/group/repeat_index）齐备",
+                   shown,
+                   "计划结构不完整，无法为每个任务建立身份；序号与身份唯一性核验中止，不生成看似完整的索引", basis)
+        return plan
+
+    sequences = [entry["plan_seq"] for entry in entries]
+    if sequences != list(range(len(entries))):
         report.add("FAIL", area, f"{label} · plan_seq", "0..N-1 连续",
-                   f"不连续/重复（N={len(tasks)}）", "计划序号断裂", basis)
-    bad_round = [task for task in tasks
-                 if task.get("repeat_index") != task.get("round_index")]
+                   f"不连续/重复（N={len(entries)}）", "计划序号断裂", basis)
+    bad_round = [entry for entry in entries
+                 if entry["repeat_index"] != entry["round_index"]]
     if bad_round:
         report.add("FAIL", area, f"{label} · repeat_index",
                    "repeat_index == round_index", f"{len(bad_round)} 个任务不等",
                    "与设计 §5.3 冲突", basis)
 
-    identities = plan_schedule.plan_identities(plan)
+    # --- 身份唯一性：同一身份出现在两个 plan_seq 上，结果行就无法映射到唯一任务 ---
+    duplicates = plan_schedule.plan_identity_duplicates(entries)
+    for identity, items in duplicates:
+        seqs = "、".join(repr(item["plan_seq"]) for item in items)
+        locations = "、".join(item["where"] for item in items)
+        report.add("FAIL", area, f"{label} · 身份唯一性",
+                   "每个实验身份（experiment_id, sample_id, group, repeat_index）只出现一次",
+                   f"重复 {len(items)} 次：{list(identity)}；plan_seq={seqs}",
+                   f"同一身份对应多个计划任务（{locations}），结果行匹配其中任意一条都不能证明计划合法，执行顺序不可审计", basis)
+    if not duplicates:
+        report.add("PASS", area, f"{label} · 身份唯一性",
+                   f"{len(entries)} 个任务身份唯一", "无重复",
+                   "计划可逐身份审计", basis)
+
+    identities = {entry["identity"] for entry in entries}
     if expected_identities is not None:
         missing = sorted(expected_identities - identities)
         extra = sorted(identities - expected_identities)
@@ -327,7 +355,8 @@ def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def check_results(report, results_path, plan, expected_batch=None):
+def check_results(report, results_path, plan, expected_batch=None,
+                  batch_decision=None):
     """逐行核对 results.jsonl 的字段、身份、批次、重复与计划同源关系。
 
     返回**字段类型合法**的身份列表（畸形记录只形成 FAIL，不进入集合比较，
@@ -353,38 +382,57 @@ def check_results(report, results_path, plan, expected_batch=None):
     身份照进集合比较与计划覆盖统计。反过来也不允许用「部分成功」换任何
     §7.1 合规 PASS。
 
-    批次（batch）另有一条边界：调用方给出 expected_batch 时按目录可信规则逐条比对；
-    目录名与记录都判不出批次（expected_batch=None）时，batch 只是「无法判定」，
-    不是生产器的契约缺口 —— 此时不报 FAIL、不猜批次，由 run_preflight 统一报
-    UNKNOWN；其余字段的失败照常保留。
+    批次（batch）按四种状态处理（整份文件共用一个结论，见 decide_batch()）：
+
+    - directory：目录名给出可信批次，记录若声明了别的批次逐行 FAIL；
+    - records：目录名不可判定，但记录一致声明同一个批次，采用该值；
+    - missing：目录名与记录都没有批次 —— 不是契约缺口，不报 FAIL、不猜批次，
+      由 run_preflight 统一报 UNKNOWN，其余字段的失败照常保留；
+    - conflict / invalid：同一文件声明了多个批次、或声明了非法值 —— 都报结构化
+      FAIL（冲突按文件一条、非法逐行一条），不再降级成 UNKNOWN。
+
+    `batch_decision` 为 None 时（直接调用的旧路径）按 expected_batch 退化成
+    directory / missing 两态，行为与第五轮一致。
     """
+
+    if batch_decision is None:
+        batch_decision = BatchDecision(
+            BATCH_STATE_DIRECTORY if expected_batch is not None
+            else BATCH_STATE_MISSING,
+            expected_batch,
+            "" if expected_batch is not None else "调用方未给出批次，目录名也不可判定",
+        )
 
     area = "结果记录"
     basis = "设计 §7.1（记录字段）/ §5.3（身份四元组）/ §2.4（覆盖与批次）"
     label = str(results_path)
     identities = []
     seen = {}
-    plan_ids = plan_schedule.plan_identities(plan) if plan else None
+    plan_map = None
+    plan_ids = None
     plan_sha = plan.get("plan_sha256") if plan else None
-    # 计划任务索引：身份四元组 → 计划任务。设计 §5.3 要求 plan_seq 是计划的全局连续
-    # 序号，seed/scheme/algorithm_version/plan_sha256 用来证明结果行与计划同源；这些
+    # 计划任务索引：身份四元组 → 计划任务条目。设计 §5.3 要求 plan_seq 是计划的全局
+    # 连续序号，seed/scheme/algorithm_version/plan_sha256 用来证明结果行与计划同源；这些
     # 比对必须按身份找到「那一条任务」再比，不能只看 plan_seq 是不是 int、在不在范围里。
+    #
+    # 同一身份出现多次时不能用 dict 覆盖掉一条：这里保留整个列表，重复身份既不建索引，
+    # 也不挑其中任意一条来比对 —— 唯一性由 check_plan() 逐条 FAIL，结果侧不重复报；
+    # 更不允许「结果行恰好匹配其中一条」把重复计划洗成合法。
     plan_task_by_identity = {}
+    plan_identity_duplicates = {}
+    plan_structure_problems = []
+    if plan is not None:
+        plan_map, plan_structure_problems = plan_schedule.plan_identity_map(plan)
+        for plan_key, plan_entries in (plan_map or {}).items():
+            if len(plan_entries) == 1:
+                plan_task_by_identity[plan_key] = plan_entries[0]
+            else:
+                plan_identity_duplicates[plan_key] = plan_entries
+        if plan_map is not None:
+            plan_ids = set(plan_map)
     plan_seed = plan.get("seed") if plan is not None else None
     plan_scheme = plan.get("scheme") if plan is not None else None
     plan_algorithm_version = plan.get("algorithm_version") if plan is not None else None
-    if plan is not None and isinstance(plan.get("blocks"), list):
-        plan_experiment_id = plan.get("experiment_id")
-        for plan_block in plan["blocks"]:
-            if not isinstance(plan_block, dict):
-                continue
-            for plan_task in plan_block.get("tasks") or ():
-                if not isinstance(plan_task, dict):
-                    continue
-                plan_task_by_identity[
-                    (plan_experiment_id, plan_block.get("sample_id"),
-                     plan_task.get("group"), plan_task.get("repeat_index"))
-                ] = plan_task
     legacy_plan_warned = False
     invalid_rows = 0
     producer_rows = 0
@@ -431,6 +479,7 @@ def check_results(report, results_path, plan, expected_batch=None):
                        type(row).__name__, "记录格式错误", basis)
             continue
 
+        raw_row = row  # 原始记录：batch 这类字段必须按记录本来的样子核对
         null_ok = set()  # 只有生产器行会出现「设计值就是 null」的字段
         failed_fields = set()
         partial = False  # 生产器行：只有 §7.1 视图的一部分，核验按「可得即核」
@@ -447,14 +496,18 @@ def check_results(report, results_path, plan, expected_batch=None):
             producer_rows += 1
             partial = True
             normalized = result_schema.normalize_record(
-                row, batch=expected_batch, run_dir=results_path.parent)
+                row, batch=batch_decision.value, run_dir=results_path.parent)
             failures = normalized.failures()
-            # expected_batch=None 表示目录名与记录都给不出批次（批次本身不可判定）。
-            # normalize_record 此时只能把 batch 记成「调用方未给出」，但这不是生产器的
-            # 契约缺口：批次归属由 run_preflight 的目录规则判定，判定不出来时已经单独
-            # 报 UNKNOWN。这里既不报 FAIL，也不把未知批次当成某个已知批次。
-            batch_undecidable = expected_batch is None
-            undecidable = {"batch"} if batch_undecidable else set()
+            # batch 的四态由 decide_batch() 判定，行级只核对记录「自己声明的」值：
+            # - missing：记录没声明、目录也判不出 —— 不是契约缺口，由 run_preflight
+            #   报 UNKNOWN，normalize 的 batch 失败在这里减掉；
+            # - invalid：记录声明了非法值 —— 下面逐行报结构化 FAIL，这里的通用失败
+            #   减掉，避免同一行把同一件事报两遍；
+            # - conflict：文件内声明互相矛盾 —— 由函数末尾按文件报一条 FAIL；
+            # - directory / records：值已确定，记录若声明了别的批次逐行报冲突。
+            # 行级已单独核对「记录自己声明的 batch」（非空字符串 / 与目录一致 /
+            # 非法值逐行 FAIL），normalize 的通用 batch 失败不再重复报一次。
+            undecidable = {"batch"}
             failed_fields = set(failures) - undecidable
             for name in sorted(failed_fields):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
@@ -502,20 +555,22 @@ def check_results(report, results_path, plan, expected_batch=None):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
                            "非空字符串", repr(value), "字段类型/取值错误", basis)
 
-        # --- batch：逐条核对，不是只看第一条 ---
-        batch_value = row.get("batch")
-        if isinstance(batch_value, str) and batch_value.strip():
-            if expected_batch is not None and batch_value != expected_batch:
-                report.add("FAIL", area, f"{label}:{lineno} · batch",
-                           f"batch={expected_batch}（由目录推断）", repr(batch_value),
-                           "记录批次与所属目录不符", basis)
-        elif partial and expected_batch is None:
-            # 批次本身无法判定（目录名与记录都给不出唯一值）：行级不重复报错，
-            # 由 run_preflight 的 UNKNOWN「可判定的批次」统一说明。
-            pass
-        else:
+        # --- batch：逐条核对记录「自己声明的」值（不是标准化视图里的目录值）---
+        has_declared_batch = "batch" in raw_row
+        declared_batch = raw_row.get("batch") if has_declared_batch else None
+        if has_declared_batch and not result_schema.is_valid_batch_value(declared_batch):
             report.add("FAIL", area, f"{label}:{lineno} · batch",
-                       "非空字符串", repr(batch_value), "批次字段类型/取值错误", basis)
+                       "非空字符串（或完全省略该字段）", repr(declared_batch),
+                       "batch 值非法：批次只能是批次名字符串，list/dict/int/bool/空串"
+                       "都不接受", basis)
+        elif (has_declared_batch and batch_decision.value is not None
+              and declared_batch != batch_decision.value):
+            source = ("由目录推断" if batch_decision.state == BATCH_STATE_DIRECTORY
+                      else "由该文件其余记录一致声明")
+            report.add("FAIL", area, f"{label}:{lineno} · batch",
+                       f"batch={batch_decision.value}（{source}）",
+                       repr(declared_batch),
+                       "记录批次与所属目录/文件不一致", basis)
 
         # data_kind 在生产器记录里是不可恢复字段：缺口已按字段 FAIL（见函数末尾），
         # 这里既不补默认值，也不因为「跳过」而产生任何 §7.1 合规 PASS。
@@ -596,6 +651,13 @@ def check_results(report, results_path, plan, expected_batch=None):
         else:
             _warn_legacy_plan(plan_sha_value)
 
+    if batch_decision.state == BATCH_STATE_CONFLICT:
+        report.add("FAIL", area, f"{label} · batch",
+                   "同一文件内所有记录声明的批次一致",
+                   batch_decision.detail,
+                   "同一结果文件声明了多个批次，无法确定归属（每个值单独看都合法，"
+                   "但整体矛盾，不能挑其中一个当真）", basis)
+
     # --- 契约缺口：按字段聚合，各一条 FAIL（不可恢复字段不得降级为 WARNING）---
     unrecoverable = result_schema.unrecoverable_reasons()
     for name in RESULTS_REQUIRED_FIELDS:
@@ -631,6 +693,15 @@ def check_results(report, results_path, plan, expected_batch=None):
             f"{len(result_schema.DERIVED_FIELDS)} 个可确定性派生字段；"
             f"不可恢复字段 {len(result_schema.UNRECOVERABLE_FIELDS)} 个，"
             f"逐字段见上（缺 {sorted(gap_fields)}）")
+    if plan_structure_problems:
+        report.notes.append(
+            f"{label}：计划结构不完整（{len(plan_structure_problems)} 处），未建立身份索引；"
+            f"原因见「计划」区域的 FAIL")
+    if plan_identity_duplicates:
+        report.notes.append(
+            f"{label}：计划中有 {len(plan_identity_duplicates)} 个重复身份，未为这些身份建立"
+            f"索引（不取其中任意一条任务比对）；唯一性已在「计划」区域逐条 FAIL")
+
     if invalid_rows:
         report.notes.append(f"{label}：{invalid_rows} 行字段/身份畸形，已跳过集合比较")
     if plan_ids is not None:
@@ -737,36 +808,94 @@ def _batch_from_directory(name):
     return None
 
 
-def _record_batches(results_path):
-    """结果文件里出现过的 batch 值（只收集非空字符串；解析失败的行跳过）。"""
+@dataclass(frozen=True)
+class BatchDecision:
+    """一个结果文件的批次判定：缺失 / 冲突 / 非法 / 可用 四态分开。
 
-    values = []
+    value 只在 directory、records 两态有值；missing/conflict/invalid 一律 None，
+    调用方据此决定报 UNKNOWN 还是 FAIL —— 不能把未知当成某个已知批次。
+    """
+
+    state: str
+    value: object = None
+    detail: str = ""
+
+
+BATCH_STATE_DIRECTORY = "directory"
+BATCH_STATE_RECORDS = "records"
+BATCH_STATE_MISSING = "missing"
+BATCH_STATE_CONFLICT = "conflict"
+BATCH_STATE_INVALID = "invalid"
+
+
+def _scan_batch_declarations(results_path):
+    """逐行扫描记录里的 batch 声明；返回 (invalids, declared)，都带行号。
+
+    非法值不能像「只收集字符串」那样被悄悄丢掉：那会把「记录声明了 list」变成
+    「记录没声明」，从而错误地退化成 UNKNOWN。解析失败的行由 check_results 报错，
+    这里跳过即可。
+    """
+
+    invalids = []
+    declared = []
     try:
         text = results_path.read_text(encoding="utf-8")
     except OSError:
-        return values
-    for line in text.splitlines():
+        return invalids, declared
+    for lineno, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(row, dict):
-            value = row.get("batch")
-            if isinstance(value, str) and value.strip() and value not in values:
-                values.append(value)
-    return values
+        if not isinstance(row, dict) or "batch" not in row:
+            continue
+        value = row.get("batch")
+        if result_schema.is_valid_batch_value(value):
+            declared.append((lineno, value))
+        else:
+            invalids.append((lineno, value))
+    return invalids, declared
+
+
+def decide_batch(directory, results_path):
+    """批次判定：目录前缀优先；否则看记录是否一致声明；否则区分缺失/冲突/非法。
+
+    目录名给出批次时它就是可信值（记录声明别的批次由 check_results 逐行 FAIL），
+    因为「这个目录属于哪个批次」不依赖记录自述；目录名判不出时才看记录，
+    而记录之间矛盾（conflict）或值非法（invalid）都不能算「无从推断」的 UNKNOWN。
+    """
+
+    directory_batch = _batch_from_directory(directory.name)
+    invalids, declared = _scan_batch_declarations(results_path)
+    if directory_batch is not None:
+        return BatchDecision(BATCH_STATE_DIRECTORY, directory_batch, "")
+    if invalids:
+        detail = "、".join(
+            "第 " + str(lineno) + " 行 batch=" + repr(value)
+            for lineno, value in invalids)
+        return BatchDecision(BATCH_STATE_INVALID, None, detail)
+    values = []
+    for _, value in declared:
+        if value not in values:
+            values.append(value)
+    if len(values) > 1:
+        detail = "、".join(
+            "第 " + str(lineno) + " 行 batch=" + repr(value)
+            for lineno, value in declared)
+        return BatchDecision(BATCH_STATE_CONFLICT, None, detail)
+    if values:
+        return BatchDecision(BATCH_STATE_RECORDS, values[0],
+                             "记录一致声明 batch=" + repr(values[0]))
+    return BatchDecision(BATCH_STATE_MISSING, None,
+                         "目录名与记录都没有给出批次")
 
 
 def expected_batch_for(directory, results_path):
-    """预期批次：优先用目录名（可信规则）；目录名不可判定时仅在记录唯一时采用。"""
+    """预期批次名（兼容旧调用）；四态判定见 decide_batch()。"""
 
-    batch = _batch_from_directory(directory.name)
-    if batch is not None:
-        return batch
-    values = _record_batches(results_path)
-    return values[0] if len(values) == 1 else None
+    return decide_batch(directory, results_path).value
 
 
 def is_b0_legacy(directory):
@@ -873,7 +1002,8 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                            "有计划但没有结果文件", "设计 §5.3")
             continue
 
-        expected_batch = expected_batch_for(directory, results_path)
+        batch_decision = decide_batch(directory, results_path)
+        expected_batch = batch_decision.value
         design_batch = expected_batch in TOTAL_BATCHES
         plan = None
         if plan_path.is_file():
@@ -884,14 +1014,21 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                        "设计 §5.3")
 
         identities = check_results(report, results_path, plan,
-                                   expected_batch=expected_batch)
+                                   expected_batch=expected_batch,
+                                   batch_decision=batch_decision)
         experiment_ids = {row[0] for row in identities}
-        if expected_batch is None:
-            report.add("UNKNOWN", "覆盖", label, "可判定的批次", "无法判定",
-                       "目录名与记录都无法确定唯一批次，需负责人确认", "设计 §2.4")
-        else:
+        if expected_batch is not None:
             by_batch.setdefault(expected_batch, []).extend(identities)
             check_coverage(report, expected_batch, identities, experiment_ids)
+        elif batch_decision.state == BATCH_STATE_MISSING:
+            # 只有「目录名与记录都没有批次信息」才是证据不足；冲突与非法值已经在
+            # check_results 里报了结构化 FAIL，不能再降级成 UNKNOWN 把矛盾藏起来。
+            report.add("UNKNOWN", "覆盖", label, "可判定的批次", "无法判定",
+                       "目录名与记录都没有给出批次，需负责人确认", "设计 §2.4")
+        else:
+            report.notes.append(
+                f"{label}：batch 判定为 {batch_decision.state}（{batch_decision.detail}），"
+                f"批次归属不可确定，未做覆盖核对；原因见「结果记录」区域的 FAIL")
 
     total = sum(len(by_batch.get(batch, [])) for batch in TOTAL_BATCHES)
     if by_batch:

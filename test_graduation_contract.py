@@ -1103,7 +1103,13 @@ def test_flow_b0_legacy(root):
     """任务四：真实 b0-* 目录 + 无 plan.json —— legacy 例外只报 WARNING。"""
 
     repo_root, runs_dir, run_dir = _repo(root, "b0-remainder-20261113T013105Z")
-    record, path = _produce(run_dir, _make_api(repo_root), plan_sha256=None)
+    # 批次由 b0-* 目录名识别，身份则必须是 B0 组、样本来自 S5/S7（设计 §2.4 的
+    # legacy 探索组）：目录规则与记录身份是两条独立证据，用 S2×D 就测不出后者。
+    api = _make_api(repo_root)
+    _produce(run_dir, api, plan_sha256=None, sample_id="S7", group="B0",
+             repeat_index=0)
+    record, path = _produce(run_dir, api, plan_sha256=None, sample_id="S5",
+                            group="B0", repeat_index=1)
     # 清单必须非空（空清单本身就是 FAIL），但绝不能覆盖 B0 文件本身：
     # 只放一个与本次核验无关的说明文件，用来证明「未纳入清单」对 legacy 是 WARNING。
     note = repo_root / "docs" / "synthetic-note.txt"
@@ -1140,9 +1146,244 @@ def test_flow_b0_legacy(root):
           not any(item.area == "清单" and item.level == "FAIL"
                   for item in report.findings),
           [item.render() for item in report.findings if item.area == "清单"])
-    check("7.6-B0：legacy 行仍被计入执行证据",
-          "身份可识别 1 行" in notes, notes)
+    check("7.6-B0：legacy 行仍被计入执行证据（2 行都是 B0 身份）",
+          "身份可识别 2 行" in notes and "批次 b0-legacy：2 条记录" in notes,
+          notes)
+    check("7.6-B0：记录身份是 S5/S7 × B0，不是主实验 S2×D",
+          record.get("sample_id") == "S5" and record.get("group") == "B0",
+          [record.get("sample_id"), record.get("group")])
 
+
+# ---------------------------------------------------------------------------
+# 7.7 批次四态与计划身份唯一性（第六轮复审）
+#
+# 7.6 只用「一条记录 + 没有 batch 字段」覆盖了「批次不可判定」，另外三态（记录一致
+# 声明、记录互相矛盾、记录声明非法值）以及「记录声明与目录冲突」都没被走过；计划侧
+# 也只比了身份集合，而 plan_identities() 用 set 会把重复身份折叠掉，重复身份从未被测。
+# 下面五条批次路径 + 四条计划路径把它们钉住。
+# ---------------------------------------------------------------------------
+
+_MISSING_BATCH = object()
+
+
+def _batch_case(root, dirname, markers, *, plan_sha256=None):
+    """一个运行目录：按 markers 逐行写 batch，然后跑完整的 run_preflight()。
+
+    markers[i] 对应第 i 行；_MISSING_BATCH 表示该行完全不带 batch 字段。
+    """
+
+    repo_root, runs_dir, run_dir = _repo(root, dirname)
+    api = _make_api(repo_root)
+    path = None
+    for repeat_index in range(len(markers)):
+        _record, path = _produce(run_dir, api, repeat_index=repeat_index,
+                                 plan_sha256=plan_sha256)
+    rows = _rows_of(path)
+    check("7.7-批次场景（" + dirname + "）：合成行数与声明数一致",
+          len(rows) == len(markers), [len(rows), len(markers)])
+    for row, marker in zip(rows, markers):
+        if marker is _MISSING_BATCH:
+            row.pop("batch", None)
+        else:
+            row["batch"] = marker
+    Path(path).write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in rows), encoding="utf-8", newline="\n")
+    manifest = _write_manifest(repo_root, (("main", path, len(rows)),))
+    return _flow(repo_root, runs_dir, manifest)
+
+
+def test_flow_batch_records_consistent(root):
+    """目录名判不出批次，但记录一致声明 suppl-subj —— 采用记录值，不报 FAIL。"""
+
+    report = _batch_case(root, "run-batch-consistent",
+                         ["suppl-subj", "suppl-subj"])
+    notes = "\n".join(report.notes)
+
+    check("7.7-记录一致声明：不报 batch FAIL",
+          _field_fails(report, "batch") == [],
+          [item.target for item in _fails(report)])
+    check("7.7-记录一致声明：批次被采用并计入覆盖（notes 出现「批次 suppl-subj」）",
+          "批次 suppl-subj" in notes, report.notes)
+    check("7.7-记录一致声明：不报 UNKNOWN（值已确定，不是证据不足）",
+          not [item for item in report.findings
+               if item.level == "UNKNOWN" and item.area == "覆盖"],
+          [item.render() for item in report.findings
+           if item.level == "UNKNOWN"])
+    check("7.7-记录一致声明：7 个契约缺口仍逐字段 FAIL",
+          len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
+
+
+def test_flow_batch_conflict(root):
+    """同一文件里两行声明了不同批次 —— 报一条文件级 FAIL，不降级成 UNKNOWN。"""
+
+    report = _batch_case(root, "run-batch-conflict", ["main", "suppl-subj"])
+    fails = _field_fails(report, "batch")
+
+    check("7.7-冲突：同一文件两个批次只报一条 FAIL", len(fails) == 1,
+          [(item.target, item.actual) for item in fails])
+    check("7.7-冲突：FAIL 点名两个批次与行号",
+          bool(fails) and "main" in fails[0].actual
+          and "suppl-subj" in fails[0].actual
+          and "第 1 行" in fails[0].actual and "第 2 行" in fails[0].actual,
+          [(item.actual,) for item in fails])
+    check("7.7-冲突：报的是 FAIL 而不是 UNKNOWN",
+          bool(fails) and not [item for item in report.findings
+                               if item.level == "UNKNOWN" and item.area == "覆盖"],
+          [item.render() for item in report.findings
+           if item.level == "UNKNOWN"])
+    check("7.7-冲突：7 个契约缺口仍逐字段 FAIL",
+          len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
+
+
+def test_flow_batch_invalid(root):
+    """batch 是 list/dict/int/bool/空串 —— 逐行结构化 FAIL，不当成「没声明」。"""
+
+    markers = [["main"], {"batch": "main"}, 3, True, "  "]
+    report = _batch_case(root, "run-batch-invalid", markers)
+    fails = _field_fails(report, "batch")
+
+    check("7.7-非法值：list/dict/int/bool/空串逐行 FAIL（5 条）",
+          len(fails) == 5, [(item.target, item.actual) for item in fails])
+    check("7.7-非法值：每条都按「非空字符串」类型错误报",
+          bool(fails) and all("非空字符串" in item.expected for item in fails),
+          [(item.expected,) for item in fails])
+    check("7.7-非法值：不降级成 UNKNOWN",
+          bool(fails) and not [item for item in report.findings
+                               if item.level == "UNKNOWN" and item.area == "覆盖"],
+          [item.render() for item in report.findings
+           if item.level == "UNKNOWN"])
+    check("7.7-非法值：7 个契约缺口仍逐字段 FAIL",
+          len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
+
+
+def test_flow_batch_directory_conflict(root):
+    """main-* 目录里一行声明 suppl-subj：目录可信，只在该行报冲突。"""
+
+    report = _batch_case(root, "main-20261113T061051Z",
+                         ["main", "suppl-subj"])
+    fails = _field_fails(report, "batch")
+
+    check("7.7-目录冲突：只在声明与目录不符的那一行 FAIL", len(fails) == 1,
+          [(item.target, item.actual) for item in fails])
+    check("7.7-目录冲突：FAIL 写明目录推断值",
+          bool(fails) and fails[0].expected == "batch=main（由目录推断）",
+          [(item.expected,) for item in fails])
+    check("7.7-目录冲突：指向第 2 行",
+          bool(fails) and fails[0].target.endswith(":2 · batch"),
+          [(item.target,) for item in fails])
+
+
+def test_flow_batch_directory_derived(root):
+    """对照组：main-* 目录、记录不带 batch —— 沿用目录值，不报 batch FAIL。"""
+
+    report = _batch_case(root, "main-20261113T061051Z",
+                         [_MISSING_BATCH, _MISSING_BATCH])
+    notes = "\n".join(report.notes)
+
+    check("7.7-目录推断：记录不带 batch 也不报 FAIL",
+          _field_fails(report, "batch") == [],
+          [item.target for item in _fails(report)])
+    check("7.7-目录推断：批次按目录计入 main 覆盖",
+          "批次 main" in notes, report.notes)
+
+
+def _plan_case(root, dirname, mutate, *, rows=1):
+    """计划被 mutate() 改动后重算 plan_sha256，再跑一次完整预检。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, dirname)
+    plan = _plan_for(rounds=5)
+    mutate(plan)
+    plan["plan_sha256"] = plan_schedule.plan_digest(plan)
+    _write_plan(run_dir, plan)
+    api = _make_api(repo_root)
+    path = None
+    for repeat_index in range(rows):
+        _record, path = _produce(run_dir, api, repeat_index=repeat_index,
+                                 plan_sha256=plan["plan_sha256"])
+    manifest = _write_manifest(repo_root, (
+        ("main", Path(run_dir) / plan_schedule.PLAN_NAME,
+         len(plan_schedule.plan_tasks(plan))),
+        ("main", path, len(_rows_of(path))),
+    ))
+    return _flow(repo_root, runs_dir, manifest)
+
+
+def _identity_fails(report):
+    return [item for item in _fails(report)
+            if item.target.endswith(" · 身份唯一性")]
+
+
+def test_flow_plan_duplicate_identity(root):
+    """同一身份两个 plan_seq：即使只有一条结果行匹配，也必须 FAIL。"""
+
+    def mutate(plan):
+        tasks = plan_schedule.plan_tasks(plan)
+        tasks[1]["repeat_index"] = tasks[0]["repeat_index"]
+        tasks[1]["round_index"] = tasks[0]["round_index"]
+
+    report = _plan_case(root, "main-20261113T061051Z", mutate, rows=1)
+    fails = _identity_fails(report)
+
+    check("7.7-重复身份：一条结果行匹配也照样 FAIL（1 条）",
+          len(fails) == 1, [item.target for item in _fails(report)])
+    check("7.7-重复身份：FAIL 点名重复次数与两个 plan_seq",
+          bool(fails) and "重复 2 次" in fails[0].actual
+          and "plan_seq=0、1" in fails[0].actual,
+          [(item.actual,) for item in fails])
+    check("7.7-重复身份：FAIL 说清「匹配任意一条都不能证明计划合法」",
+          bool(fails) and "执行顺序不可审计" in fails[0].reason,
+          [(item.reason,) for item in fails])
+    check("7.7-重复身份：不给「身份唯一」PASS",
+          not [item for item in report.findings
+               if item.level == "PASS" and "身份唯一性" in item.target],
+          [item.render() for item in report.findings
+           if item.level == "PASS" and "身份唯一性" in item.target])
+    check("7.7-重复身份：结果侧不为重复身份建立索引（notes 说明）",
+          "重复身份" in "\n".join(report.notes), report.notes)
+
+
+def test_flow_plan_structure_broken(root):
+    """blocks 缺 sample_id：结构不完整时报 FAIL，不崩溃、不伪装成完整索引。"""
+
+    def mutate(plan):
+        plan["blocks"][0].pop("sample_id")
+
+    report = _plan_case(root, "main-20261113T061051Z", mutate, rows=1)
+    structure = [item for item in _fails(report)
+                 if item.target.endswith(" · 计划结构")]
+
+    check("7.7-结构缺失：报「计划结构」FAIL（不抛异常）", len(structure) == 1,
+          [item.target for item in _fails(report)])
+    check("7.7-结构缺失：FAIL 点明缺的是 sample_id",
+          bool(structure) and "sample_id" in structure[0].actual,
+          [(item.actual,) for item in structure])
+    check("7.7-结构缺失：结果侧不建立身份索引并说明",
+          "计划结构不完整" in "\n".join(report.notes), report.notes)
+    check("7.7-结构缺失：不给出「身份唯一」PASS",
+          not [item for item in report.findings
+               if item.level == "PASS" and "身份唯一性" in item.target],
+          [item.render() for item in report.findings
+           if item.level == "PASS" and "身份唯一性" in item.target])
+
+
+def test_flow_plan_identity_control(root):
+    """对照组：正常计划拿到「身份唯一」PASS，新增检查不误报。"""
+
+    repo_root, runs_dir, manifest, _plan = _planned_case(root)
+    report = _flow(repo_root, runs_dir, manifest)
+    passes = [item for item in report.findings
+              if item.level == "PASS" and item.target.endswith(" · 身份唯一性")]
+
+    check("7.7-对照组：正常计划拿到「身份唯一」PASS", len(passes) == 1,
+          [item.render() for item in report.findings
+           if "身份唯一性" in item.target])
+    check("7.7-对照组：没有重复身份 FAIL", _identity_fails(report) == [],
+          [item.target for item in _fails(report)])
+    check("7.7-对照组：也没有「计划结构」FAIL",
+          not [item for item in _fails(report)
+               if item.target.endswith(" · 计划结构")],
+          [item.target for item in _fails(report)])
 
 # ---------------------------------------------------------------------------
 # 8. 消费者二：打包器
@@ -1338,6 +1579,19 @@ def _run_all():
             ("case-flow-scheme", test_flow_scheme_tamper),
             ("case-flow-algorithm", test_flow_algorithm_version_tamper),
             ("case-flow-b0", test_flow_b0_legacy),
+        ):
+            runner(root / name)
+
+        # 7.7：批次四态 / 计划身份唯一性（第六轮复审）
+        for name, runner in (
+            ("case-batch-consistent", test_flow_batch_records_consistent),
+            ("case-batch-conflict", test_flow_batch_conflict),
+            ("case-batch-invalid", test_flow_batch_invalid),
+            ("case-batch-dir-conflict", test_flow_batch_directory_conflict),
+            ("case-batch-dir-derived", test_flow_batch_directory_derived),
+            ("case-plan-dup-identity", test_flow_plan_duplicate_identity),
+            ("case-plan-structure", test_flow_plan_structure_broken),
+            ("case-plan-unique-control", test_flow_plan_identity_control),
         ):
             runner(root / name)
 

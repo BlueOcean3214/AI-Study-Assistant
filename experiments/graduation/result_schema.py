@@ -177,9 +177,11 @@ FIELD_CONTRACT = {
         _PRODUCER,
     ),
     "batch": FieldContract(
-        "batch", STATE_DERIVED, "run 目录名",
-        "记录里没有批次字段；批次由 run 目录名按 BATCH_PREFIXES 推断"
-        "（preflight_experiment_data.py:74-80、533-573），推断不出就不填",
+        "batch", STATE_DERIVED, "run 目录名 / 记录自身声明",
+        "生产器记录不含 batch 字段，批次由 run 目录名按 BATCH_PREFIXES 推断"
+        "（preflight_experiment_data.py:74-80）；记录一旦显式声明 batch，就必须是非空"
+        "字符串，并与目录推断值一致 —— 类型非法或与目录冲突都按序报 FAIL，不当成"
+        "「无从推断」的 UNKNOWN",
         _DESIGN + "；preflight_experiment_data.py:74-80",
     ),
     "model": FieldContract(
@@ -466,6 +468,80 @@ def read_prompt_messages(run_dir, prompt_ref):
 
 
 # ---------------------------------------------------------------------------
+# batch：目录推断值 + 记录自身声明（缺失 / 冲突 / 非法 / 可用 四态分开）
+# ---------------------------------------------------------------------------
+
+BATCH_OK = "ok"
+BATCH_FROM_DIRECTORY = "directory"
+BATCH_MISSING = "missing"
+BATCH_INVALID = "invalid"
+BATCH_CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class BatchResult:
+    """一条记录的批次派生结果。
+
+    code    ok / directory / missing / invalid / conflict
+    value   可用批次名；不可用时为 None（不得用目录值掩盖记录的冲突声明）
+    detail  不可用时说明原因
+    declared 记录里原本声明的原样值（缺失时为 None）
+    """
+
+    code: str
+    value: object = None
+    detail: str = ""
+    declared: object = None
+
+    @property
+    def ok(self):
+        return self.code in (BATCH_OK, BATCH_FROM_DIRECTORY)
+
+
+def is_valid_batch_value(value):
+    """§7.1 的 batch 只能是批次名字符串：list/dict/int/bool/空串都算非法值。"""
+
+    return isinstance(value, str) and bool(value.strip())
+
+
+def derive_batch(record, directory_batch=None):
+    """批次：记录自身声明与目录推断值一起判，四种情形不混为一谈。
+
+    1. 记录没给 batch：有目录推断值就采用它（directory）；都没有就是 missing ——
+       生产器当前不记录 batch，所以「没给」不是契约缺口，由调用方报 UNKNOWN；
+    2. 记录给了但不是非空字符串：invalid（list/dict/int/bool/空串一律拒绝）；
+    3. 记录给了合法值但与目录推断值不同：conflict（两个值都合法，必须被看见，
+       不能用目录值把它覆盖掉）；
+    4. 记录给了合法值且与目录一致（或目录不可判定时）：ok。
+    """
+
+    base = record if isinstance(record, dict) else {}
+    has_declared = "batch" in base
+    declared = base.get("batch") if has_declared else None
+    if not has_declared or declared is None:
+        if directory_batch is not None:
+            return BatchResult(BATCH_FROM_DIRECTORY, directory_batch,
+                               "记录未声明 batch，采用目录名推断值", None)
+        return BatchResult(BATCH_MISSING, None,
+                           "记录未声明 batch，目录名也无法判定批次", None)
+    if not is_valid_batch_value(declared):
+        return BatchResult(
+            BATCH_INVALID, None,
+            "batch=" + repr(declared) + " 不是非空字符串（批次数值/列表/对象都不接受）",
+            declared,
+        )
+    if directory_batch is not None and declared != directory_batch:
+        return BatchResult(
+            BATCH_CONFLICT, None,
+            "记录声明 batch=" + repr(declared) + " 与目录推断 "
+            + repr(directory_batch) + " 冲突",
+            declared,
+        )
+    return BatchResult(BATCH_OK, declared, "", declared)
+
+
+# ---------------------------------------------------------------------------
+
 # 标准化
 # ---------------------------------------------------------------------------
 
@@ -748,13 +824,15 @@ def normalize_record(record, batch=None, run_dir=None):
         "" if condition.ok else condition.detail,
     )
 
-    # --- batch：由调用方按 run 目录名推断 ---
-    if batch is not None:
-        normalized.results["batch"] = _result("batch", True, batch)
-    else:
-        normalized.results["batch"] = _result(
-            "batch", False, None, "调用方未给出目录推断的批次（目录名无法判定批次）"
-        )
+    # --- batch：目录推断值 + 记录自身声明（类型与一致性都要核）---
+    # 只信目录会漏掉「记录显式声明了另一个批次」，所以这里不直接写目录值，
+    # 而是走 derive_batch：记录声明非法或与目录冲突都记 ok=False（调用方据此 FAIL）。
+    batch_result = derive_batch(row, directory_batch=batch)
+    normalized.results["batch"] = _result(
+        "batch", batch_result.ok,
+        batch_result.value if batch_result.ok else None,
+        "" if batch_result.ok else batch_result.detail,
+    )
 
     # --- 其余派生字段 ---
     for name, handler in (

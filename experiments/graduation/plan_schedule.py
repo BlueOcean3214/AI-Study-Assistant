@@ -261,6 +261,89 @@ def plan_identities(plan):
     }
 
 
+def plan_identity_entries(plan):
+    """逐任务展开身份条目：不去重、不合并，重复与结构问题都如实返回。
+
+    返回 (entries, problems)：
+      entries  [{"identity": 四元组, "plan_seq": int|None, "repeat_index": ...,
+                "round_index": ..., "where": "blocks[0].tasks[1]"}]
+      problems 结构问题描述（缺 blocks/sample_id/group/repeat_index 等）
+
+    必须逐任务展开而不是走集合推导：plan_identities() 用 set 会把重复身份折叠成
+    一个，而「计划里两个任务同身份」恰恰是最需要被发现的情形，不能靠它。
+    """
+
+    entries = []
+    problems = []
+    if not isinstance(plan, dict):
+        return entries, ["plan.json 不是 JSON 对象"]
+    experiment_id = plan.get("experiment_id")
+    if not isinstance(experiment_id, str) or not experiment_id.strip():
+        problems.append("缺少非空 experiment_id，无法构成身份四元组")
+    blocks = plan.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        problems.append("blocks 缺失或为空，没有任务列表")
+        return entries, problems
+    for block_index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            problems.append("blocks[" + str(block_index) + "] 不是 JSON 对象")
+            continue
+        sample_id = block.get("sample_id")
+        if not isinstance(sample_id, str) or not sample_id.strip():
+            problems.append("blocks[" + str(block_index) + "] 缺少非空 sample_id")
+        tasks = block.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            problems.append("blocks[" + str(block_index) + "]（sample_id="
+                            + repr(sample_id) + "）没有任务")
+            continue
+        for task_index, task in enumerate(tasks):
+            where = ("blocks[" + str(block_index) + "].tasks["
+                     + str(task_index) + "]")
+            if not isinstance(task, dict):
+                problems.append(where + " 不是 JSON 对象")
+                continue
+            group = task.get("group")
+            repeat_index = task.get("repeat_index")
+            if not isinstance(group, str) or not group.strip():
+                problems.append(where + " 缺少非空 group")
+            if not isinstance(repeat_index, int) or isinstance(repeat_index, bool):
+                problems.append(where + " 缺少 int repeat_index")
+            entries.append({
+                "identity": (experiment_id, sample_id, group, repeat_index),
+                "plan_seq": task.get("plan_seq"),
+                "repeat_index": repeat_index,
+                "round_index": task.get("round_index"),
+                "where": where,
+            })
+    return entries, problems
+
+
+def plan_identity_duplicates(entries):
+    """同一身份出现 ≥2 次的分组（按首次出现顺序）；每组保留全部条目与 plan_seq。"""
+
+    grouped = {}
+    order = []
+    for entry in entries:
+        key = entry["identity"]
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(entry)
+    return [(key, grouped[key]) for key in order if len(grouped[key]) > 1]
+
+
+def plan_identity_map(plan):
+    """身份 → 条目列表（保留重复，不覆盖）。结构有问题时返回 (None, problems)。"""
+
+    entries, problems = plan_identity_entries(plan)
+    if problems:
+        return None, problems
+    mapping = {}
+    for entry in entries:
+        mapping.setdefault(entry["identity"], []).append(entry)
+    return mapping, problems
+
+
 # ---------------------------------------------------------------------------
 # 校验
 # ---------------------------------------------------------------------------
