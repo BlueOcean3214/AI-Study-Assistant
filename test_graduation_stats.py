@@ -152,7 +152,10 @@ def _results_row(sample, condition, repeat, phase, zero_latency, round_index=1):
     return {
         "experiment_id": "exp-" + sample,
         "sample_id": sample,
-        "group": "G" + sample[1:],
+        # 真实记录里 group 就是实验条件（A/B/C/D/C-subj/D-subj/B0）：打包器的
+        # SourceRow.condition 恒等于源记录的 group，生产器也不写 condition 字段，
+        # 所以夹具必须让 group 与 condition 一致，否则夹具本身就违反冻结口径。
+        "group": condition,
         "condition": condition,
         "repeat_index": repeat,
         "round_index": round_index,
@@ -217,7 +220,7 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
                 if other["source_run_dir"] == item["run_dir"]) + 1),
             "experiment_id": "exp-" + sample,
             "sample_id": sample,
-            "group": "G" + sample[1:],
+            "group": condition,
             "condition": condition,
             "repeat_index": str(repeat),
             "round_index": item.get("round", "1"),

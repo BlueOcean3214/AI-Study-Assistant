@@ -57,6 +57,12 @@ import statistics
 import sys
 from pathlib import Path
 
+_SCHEMA_DIR = Path(__file__).resolve().parent
+if str(_SCHEMA_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCHEMA_DIR))
+
+import result_schema  # noqa: E402  condition 归属的唯一判定口径
+
 # ---------------------------------------------------------------------------
 # 常量：字段与口径（照抄 §5.4.6 / §5.4.7 / §7.2）
 # ---------------------------------------------------------------------------
@@ -1619,10 +1625,13 @@ MAPPING_IDENTITY_FIELDS = (
     ("experiment_id", "str"),
     ("sample_id", "str"),
     ("group", "str"),
-    ("condition", "str"),
     ("repeat_index", "int"),
     ("round_index", "int"),
 )
+# condition 不在这里逐字段比对：生产器（run_experiment.py）从未写出 condition 字段，
+# 打包器的 SourceRow.condition 明确规定等于源记录的 group。直接比 row["condition"]
+# 会恒为 None，真实 mapping 必然报 mismatch。condition 归属统一由
+# result_schema.derive_condition() 判定（见 _compare_mapping_identity）。
 
 
 def _compare_mapping_identity(blind_id, meta, row, line, problems):
@@ -1632,6 +1641,10 @@ def _compare_mapping_identity(blind_id, meta, row, line, problems):
     condition / repeat_index / experiment_id / source_row_number 仍可能被改成另一个
     「合法」值。那样 Y2/Y3/Y5 会被算进错误的格子，甚至错误的样本，统计结果看似
     正常却不可信，所以这里逐项比对、任何一项不符都算 results-mapping-mismatch。
+
+    condition 单独处理：生产器记录没有这个字段，打包器的 SourceRow.condition 就是
+    源记录的 group。因此 condition 只能按「由 group 派生」来核对——源记录自带
+    condition 且与 group 冲突时同样判失败，不会因为「字段缺失」而放行。
     """
 
     prefix = f"mapping.csv blind_id={blind_id}"
@@ -1675,6 +1688,23 @@ def _compare_mapping_identity(blind_id, meta, row, line, problems):
                     f"{prefix}：results 第 {line} 行 {field_name}="
                     f"{row.get(field_name)!r} 与 mapping 的 {text!r} 不一致"
                 )
+
+    # --- condition 归属：由源记录 group 派生，不能直接读 row["condition"] ---
+    want_condition = str(meta.get("condition") or "").strip()
+    if not want_condition:
+        problems["rows"].append(f"{prefix}：condition 为空")
+    else:
+        derived = result_schema.derive_condition(row)
+        if derived.code != result_schema.CONDITION_OK:
+            problems["rows"].append(
+                f"{prefix}：results 第 {line} 行无法确认 condition 归属"
+                f"（{derived.detail}），mapping 声明 {want_condition!r}"
+            )
+        elif derived.value != want_condition:
+            problems["rows"].append(
+                f"{prefix}：results 第 {line} 行 condition={derived.value!r}"
+                f"（由 group 派生）与 mapping 的 {want_condition!r} 不一致"
+            )
 
     want_prompt = str(meta.get("source_prompt_sha256") or "").strip().lower()
     if want_prompt and str(row.get("prompt_sha256") or "").strip().lower() != want_prompt:

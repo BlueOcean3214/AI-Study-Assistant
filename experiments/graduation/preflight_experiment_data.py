@@ -52,6 +52,7 @@ if str(HERE) not in sys.path:
 
 import manifest_rules  # noqa: E402
 import plan_schedule  # noqa: E402
+import result_schema  # noqa: E402
 
 # --- 冻结口径（docs/GRADUATION-EXPERIMENT-DESIGN.md） -----------------------
 DESIGN_SEED = 20261113                     # §5.1 冻结 seed
@@ -97,6 +98,11 @@ RESULTS_INT_FIELDS = ("repeat_index", "round_index", "plan_seq", "seed", "latenc
 RESULTS_STR_FIELDS = ("run_id", "experiment_id", "sample_id", "group", "batch",
                       "scheme", "algorithm_version", "base_sha",
                       "prompt_sha256", "messages_path", "data_kind")
+
+# 生产器（run_experiment.py）记录与 §7.1 的差异只能通过 result_schema 的确定性规则
+# 转换成设计视图；转换不出来的字段一律 FAIL，不降级为 WARNING。
+CONTRACT_BASIS = ("设计 §7.1（冻结记录结构）/ result_schema.FIELD_CONTRACT"
+                 "（生产器 run_experiment.py 字段取证）")
 
 LEVELS = ("FAIL", "WARNING", "UNKNOWN", "PASS")
 
@@ -326,6 +332,13 @@ def check_results(report, results_path, plan, expected_batch=None):
 
     返回**字段类型合法**的身份列表（畸形记录只形成 FAIL，不进入集合比较，
     否则 list/dict 值会让 set/dict 抛 TypeError，预检就崩了）。
+
+    两种记录来源：
+
+    - **设计原生行**（29 个 §7.1 字段齐全）：直接按字段校验，行为与改造前一致；
+    - **生产器行**（run_experiment.py 写出的记录）：先经 result_schema 做确定性
+      标准化，得到 §7.1 视图后再做同一套校验；转换不出来的字段按字段 FAIL，
+      不可恢复字段（run_id/base_sha/...）同样 FAIL，不降级为 WARNING。
     """
 
     area = "结果记录"
@@ -337,6 +350,23 @@ def check_results(report, results_path, plan, expected_batch=None):
     plan_sha = plan.get("plan_sha256") if plan else None
     legacy_plan_warned = False
     invalid_rows = 0
+    producer_rows = 0
+    derived_rows = 0
+    gap_rows = 0
+    gap_fields = {}
+    null_ok = set()
+
+    def _warn_legacy_plan(value):
+        """legacy 目录没有 plan.json：缺 plan_sha256 只报一次 WARNING（设计 §5.3 例外）。"""
+
+        nonlocal legacy_plan_warned
+        if legacy_plan_warned or _is_sha256(value):
+            return
+        legacy_plan_warned = True
+        report.add("WARNING", area, f"{label} · plan_sha256",
+                   "64 位十六进制（legacy 记录可能缺失）", repr(value),
+                   "该目录没有 plan.json（设计 §5.3 的 legacy 例外），记录缺 plan_sha256 时"
+                   "无法核对同源，需负责人确认", basis)
 
     try:
         text = results_path.read_text(encoding="utf-8")
@@ -360,18 +390,54 @@ def check_results(report, results_path, plan, expected_batch=None):
                        type(row).__name__, "记录格式错误", basis)
             continue
 
-        missing = [name for name in RESULTS_REQUIRED_FIELDS if name not in row]
+        null_ok = set()  # 只有生产器行会出现「设计值就是 null」的字段
+
+        # --- 生产器记录：先按 §7.1 视图做确定性标准化 ---
+        # run_experiment.py 从未写出 §7.1 原生结构（见 result_schema 契约表），
+        # 所以不能拿字段名直接比对：能确定性导出的字段导出，导不出的字段 FAIL。
+        # 设计原生记录（历史/合成/将来按 §7.1 产出的数据）仍走下面原有的严格路径。
+        if not result_schema.is_design_native(row):
+            producer_rows += 1
+            normalized = result_schema.normalize_record(
+                row, batch=expected_batch, run_dir=results_path.parent)
+            failures = normalized.failures()
+            for name in sorted(failures):
+                report.add("FAIL", area, f"{label}:{lineno} · {name}",
+                           "可确定性导出", failures[name],
+                           "生产器记录该字段无法按冻结设计导出", CONTRACT_BASIS)
+            for name in normalized.missing():
+                if name in failures:
+                    continue
+                gap_fields.setdefault(name, []).append(lineno)
+            if not normalized.is_complete():
+                gap_rows += 1
+                # 即使这一行因契约缺口被跳过，legacy 缺 plan_sha256 的已知限制仍要告知
+                if plan is None:
+                    _warn_legacy_plan(normalized.value("plan_sha256"))
+                continue
+            row = normalized.view()
+            # 设计值本身就是 null 的字段（成功记录的 error、legacy 的 plan_sha256）
+            # 不在视图里是正常的：交给下面的 error / plan_sha256 判定，不当作缺字段。
+            null_ok = set(normalized.null_valued())
+            derived_rows += 1
+
+        missing = [name for name in RESULTS_REQUIRED_FIELDS
+                   if name not in row and name not in null_ok]
         if missing:
             report.add("FAIL", area, f"{label}:{lineno}", "§7.1 全部字段",
                        f"缺 {missing}", "字段缺失，无法进入统计", basis)
             invalid_rows += 1
             continue
         for name in RESULTS_INT_FIELDS:
+            if name in null_ok:
+                continue
             value = row.get(name)
             if not _is_int(value):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
                            "int（不能是 bool）", repr(value), "字段类型错误", basis)
         for name in RESULTS_STR_FIELDS:
+            if name in null_ok:
+                continue
             value = row.get(name)
             if not isinstance(value, str) or not value.strip():
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
@@ -429,13 +495,32 @@ def check_results(report, results_path, plan, expected_batch=None):
                 report.add("FAIL", area, f"{label}:{lineno} · 身份",
                            "属于 plan.json 的任务", repr(identity),
                            "结果行不在计划中", basis)
-        elif not _is_sha256(plan_sha_value) and not legacy_plan_warned:
-            legacy_plan_warned = True
-            report.add("WARNING", area, f"{label} · plan_sha256",
-                       "64 位十六进制（legacy 记录可能缺失）", repr(plan_sha_value),
-                       "该目录没有 plan.json（设计 §5.3 的 legacy 例外），记录缺 plan_sha256 时"
-                       "无法核对同源，需负责人确认", basis)
+        else:
+            _warn_legacy_plan(plan_sha_value)
 
+    # --- 契约缺口：按字段聚合，各一条 FAIL（不可恢复字段不得降级为 WARNING）---
+    unrecoverable = result_schema.unrecoverable_reasons()
+    for name in RESULTS_REQUIRED_FIELDS:
+        lines = gap_fields.get(name)
+        if not lines:
+            continue
+        report.add("FAIL", area, f"{label} · {name}",
+                   "§7.1 必填字段（生产器记录须可核验）",
+                   f"{len(lines)} 行缺失：第 {lines[:5]} 行",
+                   unrecoverable.get(
+                       name, "生产器未记录该字段，且无法从现有字段确定性恢复"),
+                   CONTRACT_BASIS)
+
+    if producer_rows:
+        report.notes.append(
+            f"{label}：{producer_rows} 行来自 run_experiment.py（生产器 schema），"
+            f"经 result_schema 标准化为 §7.1 视图；{derived_rows} 行完整导出，"
+            f"{gap_rows} 行存在无法恢复的字段")
+        report.notes.append(
+            f"{label}：标准化覆盖 {len(result_schema.DIRECT_FIELDS)} 个直供字段、"
+            f"{len(result_schema.DERIVED_FIELDS)} 个可确定性派生字段；"
+            f"不可恢复字段 {len(result_schema.UNRECOVERABLE_FIELDS)} 个，"
+            f"逐字段见上（缺 {sorted(gap_fields)}）")
     if invalid_rows:
         report.notes.append(f"{label}：{invalid_rows} 行字段/身份畸形，已跳过集合比较")
     if plan_ids is not None:
