@@ -33,6 +33,7 @@ for _path in (str(HERE), str(GRADUATION_DIR)):
 import analyze_stats  # noqa: E402
 import build_prompts  # noqa: E402
 import make_blind_pack  # noqa: E402
+import plan_schedule  # noqa: E402
 import preflight_experiment_data  # noqa: E402
 import result_schema  # noqa: E402
 import run_experiment  # noqa: E402
@@ -294,6 +295,14 @@ def _preflight(results_path, *, batch="main", plan=None):
     preflight_experiment_data.check_results(report, Path(results_path), plan,
                                             expected_batch=batch)
     return report
+
+
+def _check(results_path, *, batch="main", plan=None):
+    """同 _preflight，但返回 (报告, 身份列表)：身份列表证明行没被整体跳过。"""
+    report = preflight_experiment_data.Report()
+    identities = preflight_experiment_data.check_results(
+        report, Path(results_path), plan, expected_batch=batch)
+    return report, identities
 
 
 def _fails(report):
@@ -689,6 +698,205 @@ def test_preflight_failed_record(run_dir, api):
 
 
 # ---------------------------------------------------------------------------
+# 7.5 生产器记录 × plan.json 联合核验（第四轮复审）
+#
+# 第三轮的预检对生产器记录 normalize 后只要 is_complete() 为假就 continue，
+# 于是「有 7 个不可恢复字段」被当成「这一行等于不存在」：身份不进集合比较、
+# 计划全部报缺失、plan_sha256 同源核对也不做。下面七个场景把两个维度分开钉住：
+# 契约缺口照报 FAIL，执行证据照常核验，互不屏蔽、互不伪造 PASS。
+# ---------------------------------------------------------------------------
+
+
+def _plan_for(*, experiment_id=EXPERIMENT_ID, sample_id=SAMPLE_ID, group=GROUP,
+              rounds=1):
+    """与 _produce 落盘记录同源的 plan.json（身份四元组一一对应）。"""
+
+    return plan_schedule.build_schedule(
+        experiment_id=experiment_id,
+        sample_groups={sample_id: [group]},
+        rounds=rounds,
+        seed=SEED,
+        scheme=SCHEME,
+        algorithm_version=ALGORITHM_VERSION,
+        config_hash="cd" * 32,
+        created_at="2026-11-20T14:00:00+08:00",
+    )
+
+
+def _gap_fails(report):
+    """只挑出「§7.1 缺口」这一类 FAIL（target 结尾是不可恢复字段名）。"""
+
+    return [item for item in _fails(report)
+            if item.target.rsplit(" · ", 1)[-1] in result_schema.UNRECOVERABLE_FIELDS]
+
+
+def test_partial_record_with_plan(run_dir, api):
+    """场景 1：正常生产器记录 + 同源 plan.json。"""
+
+    plan = _plan_for()
+    record, path = _produce(run_dir, api, plan_sha256=plan["plan_sha256"])
+    report, identities = _check(path, plan=plan)
+    notes = "\n".join(report.notes)
+    targets = _fail_targets(report)
+
+    check("场景1：7 个不可恢复字段仍然逐字段 FAIL",
+          len(_gap_fails(report)) == 7,
+          [item.target for item in _fails(report)])
+    check("场景1：整条记录没有被跳过（身份进入集合比较）",
+          identities == [(EXPERIMENT_ID, SAMPLE_ID, GROUP, 0)], identities)
+    check("场景1：计划完成度不误报缺失",
+          not any(item.level == "FAIL" and "计划完成度" in item.target
+                  for item in report.findings)
+          and any(item.level == "PASS" and "计划完成度" in item.target
+                  for item in report.findings),
+          [item.render() for item in report.findings if "计划完成度" in item.target])
+    check("场景1：同源时 plan_sha256 不产生 FAIL",
+          "plan_sha256" not in targets, targets[:300])
+    check("场景1：报告分开写「执行证据」与「§7.1 完整性」",
+          "执行证据" in notes and "§7.1 完整性" in notes, notes)
+    check("场景1：执行证据给出结果行数与身份可识别行数",
+          "非空结果行 1 行" in notes and "身份可识别 1 行" in notes, notes)
+    check("场景1：执行证据给出计划覆盖（1 个计划任务、未命中 0）",
+          "计划任务 1 个" in notes and "未命中 0 个" in notes, notes)
+    check("场景1：§7.1 完整性单独计数（缺口 1 行、完整 0 行）",
+          "完整记录 0 行" in notes and "存在契约缺口 1 行" in notes, notes)
+    check("场景1：没有为部分标准化伪造 §7.1 合规 PASS",
+          [item for item in report.findings
+           if item.level == "PASS"
+           and item.target.rsplit(" · ", 1)[-1] in result_schema.DESIGN_FIELDS] == [],
+          [item.target for item in report.findings if item.level == "PASS"])
+
+
+def test_partial_record_plan_sha_null(run_dir, api):
+    """场景 2：plan.json 存在、记录 plan_sha256 为 null —— 必须额外 FAIL。"""
+
+    plan = _plan_for()
+    record, path = _produce(run_dir, api, plan_sha256=None)
+    report, identities = _check(path, plan=plan)
+    sha_fails = [item for item in _fails(report)
+                 if item.target.endswith(" · plan_sha256")]
+
+    check("场景2：plan_sha256=null 额外产生 FAIL", len(sha_fails) == 1,
+          [item.target for item in _fails(report)])
+    check("场景2：FAIL 写明是「null（记录未提供）」",
+          any("null（记录未提供）" in item.actual for item in sha_fails),
+          [item.actual for item in sha_fails])
+    check("场景2：缺口 FAIL 与同源 FAIL 同时存在（7 + 1 = 8 条）",
+          len(_fails(report)) == 8 and len(_gap_fails(report)) == 7,
+          len(_fails(report)))
+    check("场景2：有 plan.json 时不走 legacy WARNING",
+          not any(item.level == "WARNING" and "plan_sha256" in item.target
+                  for item in report.findings),
+          [item.target for item in report.findings if item.level == "WARNING"])
+    check("场景2：身份仍被识别",
+          identities == [(EXPERIMENT_ID, SAMPLE_ID, GROUP, 0)], identities)
+
+
+def test_partial_record_plan_sha_tampered(run_dir, api):
+    """场景 3：plan_sha256 被篡改 —— 不能被 7 个缺口遮住。"""
+
+    plan = _plan_for()
+    record, path = _produce(run_dir, api, plan_sha256="ee" * 32)
+    report, identities = _check(path, plan=plan)
+    sha_fails = [item for item in _fails(report)
+                 if item.target.endswith(" · plan_sha256")]
+
+    check("场景3：篡改的 plan_sha256 被识别（不同源）",
+          len(sha_fails) == 1
+          and sha_fails[0].reason == "结果行与同目录 plan.json 不同源",
+          [(item.reason, item.actual) for item in sha_fails])
+    check("场景3：契约缺口 7 条 + 同源 1 条 = 8 条",
+          len(_fails(report)) == 8 and len(_gap_fails(report)) == 7,
+          len(_fails(report)))
+    check("场景3：篡改不影响身份识别",
+          identities == [(EXPERIMENT_ID, SAMPLE_ID, GROUP, 0)], identities)
+
+
+def test_partial_record_not_in_plan(run_dir, api):
+    """场景 4：结果行不属于 plan.json —— 有 7 个缺口也必须发现。"""
+
+    plan = _plan_for(sample_id="S3")
+    record, path = _produce(run_dir, api, plan_sha256=plan["plan_sha256"])
+    report, identities = _check(path, plan=plan)
+    targets = _fail_targets(report)
+
+    check("场景4：发现结果行不在计划中",
+          any(item.reason == "结果行不在计划中" for item in _fails(report)),
+          [(item.target, item.reason) for item in _fails(report)])
+    check("场景4：计划完成度同时报缺失（不因缺口而放过）",
+          any(item.level == "FAIL" and "计划完成度" in item.target
+                  for item in report.findings),
+          [item.render() for item in report.findings if "计划完成度" in item.target])
+    check("场景4：缺口 7 条 + 身份 1 条 + 完成度 1 条 = 9 条",
+          len(_fails(report)) == 9 and len(_gap_fails(report)) == 7,
+          [item.target for item in _fails(report)])
+    check("场景4：缺失的计划身份被点名",
+          any("S3" in item.reason for item in _fails(report)), targets[:300])
+
+
+def test_partial_record_duplicate(run_dir, api):
+    """场景 5：重复身份 —— 缺口行也必须继续查重。"""
+
+    plan = _plan_for()
+    _produce(run_dir, api, plan_sha256=plan["plan_sha256"])
+    record, path = _produce(run_dir, api, plan_sha256=plan["plan_sha256"])
+    report, identities = _check(path, plan=plan)
+
+    check("场景5：发现重复身份",
+          any(item.reason == "同一实验身份出现多条记录" for item in _fails(report)),
+          [(item.target, item.actual) for item in _fails(report)])
+    check("场景5：重复的同一身份只计 1 个", len(identities) == 1, identities)
+    check("场景5：缺口 7 条 + 重复 1 条 = 8 条（缺口按字段聚合不刷屏）",
+          len(_fails(report)) == 8 and len(_gap_fails(report)) == 7,
+          [item.target for item in _fails(report)])
+    check("场景5：两条真实执行记录被计数",
+          any("非空结果行 2 行" in note for note in report.notes), report.notes)
+
+
+def test_partial_record_batch_misattributed(run_dir, api):
+    """场景 6：批次归属错误 —— 生产器行的 batch 由目录推断，归属由覆盖检查判定。"""
+
+    plan = _plan_for()
+    record, path = _produce(run_dir, api, plan_sha256=plan["plan_sha256"])
+    report, identities = _check(path, batch="suppl-subj", plan=plan)
+    check("场景6：生产器行照常带上目录推断的批次",
+          identities == [(EXPERIMENT_ID, SAMPLE_ID, GROUP, 0)], identities)
+    check("场景6：批次本身不产生假 FAIL",
+          not any("· batch" in item.target for item in _fails(report)),
+          [item.target for item in _fails(report)])
+
+    coverage = preflight_experiment_data.Report()
+    preflight_experiment_data.check_coverage(coverage, "suppl-subj", identities,
+                                             {EXPERIMENT_ID})
+    check("场景6：S2 记录放进 suppl-subj 目录 → 覆盖检查报 FAIL",
+          any(item.level == "FAIL" for item in coverage.findings),
+          [item.render() for item in coverage.findings])
+    check("场景6：覆盖 FAIL 与 7 条缺口 FAIL 互不屏蔽",
+          len(_gap_fails(report)) == 7 and len(_fails(report)) == 7,
+          [item.target for item in _fails(report)])
+
+
+def test_partial_record_legacy_still_warning(run_dir, api):
+    """场景 7：无 plan.json 的 B0 legacy —— 仍只报 WARNING，不算缺口 FAIL。"""
+
+    record, path = _produce(run_dir, api, plan_sha256=None)
+    report, identities = _check(path, plan=None)
+    warnings = [item for item in report.findings
+                if item.level == "WARNING" and "plan_sha256" in item.target]
+
+    check("场景7：legacy 缺 plan_sha256 只有 WARNING", len(warnings) == 1,
+          [item.target for item in report.findings if item.level == "WARNING"])
+    check("场景7：不因缺 plan_sha256 多出 FAIL（仍只有 7 条缺口）",
+          len(_fails(report)) == 7 and len(_gap_fails(report)) == 7,
+          [item.target for item in _fails(report)])
+    check("场景7：没有 plan.json 时不做计划完成度判定",
+          not any("计划完成度" in item.target for item in report.findings),
+          [item.target for item in report.findings])
+    check("场景7：legacy 行仍被计入执行证据",
+          identities == [(EXPERIMENT_ID, SAMPLE_ID, GROUP, 0)]
+          and any("身份可识别 1 行" in note for note in report.notes), report.notes)
+
+# ---------------------------------------------------------------------------
 # 8. 消费者二：打包器
 # ---------------------------------------------------------------------------
 
@@ -860,6 +1068,18 @@ def _run_all():
         test_preflight_usage_unavailable(root / "case-nousage" / "run", api)
         test_preflight_legacy_plan_sha(root / "case-legacy" / "run", api)
         test_preflight_failed_record(root / "case-failed" / "run", api)
+
+        # 7.5：生产器记录 × plan.json 联合核验
+        for name, runner in (
+            ("case-plan-ok", test_partial_record_with_plan),
+            ("case-plan-null", test_partial_record_plan_sha_null),
+            ("case-plan-tamper", test_partial_record_plan_sha_tampered),
+            ("case-plan-notin", test_partial_record_not_in_plan),
+            ("case-plan-dup", test_partial_record_duplicate),
+            ("case-plan-batch", test_partial_record_batch_misattributed),
+            ("case-plan-legacy", test_partial_record_legacy_still_warning),
+        ):
+            runner(root / name / "run", _make_api(root / name))
 
         # 8：打包器
         test_packer(path)

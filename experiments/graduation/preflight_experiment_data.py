@@ -339,6 +339,18 @@ def check_results(report, results_path, plan, expected_batch=None):
     - **生产器行**（run_experiment.py 写出的记录）：先经 result_schema 做确定性
       标准化，得到 §7.1 视图后再做同一套校验；转换不出来的字段按字段 FAIL，
       不可恢复字段（run_id/base_sha/...）同样 FAIL，不降级为 WARNING。
+
+    对生产器行，「执行证据」与「§7.1 契约完整性」是两个独立维度：
+
+    - 执行证据（这一行是否真的跑过）由身份四元组、批次归属、是否属于
+      plan.json、plan_sha256 是否同源来证明；只要这些字段能导出来就照常核对，
+      与 7 个不可恢复字段缺不缺无关。
+    - 契约完整性由 29 个字段是否齐备来判定，缺口逐字段 FAIL（按字段聚合，
+      不逐行刷屏），并单独计数。
+
+    因此结果行即使 `is_complete()` 为假也**不会**被整体跳过：缺口照报，
+    身份照进集合比较与计划覆盖统计。反过来也不允许用「部分成功」换任何
+    §7.1 合规 PASS。
     """
 
     area = "结果记录"
@@ -355,6 +367,9 @@ def check_results(report, results_path, plan, expected_batch=None):
     gap_rows = 0
     gap_fields = {}
     null_ok = set()
+    failed_fields = set()
+    result_rows = 0
+    identified_rows = 0
 
     def _warn_legacy_plan(value):
         """legacy 目录没有 plan.json：缺 plan_sha256 只报一次 WARNING（设计 §5.3 例外）。"""
@@ -379,6 +394,7 @@ def check_results(report, results_path, plan, expected_batch=None):
             report.add("FAIL", area, f"{label}:{lineno}", "非空行", "空行",
                        "结果文件出现空行，可能被截断或手工编辑", basis)
             continue
+        result_rows += 1
         try:
             row = json.loads(line)
         except json.JSONDecodeError as error:
@@ -391,16 +407,24 @@ def check_results(report, results_path, plan, expected_batch=None):
             continue
 
         null_ok = set()  # 只有生产器行会出现「设计值就是 null」的字段
+        failed_fields = set()
+        partial = False  # 生产器行：只有 §7.1 视图的一部分，核验按「可得即核」
 
         # --- 生产器记录：先按 §7.1 视图做确定性标准化 ---
         # run_experiment.py 从未写出 §7.1 原生结构（见 result_schema 契约表），
         # 所以不能拿字段名直接比对：能确定性导出的字段导出，导不出的字段 FAIL。
         # 设计原生记录（历史/合成/将来按 §7.1 产出的数据）仍走下面原有的严格路径。
+        #
+        # 契约缺口（7 个不可恢复字段）**不等于**执行证据缺失：缺口只让「§7.1 完整性」
+        # 这一维度 FAIL；其余字段能证明的身份、批次归属、计划成员关系、同源哈希仍要
+        # 逐行核对。否则一批真实跑完的数据会被整体误报成「计划任务全部缺失」。
         if not result_schema.is_design_native(row):
             producer_rows += 1
+            partial = True
             normalized = result_schema.normalize_record(
                 row, batch=expected_batch, run_dir=results_path.parent)
             failures = normalized.failures()
+            failed_fields = set(failures)
             for name in sorted(failures):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
                            "可确定性导出", failures[name],
@@ -409,34 +433,38 @@ def check_results(report, results_path, plan, expected_batch=None):
                 if name in failures:
                     continue
                 gap_fields.setdefault(name, []).append(lineno)
-            if not normalized.is_complete():
+            if normalized.is_complete():
+                derived_rows += 1
+            else:
                 gap_rows += 1
-                # 即使这一行因契约缺口被跳过，legacy 缺 plan_sha256 的已知限制仍要告知
+                # 即使这一行有契约缺口，legacy 缺 plan_sha256 的已知限制仍要告知
                 if plan is None:
                     _warn_legacy_plan(normalized.value("plan_sha256"))
-                continue
             row = normalized.view()
             # 设计值本身就是 null 的字段（成功记录的 error、legacy 的 plan_sha256）
             # 不在视图里是正常的：交给下面的 error / plan_sha256 判定，不当作缺字段。
             null_ok = set(normalized.null_valued())
-            derived_rows += 1
 
-        missing = [name for name in RESULTS_REQUIRED_FIELDS
-                   if name not in row and name not in null_ok]
-        if missing:
-            report.add("FAIL", area, f"{label}:{lineno}", "§7.1 全部字段",
-                       f"缺 {missing}", "字段缺失，无法进入统计", basis)
-            invalid_rows += 1
-            continue
+        # --- 字段齐全性：设计原生行要求 29 个字段全在 ---
+        # 生产器行的缺口已按字段聚合上报（见函数末尾），此处不逐行重复刷屏，
+        # 也不把「取不到」当成「值不对」再报一次。
+        if not partial:
+            missing = [name for name in RESULTS_REQUIRED_FIELDS
+                       if name not in row and name not in null_ok]
+            if missing:
+                report.add("FAIL", area, f"{label}:{lineno}", "§7.1 全部字段",
+                           f"缺 {missing}", "字段缺失，无法进入统计", basis)
+                invalid_rows += 1
+                continue
         for name in RESULTS_INT_FIELDS:
-            if name in null_ok:
+            if name in null_ok or name not in row:
                 continue
             value = row.get(name)
             if not _is_int(value):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
                            "int（不能是 bool）", repr(value), "字段类型错误", basis)
         for name in RESULTS_STR_FIELDS:
-            if name in null_ok:
+            if name in null_ok or name not in row:
                 continue
             value = row.get(name)
             if not isinstance(value, str) or not value.strip():
@@ -450,11 +478,17 @@ def check_results(report, results_path, plan, expected_batch=None):
                 report.add("FAIL", area, f"{label}:{lineno} · batch",
                            f"batch={expected_batch}（由目录推断）", repr(batch_value),
                            "记录批次与所属目录不符", basis)
+        elif partial and expected_batch is None:
+            # 批次本身无法判定（目录名与记录都给不出唯一值）：行级不重复报错，
+            # 由 run_preflight 的 UNKNOWN「可判定的批次」统一说明。
+            pass
         else:
             report.add("FAIL", area, f"{label}:{lineno} · batch",
                        "非空字符串", repr(batch_value), "批次字段类型/取值错误", basis)
 
-        if row.get("data_kind") != DESIGN_DATA_KIND:
+        # data_kind 在生产器记录里是不可恢复字段：缺口已按字段 FAIL（见函数末尾），
+        # 这里既不补默认值，也不因为「跳过」而产生任何 §7.1 合规 PASS。
+        if not partial and row.get("data_kind") != DESIGN_DATA_KIND:
             report.add("FAIL", area, f"{label}:{lineno} · data_kind",
                        DESIGN_DATA_KIND, repr(row.get("data_kind")),
                        "数据来源标记与设计不符", basis)
@@ -473,6 +507,7 @@ def check_results(report, results_path, plan, expected_batch=None):
                        and isinstance(group, str) and group.strip()
                        and _is_int(repeat_index))
         if identity_ok:
+            identified_rows += 1
             identity = (experiment_id, sample_id, group, repeat_index)
             if identity in seen:
                 report.add("FAIL", area, f"{label}:{lineno} · 身份",
@@ -487,7 +522,14 @@ def check_results(report, results_path, plan, expected_batch=None):
 
         plan_sha_value = row.get("plan_sha256")
         if plan is not None:
-            if plan_sha_value != plan_sha:
+            if plan_sha_value is None and "plan_sha256" not in failed_fields:
+                # 只有「记录根本没给」才走这条：设计 §7.1 要求每条结果行带 plan_sha256，
+                # 有 plan.json 时可据此核对同源；null 不是可以忽略的缺省值。
+                report.add("FAIL", area, f"{label}:{lineno} · plan_sha256",
+                           plan_sha, "null（记录未提供）",
+                           "plan.json 存在时结果行必须带 plan_sha256，否则无法核对同源",
+                           basis)
+            elif plan_sha_value is not None and plan_sha_value != plan_sha:
                 report.add("FAIL", area, f"{label}:{lineno} · plan_sha256",
                            plan_sha, repr(plan_sha_value),
                            "结果行与同目录 plan.json 不同源", basis)
@@ -513,6 +555,13 @@ def check_results(report, results_path, plan, expected_batch=None):
 
     if producer_rows:
         report.notes.append(
+            f"{label}：执行证据 —— 非空结果行 {result_rows} 行，身份可识别 "
+            f"{identified_rows} 行（唯一身份 {len(identities)} 个）")
+        report.notes.append(
+            f"{label}：§7.1 完整性 —— 完整记录 {derived_rows} 行，存在契约缺口 "
+            f"{gap_rows} 行（缺口字段 {len(gap_fields)} 个）；缺口不影响上面这一行的"
+            f"身份与计划归属核验，但该文件整体仍因缺口 FAIL")
+        report.notes.append(
             f"{label}：{producer_rows} 行来自 run_experiment.py（生产器 schema），"
             f"经 result_schema 标准化为 §7.1 视图；{derived_rows} 行完整导出，"
             f"{gap_rows} 行存在无法恢复的字段")
@@ -525,6 +574,9 @@ def check_results(report, results_path, plan, expected_batch=None):
         report.notes.append(f"{label}：{invalid_rows} 行字段/身份畸形，已跳过集合比较")
     if plan_ids is not None:
         missing_ids = sorted(plan_ids - set(identities))
+        report.notes.append(
+            f"{label}：计划任务 {len(plan_ids)} 个，身份命中（已执行）"
+            f"{len(plan_ids) - len(missing_ids)} 个，未命中 {len(missing_ids)} 个")
         if missing_ids:
             report.add("FAIL", area, f"{label} · 计划完成度",
                        f"{len(plan_ids)} 个计划身份", f"缺 {len(missing_ids)}",
