@@ -10,32 +10,36 @@
         --manifest docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv
 
 检查内容：
+
 - 清单（manifest）声明的文件是否存在、大小/SHA-256/记录数是否与磁盘一致；
+- **文件级**清单覆盖：每个运行目录的 plan.json 与 results.jsonl 要分别确认已纳入清单，
+  不能用「目录里有一个文件在清单里」代表整个目录可信；B0 legacy 按设计例外单独处理；
 - plan.json 的 plan_sha256 是否自洽，冻结参数（seed/scheme/algorithm_version/
   block_unit/round_count）是否与设计 §5.1 一致；
 - results.jsonl 是否可解析、字段是否齐全、身份是否重复、行是否属于计划、
-  plan_sha256 是否与同目录计划同源；
+  plan_sha256 是否与同目录计划同源；**每一条记录的 batch 都必须与目录推断值一致**；
+- 字段类型畸形（list/dict/null 等）只形成结构化 FAIL，不再让集合/身份比较抛异常；
 - 覆盖是否与冻结设计一致：主实验 7 样本 × A/B/C/D × 5 轮 = 140 份，补充
-  C/D-subj（S5）10 份、S7-empty × D 5 份，生成任务合计 165 份；B0 的 10 份是
-  legacy 探索组，只做记录、不作为覆盖要求。
+  C/D-subj（S5）10 份、S7-empty × D 5 份，B0 legacy 10 份只记录；
+- 运行前后对 **manifest 自身 + 所有实际读取的 plan.json/results.jsonl** 重算哈希。
 
 只读约定：本工具只打开文件进行读取，不写、不改、不生成任何实验数据；唯一的写操作
-是把报告写到显式给出的 `--json` 路径（可选）。运行结束会重算输入文件哈希，若期间
-被改动则报 FAIL。
+是把报告写到显式给出的 `--json` 路径（可选）。
 
 报告分级：
 - PASS：实际值与冻结设计/清单一致；
-- WARNING：设计未规定或无法从现有证据判定的地方（例如未纳入清单的 legacy 目录），
+- WARNING：设计未规定或无法从现有证据判定的地方（例如未纳入清单的 B0 legacy），
   需要负责人确认；
-- FAIL：与冻结设计/清单冲突，或数据本身损坏，这些情况不得进入正式统计。
-- UNKNOWN：证据不足（文件缺失导致无法继续核对该项）。
+- FAIL：与冻结设计/清单冲突，或数据本身损坏，这些情况不得进入正式统计；
+- UNKNOWN：证据不足（无法判定批次等）。
 
-退出码：0 = 无 FAIL；1 = 存在 FAIL；2 = 参数/环境错误。
+退出码：0 = 无 FAIL；1 = 存在 FAIL；2 = 参数错误。
 """
 
 import argparse
 import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,20 +62,26 @@ DESIGN_ROUND_COUNT = 5                     # §5.1 / §5.3
 DESIGN_MAIN_SAMPLES = ("S1", "S2", "S3", "S4", "S5", "S6", "S7")   # §2.4
 DESIGN_MAIN_GROUPS = ("A", "B", "C", "D")                          # §2.4
 DESIGN_MAIN_RECORDS = 140                  # §2.4 28 格 × 5 轮
-DESIGN_SUPPLEMENT_SUBJ = {"sample_id": "S5", "groups": ("C-subj", "D-subj"),
-                          "batches": ("suppl-subj",), "records_per_cell": 5}
-DESIGN_SUPPLEMENT_S7EMPTY = {"sample_id": "S7-empty", "groups": ("D",),
-                             "batches": ("suppl-s7empty",),
-                             "records_per_cell": 5}
+DESIGN_SUPPLEMENT_RECORDS = 25             # §2.4 补充源输出 25 份
 DESIGN_GENERATED_TOTAL = 165               # §2.4 140 + 25
-DESIGN_BLIND_FORMAL = 84                   # §2.4 / §7.2
-DESIGN_BLIND_SUPPLEMENT = 23               # §2.4（25 份源输出里实际纳入 23）
 DESIGN_DATA_KIND = "simulated_learner_fixture"        # §7.1
 B0_BATCH = "b0-legacy"
 B0_LEGACY_SAMPLES = ("S5", "S7")           # §1.3 / §2.4，B0 只跑这两格
 B0_LEGACY_RECORDS = 10
 RESULTS_FILE_NAME = "results.jsonl"
 TOTAL_BATCHES = ("main", "suppl-subj", "suppl-s7empty", B0_BATCH)
+# 目录名前缀 → 批次（可信规则；不依赖记录内容，避免第一条记录决定整批归属）
+BATCH_PREFIXES = (
+    ("internal-api-smoke-", "smoke"),
+    ("suppl-s7empty-", "suppl-s7empty"),
+    ("suppl-subj-", "suppl-subj"),
+    ("main-", "main"),
+    ("b0-", B0_BATCH),
+)
+SUPPLEMENT_S7EMPTY = {"sample_id": "S7-empty", "groups": ("D",),
+                      "batches": ("suppl-s7empty",), "records_per_cell": 5}
+SUPPLEMENT_SUBJ = {"sample_id": "S5", "groups": ("C-subj", "D-subj"),
+                   "batches": ("suppl-subj",), "records_per_cell": 5}
 
 # §7.1 生成记录字段（全部必填；值为 None 也算存在）
 RESULTS_REQUIRED_FIELDS = (
@@ -151,45 +161,54 @@ class Report:
 
 
 def check_manifest(report, manifest_path, repo_root):
-    """清单声明的文件是否存在，大小/哈希/记录数是否与磁盘一致。返回已核对的路径集合。"""
+    """清单声明的文件是否存在，大小/哈希/记录数是否与磁盘一致。
+
+    返回清单覆盖的绝对路径集合。**同一文件只要有一项不一致，就不再补 PASS**：
+    报告的 PASS/FAIL 必须互斥，否则「哈希对不上」和「清单条目可核对」会同时出现。
+    """
 
     area = "清单"
     basis = "docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv（可信清单）"
-    verified = set()
+    declared_paths = set()
+    failed_paths = set()
     if not manifest_path.is_file():
         report.add("FAIL", area, str(manifest_path), "清单文件存在",
                    "不存在", "缺少可信清单，无法核对文件完整性", basis)
-        return verified
+        return declared_paths, failed_paths
     try:
         entries = manifest_rules.load_manifest(manifest_path)
     except manifest_rules.ManifestError as error:
         report.add("FAIL", area, str(manifest_path), "清单结构与列定义合法",
                    f"解析失败：{error}", "清单不可信，后续核对全部失效", basis)
-        return verified
+        return declared_paths, failed_paths
 
     if not entries:
         report.add("FAIL", area, str(manifest_path), "至少有一条清单条目",
                    "0 条", "空清单无法作为可信来源", basis)
-        return verified
+        return declared_paths, failed_paths
 
     for relative, entry in sorted(entries.items()):
         path = (repo_root / relative).resolve()
-        verified.add(path)
+        declared_paths.add(path)
         target = relative
         if not path.is_file():
             report.add("FAIL", area, target, "文件存在", str(path),
                        "清单声明的文件缺失", basis)
+            failed_paths.add(path)
             continue
+        entry_ok = True
         actual_size = path.stat().st_size
         declared_size = entry.get("size_bytes")
         if str(actual_size) != str(declared_size).strip():
             report.add("FAIL", area, target, f"size_bytes={declared_size}",
                        f"size_bytes={actual_size}", "文件大小与清单不符", basis)
+            entry_ok = False
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         declared = str(entry.get("sha256", "")).strip().lower()
         if digest != declared:
             report.add("FAIL", area, target, f"sha256={declared}",
                        f"sha256={digest}", "文件 SHA-256 与清单不符", basis)
+            entry_ok = False
         declared_records = str(entry.get("records", "")).strip()
         if path.name == plan_schedule.PLAN_NAME:
             try:
@@ -198,15 +217,20 @@ def check_manifest(report, manifest_path, repo_root):
             except (OSError, ValueError, KeyError, TypeError) as error:
                 report.add("FAIL", area, target, "可解析的 plan.json",
                            f"解析失败：{error}", "计划文件损坏", basis)
+                failed_paths.add(path)
                 continue
         else:
             actual_records = str(_count_jsonl(path))
         if declared_records and declared_records != actual_records:
             report.add("FAIL", area, target, f"records={declared_records}",
                        f"records={actual_records}", "记录数与清单不符", basis)
-        report.add("PASS", area, target, "存在、大小/哈希/记录数与清单一致",
-                   "一致", "清单条目可核对", basis)
-    return verified
+            entry_ok = False
+        if entry_ok:
+            report.add("PASS", area, target, "存在、大小/哈希/记录数与清单一致",
+                       "一致", "清单条目可核对", basis)
+        else:
+            failed_paths.add(path)
+    return declared_paths, failed_paths
 
 
 def _count_jsonl(path):
@@ -225,7 +249,7 @@ def _count_jsonl(path):
 def check_plan(report, plan_path, expected_identities, label, *, strict=True):
     """plan.json 完整性 + 冻结参数 + 任务身份集合。返回 plan 或 None。
 
-    strict=False 用于设计 §2.4 之外、不受五轮冻结参数约束的目录（例如冒烟批次）：
+    `strict=False` 用于设计 §2.4 之外、不受五轮冻结参数约束的目录（例如冒烟批次）：
     参数偏离冻结值只报 WARNING（需负责人确认），不直接判 FAIL。
     """
 
@@ -293,16 +317,26 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
 # ---------------------------------------------------------------------------
 
 
-def check_results(report, results_path, plan, expected_batches):
-    """逐行核对 results.jsonl 的字段、身份、重复与计划同源关系。返回身份列表。"""
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def check_results(report, results_path, plan, expected_batch=None):
+    """逐行核对 results.jsonl 的字段、身份、批次、重复与计划同源关系。
+
+    返回**字段类型合法**的身份列表（畸形记录只形成 FAIL，不进入集合比较，
+    否则 list/dict 值会让 set/dict 抛 TypeError，预检就崩了）。
+    """
 
     area = "结果记录"
-    basis = "设计 §7.1（记录字段）/ §5.3（身份四元组）/ §2.4（覆盖）"
+    basis = "设计 §7.1（记录字段）/ §5.3（身份四元组）/ §2.4（覆盖与批次）"
     label = str(results_path)
     identities = []
     seen = {}
     plan_ids = plan_schedule.plan_identities(plan) if plan else None
     plan_sha = plan.get("plan_sha256") if plan else None
+    legacy_plan_warned = False
+    invalid_rows = 0
 
     try:
         text = results_path.read_text(encoding="utf-8")
@@ -310,8 +344,6 @@ def check_results(report, results_path, plan, expected_batches):
         report.add("FAIL", area, label, "可读取", str(error), "文件不可读", basis)
         return identities
 
-    batch_values = set()
-    legacy_plan_warned = False
     for lineno, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
             report.add("FAIL", area, f"{label}:{lineno}", "非空行", "空行",
@@ -332,10 +364,11 @@ def check_results(report, results_path, plan, expected_batches):
         if missing:
             report.add("FAIL", area, f"{label}:{lineno}", "§7.1 全部字段",
                        f"缺 {missing}", "字段缺失，无法进入统计", basis)
+            invalid_rows += 1
             continue
         for name in RESULTS_INT_FIELDS:
             value = row.get(name)
-            if isinstance(value, bool) or not isinstance(value, int):
+            if not _is_int(value):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
                            "int（不能是 bool）", repr(value), "字段类型错误", basis)
         for name in RESULTS_STR_FIELDS:
@@ -344,7 +377,17 @@ def check_results(report, results_path, plan, expected_batches):
                 report.add("FAIL", area, f"{label}:{lineno} · {name}",
                            "非空字符串", repr(value), "字段类型/取值错误", basis)
 
-        batch_values.add(row.get("batch"))
+        # --- batch：逐条核对，不是只看第一条 ---
+        batch_value = row.get("batch")
+        if isinstance(batch_value, str) and batch_value.strip():
+            if expected_batch is not None and batch_value != expected_batch:
+                report.add("FAIL", area, f"{label}:{lineno} · batch",
+                           f"batch={expected_batch}（由目录推断）", repr(batch_value),
+                           "记录批次与所属目录不符", basis)
+        else:
+            report.add("FAIL", area, f"{label}:{lineno} · batch",
+                       "非空字符串", repr(batch_value), "批次字段类型/取值错误", basis)
+
         if row.get("data_kind") != DESIGN_DATA_KIND:
             report.add("FAIL", area, f"{label}:{lineno} · data_kind",
                        DESIGN_DATA_KIND, repr(row.get("data_kind")),
@@ -354,16 +397,27 @@ def check_results(report, results_path, plan, expected_batches):
                        repr(row.get("error"))[:120],
                        "存在失败记录，不能当作完成数据统计", basis)
 
-        identity = (row.get("experiment_id"), row.get("sample_id"),
-                    row.get("group"), row.get("repeat_index"))
-        if identity in seen:
-            report.add("FAIL", area, f"{label}:{lineno} · 身份",
-                       "四元组唯一",
-                       f"与第 {seen[identity]} 行重复：{identity}",
-                       "同一实验身份出现多条记录", basis)
+        # --- 身份：只有字段类型合法才进入集合比较 ---
+        experiment_id = row.get("experiment_id")
+        sample_id = row.get("sample_id")
+        group = row.get("group")
+        repeat_index = row.get("repeat_index")
+        identity_ok = (isinstance(experiment_id, str) and experiment_id.strip()
+                       and isinstance(sample_id, str) and sample_id.strip()
+                       and isinstance(group, str) and group.strip()
+                       and _is_int(repeat_index))
+        if identity_ok:
+            identity = (experiment_id, sample_id, group, repeat_index)
+            if identity in seen:
+                report.add("FAIL", area, f"{label}:{lineno} · 身份",
+                           "四元组唯一",
+                           f"与第 {seen[identity]} 行重复：{identity}",
+                           "同一实验身份出现多条记录", basis)
+            else:
+                seen[identity] = lineno
+                identities.append(identity)
         else:
-            seen[identity] = lineno
-            identities.append(identity)
+            invalid_rows += 1
 
         plan_sha_value = row.get("plan_sha256")
         if plan is not None:
@@ -371,7 +425,7 @@ def check_results(report, results_path, plan, expected_batches):
                 report.add("FAIL", area, f"{label}:{lineno} · plan_sha256",
                            plan_sha, repr(plan_sha_value),
                            "结果行与同目录 plan.json 不同源", basis)
-            if plan_ids is not None and identity not in plan_ids:
+            if identity_ok and plan_ids is not None and identity not in plan_ids:
                 report.add("FAIL", area, f"{label}:{lineno} · 身份",
                            "属于 plan.json 的任务", repr(identity),
                            "结果行不在计划中", basis)
@@ -382,6 +436,8 @@ def check_results(report, results_path, plan, expected_batches):
                        "该目录没有 plan.json（设计 §5.3 的 legacy 例外），记录缺 plan_sha256 时"
                        "无法核对同源，需负责人确认", basis)
 
+    if invalid_rows:
+        report.notes.append(f"{label}：{invalid_rows} 行字段/身份畸形，已跳过集合比较")
     if plan_ids is not None:
         missing_ids = sorted(plan_ids - set(identities))
         if missing_ids:
@@ -392,12 +448,6 @@ def check_results(report, results_path, plan, expected_batches):
             report.add("PASS", area, f"{label} · 计划完成度",
                        f"{len(plan_ids)} 个计划身份", "全部有结果",
                        "计划任务全部完成", basis)
-
-    if expected_batches is not None and batch_values:
-        unexpected = sorted(str(item) for item in batch_values if item not in expected_batches)
-        if unexpected:
-            report.add("FAIL", area, f"{label} · batch", str(sorted(expected_batches)),
-                       str(unexpected), "批次与目录职责不符", basis)
     return identities
 
 
@@ -406,8 +456,8 @@ def check_results(report, results_path, plan, expected_batches):
 # ---------------------------------------------------------------------------
 
 
-def expected_main_identities(experiment_id=None):
-    """主实验 28 格 × 5 轮 = 140 个身份的「相对身份」集合（不含 experiment_id）。"""
+def expected_main_identities():
+    """主实验 28 格 × 5 轮 = 140 个「相对身份」（不含 experiment_id）。"""
 
     return {(sample, group, repeat)
             for sample in DESIGN_MAIN_SAMPLES
@@ -416,7 +466,7 @@ def expected_main_identities(experiment_id=None):
 
 
 def relative_identities(identities):
-    return {(row[1], row[2], row[3]) for row in identities if isinstance(row[3], int)}
+    return {(row[1], row[2], row[3]) for row in identities if _is_int(row[3])}
 
 
 def check_coverage(report, batch, identities, experiment_ids):
@@ -431,18 +481,17 @@ def check_coverage(report, batch, identities, experiment_ids):
                    "同一批次混入不同实验身份", basis)
 
     if batch == "main":
-        expected = expected_main_identities()
-        _report_set(report, area, f"批次 main", expected, relative, basis,
-                    "主实验 7 样本 × A/B/C/D × 5 轮")
+        _report_set(report, area, "批次 main", expected_main_identities(), relative,
+                    basis, "主实验 7 样本 × A/B/C/D × 5 轮")
     elif batch == "suppl-subj":
-        expected = {(DESIGN_SUPPLEMENT_SUBJ["sample_id"], group, repeat)
-                    for group in DESIGN_SUPPLEMENT_SUBJ["groups"]
+        expected = {(SUPPLEMENT_SUBJ["sample_id"], group, repeat)
+                    for group in SUPPLEMENT_SUBJ["groups"]
                     for repeat in range(DESIGN_ROUND_COUNT)}
         _report_set(report, area, "批次 suppl-subj", expected, relative, basis,
                     "S5 × C-subj/D-subj × 5 轮")
     elif batch == "suppl-s7empty":
-        expected = {(DESIGN_SUPPLEMENT_S7EMPTY["sample_id"], group, repeat)
-                    for group in DESIGN_SUPPLEMENT_S7EMPTY["groups"]
+        expected = {(SUPPLEMENT_S7EMPTY["sample_id"], group, repeat)
+                    for group in SUPPLEMENT_S7EMPTY["groups"]
                     for repeat in range(DESIGN_ROUND_COUNT)}
         _report_set(report, area, "批次 suppl-s7empty", expected, relative, basis,
                     "S7-empty × D × 5 轮")
@@ -477,6 +526,90 @@ def _report_set(report, area, label, expected, actual, basis, desc):
 
 
 # ---------------------------------------------------------------------------
+# 批次与指纹
+# ---------------------------------------------------------------------------
+
+
+def _batch_from_directory(name):
+    """目录名 → 批次；无法判定返回 None（不读记录内容）。"""
+
+    for prefix, batch in BATCH_PREFIXES:
+        if name.startswith(prefix):
+            return batch
+    return None
+
+
+def _record_batches(results_path):
+    """结果文件里出现过的 batch 值（只收集非空字符串；解析失败的行跳过）。"""
+
+    values = []
+    try:
+        text = results_path.read_text(encoding="utf-8")
+    except OSError:
+        return values
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            value = row.get("batch")
+            if isinstance(value, str) and value.strip() and value not in values:
+                values.append(value)
+    return values
+
+
+def expected_batch_for(directory, results_path):
+    """预期批次：优先用目录名（可信规则）；目录名不可判定时仅在记录唯一时采用。"""
+
+    batch = _batch_from_directory(directory.name)
+    if batch is not None:
+        return batch
+    values = _record_batches(results_path)
+    return values[0] if len(values) == 1 else None
+
+
+def is_b0_legacy(directory):
+    """B0 legacy 目录（设计 §1.3 / §2.4：不进五轮计划，也不在冻结清单里）。"""
+
+    return directory.name.startswith("b0-") or _batch_from_directory(directory.name) == B0_BATCH
+
+
+def collect_fingerprint_paths(runs_dir, manifest_path):
+    """运行前后要重算指纹的文件：manifest 自身 + 所有实际读取的 plan/results。
+
+    清单只覆盖一部分文件（B0 legacy 就不在清单里），因此只对 `verified` 做指纹
+    覆盖不到被读取的 legacy 文件；这里按「实际会读什么」收集，和清单无关。
+    """
+
+    paths = set()
+    manifest = Path(manifest_path)
+    if manifest.is_file():
+        paths.add(manifest.resolve())
+    base = Path(runs_dir)
+    if base.is_dir():
+        for directory in sorted(path for path in base.iterdir() if path.is_dir()):
+            for name in (plan_schedule.PLAN_NAME, RESULTS_FILE_NAME):
+                candidate = directory / name
+                if candidate.is_file():
+                    paths.add(candidate.resolve())
+    return paths
+
+
+def _is_sha256(value):
+    """64 位十六进制字符串（大小写不敏感）才算一个 SHA-256 值。"""
+
+    text = str(value or "").strip().lower()
+    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
+
+
+def _fingerprint(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -488,7 +621,8 @@ def run_preflight(runs_dir, manifest_path, repo_root):
     report.notes.append(f"repo-root: {repo_root}")
     report.notes.append("本工具只读：不写实验数据、不生成盲评包、不调用模型/Embedding API。")
 
-    verified = check_manifest(report, manifest_path, repo_root)
+    declared, failed = check_manifest(report, manifest_path, repo_root)
+    manifest_basis = "docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv（可信清单）"
 
     if not runs_dir.is_dir():
         report.add("FAIL", "目录", str(runs_dir), "runs 目录存在", "不存在",
@@ -501,20 +635,39 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                    "没有可核对的实验数据", "设计 §5.3")
         return report
 
-    fingerprint_before = {path: _fingerprint(path) for path in verified
+    fingerprint_before = {path: _fingerprint(path)
+                          for path in collect_fingerprint_paths(runs_dir, manifest_path)
                           if path.is_file()}
+
     by_batch = {}
     for directory in run_dirs:
+        legacy = is_b0_legacy(directory)
         plan_path = directory / plan_schedule.PLAN_NAME
         results_path = directory / RESULTS_FILE_NAME
         label = directory.name
-        if directory.resolve() in {path.parent for path in verified}:
-            report.add("PASS", "目录", label, "已纳入清单", "已纳入",
-                       "该目录的文件完整性由清单核对", "docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv")
-        else:
-            report.add("WARNING", "目录", label, "已纳入清单", "未纳入",
-                       "未纳入清单的目录不做哈希核对；若是 B0 legacy 则按设计保留，"
-                       "其他情况需负责人确认", "设计 §2.4（B0 legacy）")
+
+        # --- 文件级清单覆盖：plan.json 与 results.jsonl 分别确认 ---
+        for path in (plan_path, results_path):
+            if not path.is_file():
+                continue
+            target = f"{label}/{path.name}"
+            resolved = path.resolve()
+            if resolved in failed:
+                # 清单条目核对已在「清单」区域报 FAIL；此处不再补 PASS，
+                # 也不重复报「未纳入」，避免同一文件同时出现 PASS 与 FAIL。
+                continue
+            if resolved in declared:
+                report.add("PASS", "清单覆盖", target, "已纳入清单", "已纳入",
+                           "该文件的大小/哈希/记录数由清单核对", manifest_basis)
+            elif legacy:
+                report.add("WARNING", "清单覆盖", target,
+                           "已纳入清单（B0 legacy 例外）", "未纳入",
+                           "B0 legacy 按设计保留在清单之外，未做清单哈希核对，需负责人确认",
+                           manifest_basis)
+            else:
+                report.add("FAIL", "清单覆盖", target, "已纳入清单", "未纳入",
+                           "该文件不会被清单的大小/哈希/记录数核对；"
+                           "目录里其他文件在清单里不能替代文件级核对", manifest_basis)
 
         if not results_path.is_file():
             if plan_path.is_file():
@@ -522,8 +675,8 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                            "有计划但没有结果文件", "设计 §5.3")
             continue
 
-        batch = _infer_batch(directory, results_path)
-        design_batch = batch in TOTAL_BATCHES
+        expected_batch = expected_batch_for(directory, results_path)
+        design_batch = expected_batch in TOTAL_BATCHES
         plan = None
         if plan_path.is_file():
             plan = check_plan(report, plan_path, None, label, strict=design_batch)
@@ -533,14 +686,14 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                        "设计 §5.3")
 
         identities = check_results(report, results_path, plan,
-                                   expected_batches=None)
+                                   expected_batch=expected_batch)
         experiment_ids = {row[0] for row in identities}
-        if batch is None:
+        if expected_batch is None:
             report.add("UNKNOWN", "覆盖", label, "可判定的批次", "无法判定",
-                       "无法从目录名或记录判断批次，需负责人确认", "设计 §2.4")
+                       "目录名与记录都无法确定唯一批次，需负责人确认", "设计 §2.4")
         else:
-            by_batch.setdefault(batch, []).extend(identities)
-            check_coverage(report, batch, identities, experiment_ids)
+            by_batch.setdefault(expected_batch, []).extend(identities)
+            check_coverage(report, expected_batch, identities, experiment_ids)
 
     total = sum(len(by_batch.get(batch, [])) for batch in TOTAL_BATCHES)
     if by_batch:
@@ -549,7 +702,7 @@ def run_preflight(runs_dir, manifest_path, repo_root):
         if excluded:
             report.notes.append("未计入 §2.4 的 165 份的批次：" + "、".join(
                 f"{batch}={count}" for batch, count in sorted(excluded.items())))
-        expected_total = DESIGN_MAIN_RECORDS + 25
+        expected_total = DESIGN_MAIN_RECORDS + DESIGN_SUPPLEMENT_RECORDS
         if total == expected_total:
             report.add("PASS", "汇总", "生成任务总数", f"{expected_total}",
                        f"{total}", "与设计 §2.4 一致", "设计 §2.4")
@@ -560,47 +713,17 @@ def run_preflight(runs_dir, manifest_path, repo_root):
             report.notes.append(f"批次 {batch}：{len(items)} 条记录")
 
     changed = [str(path) for path, digest in fingerprint_before.items()
-               if path.is_file() and _fingerprint(path) != digest]
+               if not path.is_file() or _fingerprint(path) != digest]
     if changed:
         report.add("FAIL", "只读自检", "运行期间输入文件未被改动", "无改动",
                    f"{len(changed)} 个文件变化：{changed[:5]}",
                    "预检过程中输入被改动，结果不可信", "只读约定")
     else:
-        report.add("PASS", "只读自检", "运行期间输入文件未被改动", "无改动",
-                   "无改动", "输入哈希前后一致", "只读约定")
+        report.add("PASS", "只读自检",
+                   f"运行期间输入文件未被改动（{len(fingerprint_before)} 个：manifest + "
+                   f"plan.json/results.jsonl，含不在清单里的 legacy 文件）",
+                   "无改动", "无改动", "输入哈希前后一致", "只读约定")
     return report
-
-
-def _is_sha256(value):
-    """64 位十六进制字符串（大小写不敏感）才算一个 SHA-256 值。"""
-
-    text = str(value or "").strip().lower()
-    return len(text) == 64 and all(char in "0123456789abcdef" for char in text)
-
-
-def _fingerprint(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _infer_batch(directory, results_path):
-    """批次判定：优先读记录里的 batch 字段，其次按目录名前缀。"""
-
-    try:
-        for line in results_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            if isinstance(row, dict) and isinstance(row.get("batch"), str):
-                return row["batch"]
-    except (OSError, ValueError):
-        pass
-    name = directory.name
-    for prefix, batch in (("main-", "main"), ("suppl-subj-", "suppl-subj"),
-                          ("suppl-s7empty-", "suppl-s7empty"),
-                          ("b0-", B0_BATCH), ("internal-api-smoke-", "smoke")):
-        if name.startswith(prefix):
-            return batch
-    return None
 
 
 def main(argv=None):
@@ -617,7 +740,14 @@ def main(argv=None):
     parser.add_argument("--quiet", action="store_true", help="只打印汇总行")
     args = parser.parse_args(argv)
 
-    report = run_preflight(args.runs_dir, args.manifest, args.repo_root)
+    try:
+        report = run_preflight(args.runs_dir, args.manifest, args.repo_root)
+    except Exception as error:                 # noqa: BLE001 预检不得以 traceback 结束
+        print("实验数据只读预检报告\n")
+        print(f"[FAIL] 预检异常｜{type(error).__name__}: {error}")
+        print("结论：预检未能完成，按存在 FAIL 处理，数据不得进入正式统计。")
+        return 1
+
     header = "实验数据只读预检报告"
     text = report.render(header)
     if not args.quiet:

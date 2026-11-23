@@ -143,18 +143,19 @@ def _default_item(sample, item):
     raise AssertionError("未知评分项 %r" % (item,))
 
 
-def _results_row(sample, condition, repeat, phase, zero_latency):
+def _results_row(sample, condition, repeat, phase, zero_latency, round_index=1):
     bias = {"formal": 0, "calibration": 100, "supplementary": 1000}[phase]
     base = 10 if condition == "A" else (14 if condition == "D" else 12)
     latency = 0.0 if (zero_latency and condition == "A") else float(
         base + repeat + bias)
     tokens = (1000 if condition == "A" else (1200 if condition == "D" else 1100))
     return {
+        "experiment_id": "exp-" + sample,
         "sample_id": sample,
         "group": "G" + sample[1:],
         "condition": condition,
         "repeat_index": repeat,
-        "round_index": 1,
+        "round_index": round_index,
         "prompt_sha256": _sha("prompt", phase, sample, condition, repeat),
         "request_count": 3 + bias,
         "elapsed_seconds": latency,
@@ -194,8 +195,10 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
         repeat = item["repeat"]
         prompt = _sha("prompt", item["phase"], sample, condition, repeat)
         if with_results:
+            raw_round = str(item.get("round", "1")).strip()
             result_row = _results_row(sample, condition, repeat, item["phase"],
-                                      zero_latency)
+                                      zero_latency,
+                                      int(raw_round) if raw_round else None)
             results_rows.append(result_row)
             results_by_run_dir.setdefault(item["run_dir"], []).append(result_row)
             row_sha = A.row_sha256(result_row)
@@ -207,7 +210,11 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
             "batch": item["batch"],
             "source_run_dir": item["run_dir"],
             "source_file": "results.jsonl",
-            "source_row_number": str(seq),
+            # 真实 mapping 的 source_row_number 是「源 results.jsonl 内的行号」，
+            # 不是全局序号（make_blind_pack.read_rows 用 enumerate(..., start=1)）。
+            "source_row_number": str(sum(
+                1 for other in mapping_rows
+                if other["source_run_dir"] == item["run_dir"]) + 1),
             "experiment_id": "exp-" + sample,
             "sample_id": sample,
             "group": "G" + sample[1:],
@@ -1407,6 +1414,73 @@ def test_results_file_hash_guard():
                  lambda: A.load_results([dup_file], {}))
 
 
+def test_mapping_identity_guard():
+    """mapping 元数据被改（源文件字节不变）时必须 fail-closed。
+
+    只核对文件 SHA-256 挡不住这类篡改：文件一个字节没动，condition / repeat_index /
+    experiment_id / source_row_number 被换成另一个「合法」值后，统计结果会把记录算进
+    错误的格子里。这里逐项改 mapping 再走 load_results，必须报 results-mapping-mismatch。
+    """
+
+    fixture = make_fixture(TMP_ROOT / "ident", overrides=e2e_overrides(),
+                           with_results=True)
+    mapping_path = fixture["paths"]["mapping"]
+    results = fixture["paths"]["results"]
+
+    def probe(label, mutate):
+        mapping = A.load_mapping(mapping_path)
+        rows = sorted(mapping.values(), key=lambda row: row["blind_id"])
+        mutate(rows)
+        try:
+            A.load_results(results, mapping)
+        except A.StatsError as exc:
+            check(label + " → results-mapping-mismatch",
+                  exc.code == "results-mapping-mismatch", exc.code)
+        else:
+            check(label + " → results-mapping-mismatch", False, "load_results 未报错")
+
+    def bump_int(field_name):
+        def mutate(rows):
+            row = rows[0]
+            row[field_name] = str(int(str(row[field_name]).strip() or "0") + 1)
+        return mutate
+
+    probe("mapping condition 被改成另一个条件",
+          lambda rows: rows[0].__setitem__("condition", "B"))
+    probe("mapping repeat_index 被改", bump_int("repeat_index"))
+    probe("mapping round_index 被改", bump_int("round_index"))
+    probe("mapping experiment_id 被改",
+          lambda rows: rows[0].__setitem__("experiment_id", "exp-other"))
+    probe("mapping sample_id 被改",
+          lambda rows: rows[0].__setitem__("sample_id", "S9"))
+    probe("mapping source_row_number 被改", bump_int("source_row_number"))
+    probe("mapping source_prompt_sha256 被改",
+          lambda rows: rows[0].__setitem__("source_prompt_sha256", "0" * 64))
+
+    # CSV 级端到端：load_mapping 不校验这两列，篡改后必须由 load_results 拦住，
+    # 且不得留下任何统计产物。
+    for field_name, value in (("source_row_number", None),
+                              ("experiment_id", "exp-other")):
+        root = TMP_ROOT / ("ident_csv_" + field_name)
+        built = make_fixture(root, overrides=e2e_overrides(), with_results=True)
+
+        def mutate(rows, field_name=field_name, value=value):
+            target = next(row for row in rows if row["phase"] == "formal")
+            if value is None:
+                target[field_name] = str(int(target[field_name]) + 1)
+            else:
+                target[field_name] = value
+
+        mutate_csv(built["paths"]["mapping"], mutate)
+        out_dir = TMP_ROOT / ("ident_csv_out_" + field_name)
+        expect_error("mapping.csv 的 %s 被改 → fail-closed" % field_name,
+                     "results-mapping-mismatch",
+                     lambda built=built, out_dir=out_dir: run_main(
+                         built, out_dir, extra=results_extra(built)))
+        check("mapping.csv 的 %s 被改时不产出统计目录" % field_name,
+              not out_dir.exists(), out_dir)
+
+
 def test_missing_inputs():
     fixture = make_fixture(TMP_ROOT / "miss", overrides=e2e_overrides())
     fixture["paths"]["mapping"].unlink()
@@ -1671,10 +1745,14 @@ def test_mapping_structure():
         calib[0]["sample_id"] = target["sample_id"]
         calib[0]["condition"] = target["condition"]
         calib[0]["repeat_index"] = target["repeat_index"]
-        check("A4 负向用例只改格点（来源行号与 blind_id 仍与正式行不同）",
-              calib[0]["source_row_number"] != target["source_row_number"] and
+        # source_row_number 是「源文件内行号」，不同 run 目录下可能同为 1；
+        # 定位源记录靠 (source_run_dir, source_row_number) 这个组合。
+        calib_source = (calib[0]["source_run_dir"], calib[0]["source_row_number"])
+        formal_source = (target["source_run_dir"], target["source_row_number"])
+        check("A4 负向用例只改格点（来源记录与 blind_id 仍与正式行不同）",
+              calib_source != formal_source and
               calib[0]["blind_id"] != target["blind_id"],
-              (calib[0]["source_row_number"], target["source_row_number"]))
+              (calib_source, formal_source))
 
     _, message = load_and_grab("map_calib_slot", calib_same_slot)
     check("A4 校准与正式同格同 repeat → bad-mapping", message is not None,
@@ -2047,6 +2125,7 @@ def main():
         test_h5_with_results()
         test_results_mismatch()
         test_results_file_hash_guard()
+        test_mapping_identity_guard()
         test_missing_inputs()
     finally:
         print("")

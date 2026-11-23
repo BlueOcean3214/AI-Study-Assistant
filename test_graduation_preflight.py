@@ -479,6 +479,8 @@ def test_preflight_records_feed_analyze_stats():
         results_path = runs / "main-20261113T061051Z" / "results.jsonl"
         first = json.loads(results_path.read_text(encoding="utf-8").splitlines()[0])
         blind_id = "a" * 32
+        # analyze_stats 现在逐项比对 mapping 与源记录的身份字段，
+        # 因此这里的 meta 必须与第一条记录完全一致（含行号 1）。
         meta = {
             "blind_id": blind_id,
             "phase": "formal",
@@ -488,9 +490,14 @@ def test_preflight_records_feed_analyze_stats():
             "source_results_file_sha256": _sha(results_path),
             "source_result_row_sha256": A.row_sha256(first),
             "source_prompt_sha256": first["prompt_sha256"],
+            "prompt_sha256": first["prompt_sha256"],
+            "experiment_id": first["experiment_id"],
             "sample_id": first["sample_id"],
             "group": first["group"],
-            "prompt_sha256": first["prompt_sha256"],
+            "condition": first["condition"],
+            "repeat_index": str(first["repeat_index"]),
+            "round_index": str(first["round_index"]),
+            "source_row_number": "1",
         }
         index, file_hashes = A.load_results([results_path], {blind_id: meta})
         assert file_hashes == {str(results_path): _sha(results_path)}
@@ -504,6 +511,104 @@ def test_preflight_records_feed_analyze_stats():
             assert error.code == "results-file-hash-mismatch", error.code
         else:
             raise AssertionError("改动结果文件后 analyze_stats 必须拒绝")
+
+def test_manifest_missing_results_entry_fails():
+    """清单只列了 plan.json、漏列 results.jsonl：必须按文件报 FAIL。"""
+
+    with _case("manifest_gap") as root:
+        runs, manifest = build_dataset(root, include_b0=False)
+        target = runs / "main-20261113T061051Z" / "results.jsonl"
+        entries = [entry for entry in manifest_entries(root, runs)
+                   if Path(entry[1]) != target]
+        write_manifest(root, runs, entries, manifest=manifest)
+        code, report = run_preflight(root, runs, manifest)
+        assert code == 1, f"退出码应为 1，实际 {code}：\n{report}"
+        assert_fail(report, "main-20261113T061051Z/results.jsonl")
+        assert_contains(report, "未纳入")
+        # 同目录的 plan.json 仍应判 PASS：文件级判定，不是目录级
+        assert_contains(report, "main-20261113T061051Z/plan.json")
+
+
+def test_nonfirst_batch_tamper_fails():
+    """只改非首行的 batch：不能被「第一条记录推断批次」蒙混过去。"""
+
+    with _case("batch") as root:
+        runs, manifest = build_dataset(root, include_b0=False)
+        target = runs / "main-20261113T061051Z" / "results.jsonl"
+        lines = target.read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[0])
+        assert first["batch"] == "main", first["batch"]
+        second = json.loads(lines[1])
+        second["batch"] = "suppl-subj"
+        lines[1] = json.dumps(second, ensure_ascii=False, sort_keys=True)
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        refresh_manifest(root, runs)
+        code, report = run_preflight(root, runs, manifest)
+        assert code == 1, f"退出码应为 1，实际 {code}：\n{report}"
+        assert_fail(report, "batch")
+        assert_contains(report, "suppl-subj")
+
+
+def test_malformed_field_types_report_fail():
+    """batch/sample_id/repeat_index 被写成 list/dict/null：结构化 FAIL，不崩。"""
+
+    with _case("types") as root:
+        runs, manifest = build_dataset(root, include_b0=False)
+        target = runs / "main-20261113T061051Z" / "results.jsonl"
+        lines = target.read_text(encoding="utf-8").splitlines()
+        first = json.loads(lines[0])
+        first["batch"] = ["main"]
+        lines[0] = json.dumps(first, ensure_ascii=False, sort_keys=True)
+        second = json.loads(lines[1])
+        second["sample_id"] = {"x": 1}
+        lines[1] = json.dumps(second, ensure_ascii=False, sort_keys=True)
+        third = json.loads(lines[2])
+        third["repeat_index"] = None
+        lines[2] = json.dumps(third, ensure_ascii=False, sort_keys=True)
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        refresh_manifest(root, runs)
+        code, report = run_preflight(root, runs, manifest)
+        assert code == 1, f"退出码应为 1，实际 {code}：\n{report}"
+        assert "Traceback" not in report, report
+        assert_fail(report, "batch")
+        assert_fail(report, "sample_id")
+        assert_fail(report, "repeat_index")
+
+
+def test_manifest_mismatch_never_reports_pass():
+    """同一文件出现大小不符时，不能再有该文件的 PASS 行。"""
+
+    with _case("nopass") as root:
+        runs, manifest = build_dataset(root, include_b0=False)
+        rows = list(csv.DictReader(manifest.open(encoding="utf-8", newline="")))
+        for row in rows:
+            if row["relative_path"].endswith("main-20261113T061051Z/results.jsonl"):
+                row["size_bytes"] = str(int(row["size_bytes"]) + 1)
+        with manifest.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        code, report = run_preflight(root, runs, manifest)
+        assert code == 1
+        assert_fail(report, "main-20261113T061051Z/results.jsonl")
+        for line in report.splitlines():
+            if "main-20261113T061051Z/results.jsonl" in line:
+                assert not line.startswith("[PASS]"), line
+
+
+def test_fingerprint_covers_manifest_and_legacy():
+    """指纹范围含清单自身与 B0 legacy 的 results.jsonl。"""
+
+    with _case("fingerprint") as root:
+        runs, manifest = build_dataset(root, include_b0=True)
+        paths = {str(path) for path in pf.collect_fingerprint_paths(runs, manifest)}
+        assert str(manifest.resolve()) in paths, paths
+        b0 = runs / "b0-remainder-20261113T013105Z" / "results.jsonl"
+        assert str(b0.resolve()) in paths, paths
+        code, report = run_preflight(root, runs, manifest)
+        assert code == 0, report
+        assert_contains(report, "只读自检")
+
 
 TESTS = (
     test_clean_dataset_passes,
@@ -519,6 +624,11 @@ TESTS = (
     test_runtime_error_does_not_emit_statistics,
     test_readonly_mode_leaves_inputs_untouched,
     test_preflight_records_feed_analyze_stats,
+    test_manifest_missing_results_entry_fails,
+    test_nonfirst_batch_tamper_fails,
+    test_malformed_field_types_report_fail,
+    test_manifest_mismatch_never_reports_pass,
+    test_fingerprint_covers_manifest_and_legacy,
 )
 
 

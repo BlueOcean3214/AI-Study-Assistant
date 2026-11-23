@@ -1615,6 +1615,86 @@ def _results_file_candidates(entries, meta):
     return hits
 
 
+MAPPING_IDENTITY_FIELDS = (
+    ("experiment_id", "str"),
+    ("sample_id", "str"),
+    ("group", "str"),
+    ("condition", "str"),
+    ("repeat_index", "int"),
+    ("round_index", "int"),
+)
+
+
+def _compare_mapping_identity(blind_id, meta, row, line, problems):
+    """逐项比对 mapping 与命中的源记录；任何不一致都 fail-closed。
+
+    只核对文件 SHA-256 不能证明 mapping 元数据没被改过：源文件一个字节没动，
+    condition / repeat_index / experiment_id / source_row_number 仍可能被改成另一个
+    「合法」值。那样 Y2/Y3/Y5 会被算进错误的格子，甚至错误的样本，统计结果看似
+    正常却不可信，所以这里逐项比对、任何一项不符都算 results-mapping-mismatch。
+    """
+
+    prefix = f"mapping.csv blind_id={blind_id}"
+    for field_name, kind in MAPPING_IDENTITY_FIELDS:
+        raw = meta.get(field_name)
+        text = "" if raw is None else str(raw).strip()
+        if kind == "str":
+            if not text:
+                problems["rows"].append(f"{prefix}：{field_name} 为空")
+                continue
+            if row.get(field_name) != text:
+                problems["rows"].append(
+                    f"{prefix}：results 第 {line} 行 {field_name}="
+                    f"{row.get(field_name)!r} 与 mapping 的 {text!r} 不一致"
+                )
+        else:
+            if not text:
+                # 设计里 round_index 允许 B0 legacy 为空：只要求源记录同为空
+                if row.get(field_name) is not None:
+                    problems["rows"].append(
+                        f"{prefix}：mapping 的 {field_name} 为空，"
+                        f"但 results 第 {line} 行是 {row.get(field_name)!r}"
+                    )
+                continue
+            if text == "-1":
+                # load_mapping 把「空 round_index」（B0 legacy，设计允许为空）归一成 -1；
+                # legacy 记录里 round_index 为 null 或 -1 都等价，不算篡改。
+                if row.get(field_name) not in (None, -1):
+                    problems["rows"].append(
+                        f"{prefix}：results 第 {line} 行 {field_name}="
+                        f"{row.get(field_name)!r} 与 mapping 的空值（-1）不一致"
+                    )
+                continue
+            if not _is_integer_text(text):
+                problems["rows"].append(
+                    f"{prefix}：{field_name}={raw!r} 不是整数"
+                )
+                continue
+            if row.get(field_name) != int(text):
+                problems["rows"].append(
+                    f"{prefix}：results 第 {line} 行 {field_name}="
+                    f"{row.get(field_name)!r} 与 mapping 的 {text!r} 不一致"
+                )
+
+    want_prompt = str(meta.get("source_prompt_sha256") or "").strip().lower()
+    if want_prompt and str(row.get("prompt_sha256") or "").strip().lower() != want_prompt:
+        problems["rows"].append(f"{prefix}：prompt_sha256 与 mapping 记录不一致")
+
+    want_line = str(meta.get("source_row_number") or "").strip()
+    if not want_line:
+        problems["rows"].append(f"{prefix}：source_row_number 为空，无法核对源记录行号")
+    elif not _is_integer_text(want_line):
+        problems["rows"].append(f"{prefix}：source_row_number={want_line!r} 不是正整数")
+    elif int(want_line) != line:
+        problems["rows"].append(
+            f"{prefix}：source_row_number={want_line} 与实际命中行号 {line} 不一致"
+        )
+
+
+def _is_integer_text(text):
+    return bool(re.fullmatch(r"-?\d+", text))
+
+
 def load_results(paths, mapping):
     """读 results.jsonl，并把 mapping 记录的源文件 SHA-256 与实际文件逐条核对。
 
@@ -1703,7 +1783,13 @@ def load_results(paths, mapping):
                 f" SHA-256={entry['digest']} 与 mapping 记录的 {expected} 不一致"
             )
             continue
-        key = meta["source_result_row_sha256"]
+        key = str(meta.get("source_result_row_sha256") or "").strip()
+        if not key:
+            problems["rows"].append(
+                f"mapping.csv blind_id={blind_id}：source_result_row_sha256 为空，"
+                "无法定位源记录"
+            )
+            continue
         hit = entry["rows"].get(key)
         if hit is None:
             problems["rows"].append(
@@ -1721,17 +1807,7 @@ def load_results(paths, mapping):
         row_owner[key] = entry
         index[key] = {"row": hit["row"], "file": str(entry["path"]), "line": hit["line"]}
         row = hit["row"]
-        for field in ("sample_id", "group"):
-            want = meta[field]
-            if row.get(field) != want:
-                problems["rows"].append(
-                    f"mapping.csv blind_id={blind_id}：results 行 {field}="
-                    f"{row.get(field)!r} 与 mapping 的 {want!r} 不一致"
-                )
-        if meta["source_prompt_sha256"] and row.get("prompt_sha256") != meta["source_prompt_sha256"]:
-            problems["rows"].append(
-                f"mapping.csv blind_id={blind_id}：prompt_sha256 与 mapping 记录不一致"
-            )
+        _compare_mapping_identity(blind_id, meta, row, hit["line"], problems)
 
     for entry in entries:
         if id(entry) not in referenced:
