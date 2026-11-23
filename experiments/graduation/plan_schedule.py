@@ -359,82 +359,155 @@ def _expect(plan, field, expected):
         )
 
 
-def _require_int(where, field, value):
-    """整数类型校验：bool 是 int 的子类，必须单独拒绝，不能用 == 顶替。"""
+def _int_type_problem(where, field, value):
+    """整数类型的严格判定：bool 是 int 的子类，必须单独拒绝，不能用 == 顶替。
+
+    返回问题描述（含处置建议）；类型正确时返回 None。生产侧抛异常、只读核验报 FAIL
+    共用这套判定，避免「生产器拒绝、预检放行」两条口径。
+    """
 
     if isinstance(value, bool) or not isinstance(value, int):
-        raise PlanIntegrityError(
+        return (
             f"plan.json 的 {where} 的 {field} 类型不正确：{value!r}"
             f"（{type(value).__name__}），必须是整数（且不能是 bool）；"
             "拒绝自动类型转换，请换新的 --run-dir。"
         )
 
-    return value
+    return None
 
 
-def _require_str(where, field, value):
+def _str_type_problem(where, field, value):
+    """字符串类型判定；空字符串不算合法的身份字段值。"""
+
     if not isinstance(value, str):
-        raise PlanIntegrityError(
+        return (
             f"plan.json 的 {where} 的 {field} 类型不正确：{value!r}"
             f"（{type(value).__name__}），必须是字符串；"
             "拒绝自动类型转换，请换新的 --run-dir。"
         )
 
-    return value
+    if not value.strip():
+        return (
+            f"plan.json 的 {where} 的 {field} 不能是空字符串；"
+            "拒绝自动类型转换，请换新的 --run-dir。"
+        )
+
+    return None
 
 
-def _check_plan_scalar_types(plan):
-    """顶层标量字段的严格类型校验，必须早于任何 _expect() 等值比较。
+def plan_type_problems(plan):
+    """整份计划的严格类型校验，按发现顺序返回问题清单（不抛异常）。
 
-    SCHEMA_VERSION 是整数 1，而 True == 1、1.0 == 1，若先做等值比较，
-    篡改后重算 plan_sha256 的 plan.json 就能绕过完整性要求。
+    Python 里 True == 1、1.0 == 1，等值比较识别不了类型冒充；计划一旦被改成
+    等值浮点/布尔再重算 plan_sha256，所有 == 比较都会放行。因此类型必须先查，
+    而且要覆盖顶层（schema_version/seed/round_count）与每个任务的身份字段
+    （plan_seq/round_index/repeat_index 是整数非 bool，group 是非空字符串）。
+
+    只读核验（预检）用它把类型错误报成 FAIL；生产侧 validate_plan() 通过
+    _check_plan_types() 取第一个问题抛 PlanIntegrityError，两边同一个判定。
     """
 
-    _require_int("顶层字段", "schema_version", plan.get("schema_version"))
-    _require_int("顶层字段", "seed", plan.get("seed"))
-    _require_int("顶层字段", "round_count", plan.get("round_count"))
+    if not isinstance(plan, dict):
+        return [f"plan.json 的顶层必须是 JSON 对象，收到 {type(plan).__name__}"]
 
+    problems = []
 
-def _check_plan_types(plan, sample_order, blocks):
-    """整份计划的严格类型校验；在任何范围/顺序/身份比较之前执行。
+    for field in ("schema_version", "seed", "round_count"):
+        problem = _int_type_problem("顶层字段", field, plan.get(field))
 
-    Python 里 True == 1、False == 0，单纯的值比较无法识别 bool 冒充整数，
-    因此 plan_seq / round_index / repeat_index 必须先确认是 int 且不是 bool，
-    group / sample_id / sample_order 必须先确认是字符串。
-    """
+        if problem:
+            problems.append(problem)
 
-    _check_plan_scalar_types(plan)
+    sample_order = plan.get("sample_order")
 
-    for index, sample_id in enumerate(sample_order):
-        _require_str(f"sample_order 第 {index} 项", "sample_order", sample_id)
+    if not isinstance(sample_order, list):
+        problems.append(
+            f"plan.json 的 sample_order 必须是数组，收到 {type(sample_order).__name__}"
+        )
+    else:
+        for index, sample_id in enumerate(sample_order):
+            problem = _str_type_problem(
+                f"sample_order 第 {index} 项", "sample_order", sample_id)
+
+            if problem:
+                problems.append(problem)
+
+    blocks = plan.get("blocks")
+
+    if not isinstance(blocks, list):
+        problems.append(
+            f"plan.json 的 blocks 必须是数组，收到 {type(blocks).__name__}")
+        return problems
 
     for block_index, block in enumerate(blocks):
         if not isinstance(block, dict):
-            raise PlanIntegrityError(
+            problems.append(
                 f"plan.json 的 blocks 第 {block_index} 项必须是 JSON 对象，"
                 f"收到 {type(block).__name__}"
             )
+            continue
 
-        _require_str(f"blocks 第 {block_index} 项", "sample_id", block.get("sample_id"))
+        # 缺 sample_id 是「结构不完整」，由 plan_identity_map()/check_plan 的
+        # 计划结构 FAIL 报告；这里只查「字段存在但类型/取值不对」，避免把结构缺口
+        # 提前误报成类型问题、掩盖真正的结构判定。
+        if "sample_id" in block:
+            problem = _str_type_problem(
+                "blocks 第 " + str(block_index) + " 项", "sample_id",
+                block.get("sample_id"))
+
+            if problem:
+                problems.append(problem)
+
         tasks = block.get("tasks")
 
         if not isinstance(tasks, list):
-            raise PlanIntegrityError(
-                f"plan.json 的 {block.get('sample_id')} 区块缺少 tasks"
-            )
+            problems.append(f"plan.json 的 {block.get('sample_id')} 区块缺少 tasks")
+            continue
 
         for task_index, task in enumerate(tasks):
             where = f"{block.get('sample_id')} 第 {task_index} 个任务"
 
             if not isinstance(task, dict):
-                raise PlanIntegrityError(
+                problems.append(
                     f"plan.json 的 {where} 必须是 JSON 对象，收到 {type(task).__name__}"
                 )
+                continue
 
-            _require_int(where, "plan_seq", task.get("plan_seq"))
-            _require_int(where, "round_index", task.get("round_index"))
-            _require_int(where, "repeat_index", task.get("repeat_index"))
-            _require_str(where, "group", task.get("group"))
+            for field in ("plan_seq", "round_index", "repeat_index"):
+                problem = _int_type_problem(where, field, task.get(field))
+
+                if problem:
+                    problems.append(problem)
+
+            problem = _str_type_problem(where, "group", task.get("group"))
+
+            if problem:
+                problems.append(problem)
+
+    return problems
+
+
+def _check_plan_scalar_types(plan):
+    """顶层标量字段的严格类型校验（生产侧：第一个问题即抛异常）。
+
+    SCHEMA_VERSION 是整数 1，而 True == 1、1.0 == 1，若先做等值比较，
+    篡改后重算 plan_sha256 的 plan.json 就能绕过完整性要求。
+    """
+
+    problems = [problem for problem in plan_type_problems(plan)
+                if "顶层字段" in problem]
+
+    if problems:
+        raise PlanIntegrityError(problems[0])
+
+
+def _check_plan_types(plan, sample_order, blocks):
+    """整份计划的严格类型校验；在任何范围/顺序/身份比较之前执行。"""
+
+    problems = plan_type_problems(plan)
+
+    if problems:
+        raise PlanIntegrityError(problems[0])
 
 
 def validate_plan(

@@ -932,7 +932,30 @@ def _write_manifest(repo_root, entries):
         for batch, path, records in entries:
             path = Path(path)
             relative = path.resolve().relative_to(repo_root.resolve()).as_posix()
-            writer.writerow([batch, "合成数据（" + batch + "）", relative, path.name,
+            writer.writerow([batch, "合成数据（" + str(batch) + "）", relative, path.name,
+                             path.stat().st_size,
+                             hashlib.sha256(path.read_bytes()).hexdigest(), records])
+    return manifest
+
+
+def _write_manifest_without_batch(repo_root, entries):
+    """清单没有 batch 列：entries = [(path, records)]。
+
+    清单结构仍合法（relative_path/file 在），但 batch 信息整体缺失 ——
+    正式文件必须 FAIL，不能因为「读不到」就回退到记录自述。
+    """
+
+    repo_root = Path(repo_root)
+    manifest = repo_root / "docs" / "GRADUATION-EXPERIMENT-FILE-MANIFEST.csv"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    with manifest.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["batch_desc", "relative_path", "file",
+                         "size_bytes", "sha256", "records"])
+        for path, records in entries:
+            path = Path(path)
+            relative = path.resolve().relative_to(repo_root.resolve()).as_posix()
+            writer.writerow(["合成数据（无 batch 列）", relative, path.name,
                              path.stat().st_size,
                              hashlib.sha256(path.read_bytes()).hexdigest(), records])
     return manifest
@@ -991,16 +1014,43 @@ def _findings(report, level, needle):
             if item.level == level and needle in item.target]
 
 
-def test_flow_unknown_batch(root):
-    """任务一：目录名判不出批次 + 记录里没有 batch —— 只报 UNKNOWN，不报 FAIL。"""
+def test_flow_manifest_batch_fallback(root):
+    """任务一：未识别目录 + 清单 batch=main + 记录不带 batch —— 按清单归入 main。"""
 
-    repo_root, runs_dir, run_dir = _repo(root, "run-no-batch-marker")
-    record, path = _produce(run_dir, _make_api(repo_root), plan_sha256=None)
-    manifest = _write_manifest(repo_root, (("main", path, len(_rows_of(path))),))
+    report = _batch_case(root, "run-no-batch-marker", [_MISSING_BATCH])
+    notes = "\n".join(report.notes)
+
+    check("7.6-清单归类：记录不带 batch 时按清单归入 main",
+          "批次 main" in notes, report.notes)
+    check("7.6-清单归类：不报 batch FAIL",
+          _field_fails(report, "batch") == [],
+          [item.target for item in _fails(report)])
+    check("7.6-清单归类：覆盖按 main 核对（S1 记录不属于主实验 → FAIL）",
+          any(item.level == "FAIL" and item.area == "覆盖"
+              for item in report.findings),
+          [item.render() for item in report.findings if item.area == "覆盖"])
+    check("7.6-清单归类：不再报 UNKNOWN（批次已由清单确定）",
+          not [item for item in report.findings
+               if item.level == "UNKNOWN" and item.area == "覆盖"],
+          [item.render() for item in report.findings
+           if item.level == "UNKNOWN"])
+    check("7.6-清单归类：7 个契约缺口仍逐字段 FAIL",
+          len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
+
+
+def test_flow_batch_unknown(root):
+    """任务一：清单没收录该文件、目录不可判定、记录不带 batch —— 只能 UNKNOWN。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, "run-unknown-batch")
+    _record, path = _produce(run_dir, _make_api(repo_root), plan_sha256=None)
+    other = repo_root / "docs" / "note.txt"
+    other.parent.mkdir(parents=True, exist_ok=True)
+    other.write_text("占位文件\n", encoding="utf-8")
+    manifest = _write_manifest(repo_root, (("main", other, 1),))
     report = _flow(repo_root, runs_dir, manifest)
     notes = "\n".join(report.notes)
 
-    check("7.6-未知批次：全流程给出 UNKNOWN（覆盖｜批次无法判定）",
+    check("7.6-未知批次：无清单批次且目录不可判定时报 UNKNOWN（覆盖｜批次无法判定）",
           any(item.level == "UNKNOWN" and item.area == "覆盖"
               and item.actual == "无法判定" for item in report.findings),
           [item.render() for item in report.findings
@@ -1008,18 +1058,13 @@ def test_flow_unknown_batch(root):
     check("7.6-未知批次：没有针对 batch 的 FAIL（无从推断 ≠ 契约缺口）",
           not any(item.target.endswith(" · batch") for item in _fails(report)),
           [item.target for item in _fails(report)])
-    check("7.6-未知批次：其余 7 个不可恢复字段仍然逐字段 FAIL",
-          len(_gap_fails(report)) == 7
-          and len(_fails(report)) == 7, [item.target for item in _fails(report)])
-    check("7.6-未知批次：batch 也不出现在缺口字段列表里",
-          _field_fails(report, "batch") == []
-          and not any(item.reason.startswith("1 行缺失") and "batch" in item.target
-                      for item in report.findings),
-          [item.target for item in report.findings if "batch" in item.target])
-    check("7.6-未知批次：行仍被当成真实执行记录（身份可识别 1 行）",
-          "身份可识别 1 行" in notes, notes)
     check("7.6-未知批次：未把未知批次静默记成某个已知批次",
           not any(note.startswith("批次 ") for note in report.notes), report.notes)
+    check("7.6-未知批次：结果文件不在清单中仍单独 FAIL（清单覆盖）",
+          any(item.level == "FAIL" and item.area == "清单覆盖"
+              and item.target.endswith("results.jsonl") for item in report.findings),
+          [item.render() for item in report.findings
+           if item.area == "清单覆盖"])
 
 
 def test_flow_plan_audit_control(root):
@@ -1166,10 +1211,13 @@ def test_flow_b0_legacy(root):
 _MISSING_BATCH = object()
 
 
-def _batch_case(root, dirname, markers, *, plan_sha256=None):
+def _batch_case(root, dirname, markers, *, plan_sha256=None,
+                manifest_batch="main", manifest_without_batch_column=False):
     """一个运行目录：按 markers 逐行写 batch，然后跑完整的 run_preflight()。
 
     markers[i] 对应第 i 行；_MISSING_BATCH 表示该行完全不带 batch 字段。
+    manifest_batch 决定清单给这个文件什么批次；manifest_without_batch_column
+    用于造「整张清单没有 batch 列」的场景。
     """
 
     repo_root, runs_dir, run_dir = _repo(root, dirname)
@@ -1189,15 +1237,21 @@ def _batch_case(root, dirname, markers, *, plan_sha256=None):
     Path(path).write_text(
         "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
                 for row in rows), encoding="utf-8", newline="\n")
-    manifest = _write_manifest(repo_root, (("main", path, len(rows)),))
+    if manifest_without_batch_column:
+        manifest = _write_manifest_without_batch(
+            repo_root, ((path, len(rows)),))
+    else:
+        manifest = _write_manifest(
+            repo_root, ((manifest_batch, path, len(rows)),))
     return _flow(repo_root, runs_dir, manifest)
 
 
 def test_flow_batch_records_consistent(root):
-    """目录名判不出批次，但记录一致声明 suppl-subj —— 采用记录值，不报 FAIL。"""
+    """未识别目录 + 清单与记录一致声明 suppl-subj —— 归入补充批次，不报 FAIL。"""
 
     report = _batch_case(root, "run-batch-consistent",
-                         ["suppl-subj", "suppl-subj"])
+                         ["suppl-subj", "suppl-subj"],
+                         manifest_batch="suppl-subj")
     notes = "\n".join(report.notes)
 
     check("7.7-记录一致声明：不报 batch FAIL",
@@ -1215,24 +1269,26 @@ def test_flow_batch_records_consistent(root):
 
 
 def test_flow_batch_conflict(root):
-    """同一文件里两行声明了不同批次 —— 报一条文件级 FAIL，不降级成 UNKNOWN。"""
+    """清单给 main，第二行记录却声明 suppl-subj —— 只在第 2 行报冲突。"""
 
     report = _batch_case(root, "run-batch-conflict", ["main", "suppl-subj"])
     fails = _field_fails(report, "batch")
 
-    check("7.7-冲突：同一文件两个批次只报一条 FAIL", len(fails) == 1,
+    check("7.7-记录冲突：只有与清单不符的那一行 FAIL", len(fails) == 1,
           [(item.target, item.actual) for item in fails])
-    check("7.7-冲突：FAIL 点名两个批次与行号",
-          bool(fails) and "main" in fails[0].actual
-          and "suppl-subj" in fails[0].actual
-          and "第 1 行" in fails[0].actual and "第 2 行" in fails[0].actual,
-          [(item.actual,) for item in fails])
-    check("7.7-冲突：报的是 FAIL 而不是 UNKNOWN",
+    check("7.7-记录冲突：FAIL 写明清单批次 main 与实际值 suppl-subj",
+          bool(fails) and fails[0].expected == "batch=main（由清单给出）"
+          and fails[0].actual == "'suppl-subj'",
+          [(item.expected, item.actual) for item in fails])
+    check("7.7-记录冲突：指向第 2 行",
+          bool(fails) and fails[0].target.endswith(":2 · batch"),
+          [item.target for item in fails])
+    check("7.7-记录冲突：报的是 FAIL 而不是 UNKNOWN",
           bool(fails) and not [item for item in report.findings
                                if item.level == "UNKNOWN" and item.area == "覆盖"],
           [item.render() for item in report.findings
            if item.level == "UNKNOWN"])
-    check("7.7-冲突：7 个契约缺口仍逐字段 FAIL",
+    check("7.7-记录冲突：7 个契约缺口仍逐字段 FAIL",
           len(_gap_fails(report)) == 7, [item.target for item in _fails(report)])
 
 
@@ -1288,7 +1344,64 @@ def test_flow_batch_directory_derived(root):
           "批次 main" in notes, report.notes)
 
 
-def _plan_case(root, dirname, mutate, *, rows=1):
+def test_flow_manifest_vs_directory_conflict(root):
+    """main-* 目录 + 清单写 suppl-subj —— 目录与清单矛盾必须 FAIL。"""
+
+    report = _batch_case(root, "main-20261113T061051Z",
+                         [_MISSING_BATCH, "main"],
+                         manifest_batch="suppl-subj")
+    batches = [item for item in report.findings
+               if item.level == "FAIL" and item.area == "批次"]
+
+    check("7.7-清单冲突：目录与清单矛盾报文件级 FAIL（恰好 1 条）",
+          len(batches) == 1, [item.render() for item in batches])
+    check("7.7-清单冲突：FAIL 同时点名目录批次 main 与清单批次 suppl-subj",
+          bool(batches) and "main" in batches[0].actual
+          and "suppl-subj" in batches[0].actual,
+          [(item.actual,) for item in batches])
+    check("7.7-清单冲突：不静默采用其中一个批次（不报「批次 main」的覆盖结论）",
+          "批次 main" not in "\n".join(report.notes), report.notes)
+    check("7.7-清单冲突：记录声明不用于覆盖清单结果（不存在只按记录归类的路径）",
+          any(item.target.endswith(" · batch") for item in _fails(report)),
+          [item.target for item in _fails(report)])
+
+
+def test_flow_manifest_batch_empty(root):
+    """清单条目 batch 为空串 —— 正式文件必须 FAIL，不能回退到记录自述。"""
+
+    report = _batch_case(root, "main-20261113T061051Z", ["main"],
+                         manifest_batch="")
+    batches = [item for item in report.findings
+               if item.level == "FAIL" and item.area == "批次"]
+
+    check("7.7-清单空 batch：文件级 FAIL 恰好 1 条", len(batches) == 1,
+          [item.render() for item in batches])
+    check("7.7-清单空 batch：FAIL 说清清单条目 batch 为空",
+          bool(batches) and "空" in batches[0].actual,
+          [(item.actual,) for item in batches])
+    check("7.7-清单空 batch：不按记录自述把文件归入 main",
+          "批次 main" not in "\n".join(report.notes), report.notes)
+
+
+def test_flow_manifest_without_batch_column(root):
+    """整张清单没有 batch 列 —— 正式文件必须 FAIL，不能猜批次。"""
+
+    report = _batch_case(root, "main-20261113T061051Z", ["main"],
+                         manifest_without_batch_column=True)
+    batches = [item for item in report.findings
+               if item.level == "FAIL" and item.area == "批次"]
+
+    check("7.7-清单缺列：文件级 FAIL 恰好 1 条", len(batches) == 1,
+          [item.render() for item in batches])
+    check("7.7-清单缺列：FAIL 说清清单没有 batch 列",
+          bool(batches) and "没有 batch 列" in batches[0].actual,
+          [(item.actual,) for item in batches])
+    check("7.7-清单缺列：不回退到记录自述（不报「批次 main」）",
+          "批次 main" not in "\n".join(report.notes), report.notes)
+
+
+def _plan_case(root, dirname, mutate, *, rows=1,
+               manifest_plan_batch="main", manifest_results_batch="main"):
     """计划被 mutate() 改动后重算 plan_sha256，再跑一次完整预检。"""
 
     repo_root, runs_dir, run_dir = _repo(root, dirname)
@@ -1302,9 +1415,9 @@ def _plan_case(root, dirname, mutate, *, rows=1):
         _record, path = _produce(run_dir, api, repeat_index=repeat_index,
                                  plan_sha256=plan["plan_sha256"])
     manifest = _write_manifest(repo_root, (
-        ("main", Path(run_dir) / plan_schedule.PLAN_NAME,
+        (manifest_plan_batch, Path(run_dir) / plan_schedule.PLAN_NAME,
          len(plan_schedule.plan_tasks(plan))),
-        ("main", path, len(_rows_of(path))),
+        (manifest_results_batch, path, len(_rows_of(path))),
     ))
     return _flow(repo_root, runs_dir, manifest)
 
@@ -1384,6 +1497,101 @@ def test_flow_plan_identity_control(root):
           not [item for item in _fails(report)
                if item.target.endswith(" · 计划结构")],
           [item.target for item in _fails(report)])
+    check("7.7-对照组：正常整数计划没有「计划类型」FAIL",
+          not [item for item in _fails(report)
+               if item.target.endswith(" · 计划类型")],
+          [item.target for item in _fails(report)])
+
+
+def test_flow_plan_manifest_batch_mismatch(root):
+    """plan.json 与 results.jsonl 的清单批次不同 —— 同一 run-dir 必须一致。"""
+
+    report = _plan_case(root, "main-20261113T061051Z", lambda plan: None, rows=1,
+                        manifest_plan_batch="suppl-subj",
+                        manifest_results_batch="main")
+    hits = [item for item in _fails(report)
+            if item.target.endswith("plan.json · batch")]
+
+    check("7.7-计划批次不一致：报且只报一条 FAIL", len(hits) == 1,
+          [item.render() for item in _fails(report)])
+    check("7.7-计划批次不一致：FAIL 写明应与 results.jsonl 的清单批次一致",
+          bool(hits) and "与 results.jsonl 的清单批次一致" in hits[0].expected,
+          [(item.expected,) for item in hits])
+    check("7.7-计划批次不一致：实际值点名 suppl-subj，预期点名 main",
+          bool(hits) and "suppl-subj" in hits[0].actual
+          and "main" in hits[0].expected,
+          [(item.expected, item.actual) for item in hits])
+
+
+def _plan_type_case(root, dirname, mutate, *, needle):
+    """任务二：合成计划出现等值 float/bool —— 预检自身必须识别为类型错误。"""
+
+    report = _plan_case(root, dirname, mutate, rows=1)
+    fails = [item for item in _fails(report)
+             if item.target.endswith(" · 计划类型")]
+    label = "7.8-计划类型（" + needle + "）"
+
+    check(label + "：恰好一条类型 FAIL", len(fails) == 1,
+          [item.render() for item in _fails(report)])
+    check(label + "：FAIL 点名 " + needle + " 且说明类型不正确",
+          bool(fails) and needle in fails[0].actual
+          and "类型不正确" in fails[0].actual,
+          [(item.actual,) for item in fails])
+    check(label + "：不是靠清单哈希或结果行哈希被提前拦截",
+          not [item for item in _fails(report)
+               if item.area == "清单"
+               or item.target.endswith(" · plan_sha256")],
+          [item.render() for item in _fails(report)
+           if item.area == "清单"
+           or item.target.endswith(" · plan_sha256")])
+    check(label + "：不再给出身份唯一性 PASS",
+          not [item for item in report.findings
+               if item.level == "PASS" and "身份唯一性" in item.target],
+          [item.render() for item in report.findings
+           if item.level == "PASS" and "身份唯一性" in item.target])
+
+
+def test_flow_plan_type_float_plan_seq(root):
+    def mutate(plan):
+        plan_schedule.plan_tasks(plan)[1]["plan_seq"] = 1.0
+
+    _plan_type_case(root, "main-20261113T061051Z", mutate, needle="plan_seq")
+
+
+def test_flow_plan_type_bool_plan_seq(root):
+    def mutate(plan):
+        plan_schedule.plan_tasks(plan)[1]["plan_seq"] = True
+
+    _plan_type_case(root, "main-20261113T061051Z", mutate, needle="plan_seq")
+
+
+def test_flow_plan_type_float_round_index(root):
+    def mutate(plan):
+        plan_schedule.plan_tasks(plan)[1]["round_index"] = 2.0
+
+    _plan_type_case(root, "main-20261113T061051Z", mutate, needle="round_index")
+
+
+def test_flow_plan_type_bool_round_index(root):
+    def mutate(plan):
+        plan_schedule.plan_tasks(plan)[1]["round_index"] = True
+
+    _plan_type_case(root, "main-20261113T061051Z", mutate, needle="round_index")
+
+
+def test_flow_plan_type_float_seed(root):
+    def mutate(plan):
+        plan["seed"] = float(plan["seed"])
+
+    _plan_type_case(root, "main-20261113T061051Z", mutate, needle="seed")
+
+
+def test_flow_plan_type_float_round_count(root):
+    def mutate(plan):
+        plan["round_count"] = float(plan["round_count"])
+
+    _plan_type_case(root, "main-20261113T061051Z", mutate, needle="round_count")
+
 
 # ---------------------------------------------------------------------------
 # 8. 消费者二：打包器
@@ -1572,7 +1780,8 @@ def _run_all():
 
         # 7.6：全流程预检（批次不可判定 / 计划逐字段同源 / B0 legacy 目录规则）
         for name, runner in (
-            ("case-flow-unknown", test_flow_unknown_batch),
+            ("case-flow-unknown", test_flow_manifest_batch_fallback),
+            ("case-flow-batch-unknown", test_flow_batch_unknown),
             ("case-flow-plan-ok", test_flow_plan_audit_control),
             ("case-flow-plan-seq", test_flow_plan_seq_tamper),
             ("case-flow-seed", test_flow_seed_tamper),
@@ -1589,9 +1798,24 @@ def _run_all():
             ("case-batch-invalid", test_flow_batch_invalid),
             ("case-batch-dir-conflict", test_flow_batch_directory_conflict),
             ("case-batch-dir-derived", test_flow_batch_directory_derived),
+            ("case-batch-manifest-vs-dir", test_flow_manifest_vs_directory_conflict),
+            ("case-batch-manifest-empty", test_flow_manifest_batch_empty),
+            ("case-batch-manifest-no-column", test_flow_manifest_without_batch_column),
+            ("case-plan-batch-mismatch", test_flow_plan_manifest_batch_mismatch),
             ("case-plan-dup-identity", test_flow_plan_duplicate_identity),
             ("case-plan-structure", test_flow_plan_structure_broken),
             ("case-plan-unique-control", test_flow_plan_identity_control),
+        ):
+            runner(root / name)
+
+        # 7.8：plan.json 严格类型核验（第七轮任务二）
+        for name, runner in (
+            ("case-type-float-plan-seq", test_flow_plan_type_float_plan_seq),
+            ("case-type-bool-plan-seq", test_flow_plan_type_bool_plan_seq),
+            ("case-type-float-round-index", test_flow_plan_type_float_round_index),
+            ("case-type-bool-round-index", test_flow_plan_type_bool_round_index),
+            ("case-type-float-seed", test_flow_plan_type_float_seed),
+            ("case-type-float-round-count", test_flow_plan_type_float_round_count),
         ):
             runner(root / name)
 

@@ -17,8 +17,9 @@
 - plan.json 的 plan_sha256 是否自洽，冻结参数（seed/scheme/algorithm_version/
   block_unit/round_count）是否与设计 §5.1 一致；
 - results.jsonl 是否可解析、字段是否齐全、身份是否重复、行是否属于计划、
-  plan_sha256 是否与同目录计划同源；batch 分四态判定：目录推断、记录一致声明、
-  缺失（UNKNOWN）、冲突/非法值（FAIL），**记录声明与目录不一致必须逐行 FAIL**；
+  plan_sha256 是否与同目录计划同源；batch 归属以清单（relative_path→batch）为唯一
+  可信来源，目录名只做一致性校验（B0 legacy 例外），记录声明只做交叉验证：
+  清单缺失/非法、清单与目录冲突、记录与可信批次不符一律 FAIL，三者都没有才 UNKNOWN；
 - 字段类型畸形（list/dict/null 等）只形成结构化 FAIL，不再让集合/身份比较抛异常；
 - 覆盖是否与冻结设计一致：主实验 7 样本 × A/B/C/D × 5 轮 = 140 份，补充
   C/D-subj（S5）10 份、S7-empty × D 5 份，B0 legacy 10 份只记录；
@@ -167,36 +168,62 @@ class Report:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class ManifestIndex:
+    """清单核对结果：文件覆盖集合 + 每个文件的清单批次。
+
+    batches 是规范化相对路径（解析后的绝对路径）→ batch，是批次归属的唯一可信来源；
+    batch_problems 记录「清单里有这个文件、但没有合法 batch」的情况（该列缺失或为空），
+    调用方据此对正式文件报 FAIL，而不是回退到记录自述。
+    """
+
+    declared: set
+    failed: set
+    batches: dict
+    batch_problems: dict
+
+
 def check_manifest(report, manifest_path, repo_root):
     """清单声明的文件是否存在，大小/哈希/记录数是否与磁盘一致。
 
-    返回清单覆盖的绝对路径集合。**同一文件只要有一项不一致，就不再补 PASS**：
-    报告的 PASS/FAIL 必须互斥，否则「哈希对不上」和「清单条目可核对」会同时出现。
+    返回 ManifestIndex（覆盖集合 + 绝对路径→清单 batch）。**同一文件只要有一项不一致，
+    就不再补 PASS**：报告的 PASS/FAIL 必须互斥，否则「哈希对不上」和「清单条目可核对」
+    会同时出现。
     """
 
     area = "清单"
     basis = "docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv（可信清单）"
     declared_paths = set()
     failed_paths = set()
+    batches = {}
+    batch_problems = {}
     if not manifest_path.is_file():
         report.add("FAIL", area, str(manifest_path), "清单文件存在",
                    "不存在", "缺少可信清单，无法核对文件完整性", basis)
-        return declared_paths, failed_paths
+        return ManifestIndex(declared_paths, failed_paths, batches, batch_problems)
     try:
         entries = manifest_rules.load_manifest(manifest_path)
     except manifest_rules.ManifestError as error:
         report.add("FAIL", area, str(manifest_path), "清单结构与列定义合法",
                    f"解析失败：{error}", "清单不可信，后续核对全部失效", basis)
-        return declared_paths, failed_paths
+        return ManifestIndex(declared_paths, failed_paths, batches, batch_problems)
 
     if not entries:
         report.add("FAIL", area, str(manifest_path), "至少有一条清单条目",
                    "0 条", "空清单无法作为可信来源", basis)
-        return declared_paths, failed_paths
+        return ManifestIndex(declared_paths, failed_paths, batches, batch_problems)
 
     for relative, entry in sorted(entries.items()):
         path = (repo_root / relative).resolve()
         declared_paths.add(path)
+        raw_batch = entry.get("batch")
+        batch_text = "" if raw_batch is None else str(raw_batch).strip()
+        if batch_text:
+            batches[path] = batch_text
+        elif raw_batch is None:
+            batch_problems[path] = "清单没有 batch 列"
+        else:
+            batch_problems[path] = "清单条目的 batch 为空"
         target = relative
         if not path.is_file():
             report.add("FAIL", area, target, "文件存在", str(path),
@@ -237,7 +264,7 @@ def check_manifest(report, manifest_path, repo_root):
                        "一致", "清单条目可核对", basis)
         else:
             failed_paths.add(path)
-    return declared_paths, failed_paths
+    return ManifestIndex(declared_paths, failed_paths, batches, batch_problems)
 
 
 def _count_jsonl(path):
@@ -272,6 +299,24 @@ def check_plan(report, plan_path, expected_identities, label, *, strict=True):
         report.add("FAIL", area, label, "plan_sha256 自洽", str(error),
                    "计划被改动或损坏", basis)
         return None
+
+    # --- 严格类型：必须早于任何等值比较/身份索引/唯一性 PASS ---
+    # Python 里 1.0 == 1、True == 1：改写成等值浮点或布尔再重算 plan_sha256，
+    # 所有 == 比较都会放行。类型不合法时直接终止计划侧的后续核验，
+    # 不生成身份索引，也不给出「身份唯一」「身份集合」的 PASS。
+    type_problems = plan_schedule.plan_type_problems(plan)
+    if type_problems:
+        shown = "；".join(type_problems[:5])
+        if len(type_problems) > 5:
+            shown += f"（共 {len(type_problems)} 处）"
+        report.add("FAIL", area, f"{label} · 计划类型",
+                   "schema_version/seed/round_count 为整数（非 bool）；"
+                   "每个任务的 plan_seq/round_index/repeat_index 为整数（非 bool）、"
+                   "group 为非空字符串",
+                   shown,
+                   "plan.json 字段类型不合法：等值比较不能证明类型正确，"
+                   "序号/身份唯一性/身份集合核验中止", basis)
+        return plan
 
     deviations = []
     for field_name, expected in (
@@ -382,14 +427,16 @@ def check_results(report, results_path, plan, expected_batch=None,
     身份照进集合比较与计划覆盖统计。反过来也不允许用「部分成功」换任何
     §7.1 合规 PASS。
 
-    批次（batch）按四种状态处理（整份文件共用一个结论，见 decide_batch()）：
+    批次（batch）的可信来源只有清单与目录名（见 decide_batch()），记录声明只做交叉验证：
 
-    - directory：目录名给出可信批次，记录若声明了别的批次逐行 FAIL；
-    - records：目录名不可判定，但记录一致声明同一个批次，采用该值；
-    - missing：目录名与记录都没有批次 —— 不是契约缺口，不报 FAIL、不猜批次，
-      由 run_preflight 统一报 UNKNOWN，其余字段的失败照常保留；
-    - conflict / invalid：同一文件声明了多个批次、或声明了非法值 —— 都报结构化
-      FAIL（冲突按文件一条、非法逐行一条），不再降级成 UNKNOWN。
+    - directory / manifest：批次已由目录名或清单确认，记录声明别的批次逐行 FAIL；
+    - manifest-conflict：目录名与清单不一致 —— 文件级一条 FAIL，归属不可确定；
+    - manifest-missing / manifest-invalid：正式文件缺清单 batch —— 文件级 FAIL，
+      不得回退到记录自述；
+    - untrusted-records：只有记录自述 —— 文件级 FAIL，不能据此归入任何正式批次；
+    - missing：目录、清单、记录都没有批次 —— 不猜批次，由 run_preflight 报 UNKNOWN；
+    - 同一文件内声明了多个批次 —— 每一行只要与可信批次不符就逐行 FAIL（有可信
+      来源时不需要再判「整体矛盾」，归属已经确定）；非法值逐行一条 FAIL。
 
     `batch_decision` 为 None 时（直接调用的旧路径）按 expected_batch 退化成
     directory / missing 两态，行为与第五轮一致。
@@ -443,6 +490,8 @@ def check_results(report, results_path, plan, expected_batch=None,
     failed_fields = set()
     result_rows = 0
     identified_rows = 0
+    declared_seen = []   # 记录自己声明的合法 batch：(行号, 值)
+    mismatches = []      # 与可信批次不符的记录声明：(行号, 值)
 
     def _warn_legacy_plan(value):
         """legacy 目录没有 plan.json：缺 plan_sha256 只报一次 WARNING（设计 §5.3 例外）。"""
@@ -498,13 +547,13 @@ def check_results(report, results_path, plan, expected_batch=None,
             normalized = result_schema.normalize_record(
                 row, batch=batch_decision.value, run_dir=results_path.parent)
             failures = normalized.failures()
-            # batch 的四态由 decide_batch() 判定，行级只核对记录「自己声明的」值：
+            # batch 的状态由 decide_batch() 判定，行级只核对记录「自己声明的」值：
             # - missing：记录没声明、目录也判不出 —— 不是契约缺口，由 run_preflight
             #   报 UNKNOWN，normalize 的 batch 失败在这里减掉；
-            # - invalid：记录声明了非法值 —— 下面逐行报结构化 FAIL，这里的通用失败
-            #   减掉，避免同一行把同一件事报两遍；
-            # - conflict：文件内声明互相矛盾 —— 由函数末尾按文件报一条 FAIL；
-            # - directory / records：值已确定，记录若声明了别的批次逐行报冲突。
+            # - manifest-invalid / untrusted-records：可信来源缺失或记录自述非法 ——
+            #   由函数末尾报结构化 FAIL，这里的通用失败减掉，避免同一件事报两遍；
+            # - manifest-conflict：目录名与清单矛盾 —— 文件级一条 FAIL，归属不确定；
+            # - directory / manifest：值已确定，记录若声明了别的批次逐行报冲突。
             # 行级已单独核对「记录自己声明的 batch」（非空字符串 / 与目录一致 /
             # 非法值逐行 FAIL），normalize 的通用 batch 失败不再重复报一次。
             undecidable = {"batch"}
@@ -556,6 +605,7 @@ def check_results(report, results_path, plan, expected_batch=None,
                            "非空字符串", repr(value), "字段类型/取值错误", basis)
 
         # --- batch：逐条核对记录「自己声明的」值（不是标准化视图里的目录值）---
+        # 可信批次只能来自清单或目录名；记录声明用于交叉验证，不得覆盖清单。
         has_declared_batch = "batch" in raw_row
         declared_batch = raw_row.get("batch") if has_declared_batch else None
         if has_declared_batch and not result_schema.is_valid_batch_value(declared_batch):
@@ -563,14 +613,12 @@ def check_results(report, results_path, plan, expected_batch=None,
                        "非空字符串（或完全省略该字段）", repr(declared_batch),
                        "batch 值非法：批次只能是批次名字符串，list/dict/int/bool/空串"
                        "都不接受", basis)
-        elif (has_declared_batch and batch_decision.value is not None
-              and declared_batch != batch_decision.value):
-            source = ("由目录推断" if batch_decision.state == BATCH_STATE_DIRECTORY
-                      else "由该文件其余记录一致声明")
-            report.add("FAIL", area, f"{label}:{lineno} · batch",
-                       f"batch={batch_decision.value}（{source}）",
-                       repr(declared_batch),
-                       "记录批次与所属目录/文件不一致", basis)
+        elif has_declared_batch:
+            declared_seen.append((lineno, declared_batch))
+            if (batch_decision.value is not None
+                    and declared_batch != batch_decision.value
+                    and batch_decision.state != BATCH_STATE_MANIFEST_CONFLICT):
+                mismatches.append((lineno, declared_batch))
 
         # data_kind 在生产器记录里是不可恢复字段：缺口已按字段 FAIL（见函数末尾），
         # 这里既不补默认值，也不因为「跳过」而产生任何 §7.1 合规 PASS。
@@ -651,12 +699,29 @@ def check_results(report, results_path, plan, expected_batch=None,
         else:
             _warn_legacy_plan(plan_sha_value)
 
-    if batch_decision.state == BATCH_STATE_CONFLICT:
+    if batch_decision.state == BATCH_STATE_UNTRUSTED_RECORDS:
         report.add("FAIL", area, f"{label} · batch",
-                   "同一文件内所有记录声明的批次一致",
+                   "批次来自清单（relative_path→batch）或目录名",
                    batch_decision.detail,
-                   "同一结果文件声明了多个批次，无法确定归属（每个值单独看都合法，"
-                   "但整体矛盾，不能挑其中一个当真）", basis)
+                   "记录自述不能决定正式批次：未识别目录里的记录统一写 main，"
+                   "就能把其他批次冒充成主实验", BATCH_BASIS)
+    elif batch_decision.state == BATCH_STATE_MANIFEST_CONFLICT:
+        report.add("FAIL", area, f"{label} · batch",
+                   "目录名与清单的批次一致",
+                   batch_decision.detail,
+                   "同一文件的批次有两个互相矛盾的可信来源，归属不可确定", BATCH_BASIS)
+    elif mismatches and batch_decision.value is not None:
+        if batch_decision.state == BATCH_STATE_MANIFEST:
+            source = "由清单给出"
+        elif batch_decision.state == BATCH_STATE_MANIFEST_MISSING:
+            source = "由目录推断（清单缺 batch）"
+        else:
+            source = "由目录推断"
+        for lineno, value in mismatches:
+            report.add("FAIL", area, f"{label}:{lineno} · batch",
+                       f"batch={batch_decision.value}（{source}）",
+                       repr(value),
+                       "记录批次与清单/目录给出的可信批次不一致", basis)
 
     # --- 契约缺口：按字段聚合，各一条 FAIL（不可恢复字段不得降级为 WARNING）---
     unrecoverable = result_schema.unrecoverable_reasons()
@@ -810,10 +875,20 @@ def _batch_from_directory(name):
 
 @dataclass(frozen=True)
 class BatchDecision:
-    """一个结果文件的批次判定：缺失 / 冲突 / 非法 / 可用 四态分开。
+    """一个结果文件的**可信批次**判定。
 
-    value 只在 directory、records 两态有值；missing/conflict/invalid 一律 None，
-    调用方据此决定报 UNKNOWN 还是 FAIL —— 不能把未知当成某个已知批次。
+    value 只在 directory / manifest 两态有值。其余状态一律 None：
+    manifest-conflict 虽然能按目录名给出一个值，但归属有矛盾，
+    调用方必须同时报 FAIL，不能让 value 冒充「已确认」。
+
+    state 的含义：
+    - directory：目录名前缀给出批次（与清单一致；B0 legacy 允许不在清单）；
+    - manifest：目录名不可判定，清单给出批次；
+    - manifest-conflict：目录名与清单批次不一致；
+    - manifest-missing：目录名可判定，但清单没有给出该文件的 batch；
+    - manifest-invalid：清单里有这个文件，但 batch 列缺失或为空；
+    - untrusted-records：只有记录自述，不能作为正式批次来源；
+    - missing：目录、清单、记录都没有批次信息。
     """
 
     state: str
@@ -822,10 +897,61 @@ class BatchDecision:
 
 
 BATCH_STATE_DIRECTORY = "directory"
-BATCH_STATE_RECORDS = "records"
+BATCH_STATE_MANIFEST = "manifest"
+BATCH_STATE_MANIFEST_CONFLICT = "manifest-conflict"
+BATCH_STATE_MANIFEST_MISSING = "manifest-missing"
+BATCH_STATE_MANIFEST_INVALID = "manifest-invalid"
+BATCH_STATE_UNTRUSTED_RECORDS = "untrusted-records"
 BATCH_STATE_MISSING = "missing"
-BATCH_STATE_CONFLICT = "conflict"
-BATCH_STATE_INVALID = "invalid"
+
+BATCH_BASIS = "设计 §2.4（批次与覆盖）/ 附录 A（清单是 batch 的可信来源）"
+
+
+def decide_batch(directory, results_path, *, manifest_batch=None,
+                 manifest_problem=None, legacy=False):
+    """判定结果文件的可信批次：清单 > 目录名 > B0 legacy 目录名。
+
+    清单是文件批次归属的唯一可信来源：未识别目录里的记录统一写 batch="main"，
+    就能把别的批次冒充成正式主实验，所以记录自述永远只做交叉验证，不能覆盖清单。
+    目录名能识别批次时要求与清单一致；清单没给出 batch 的正式文件直接 FAIL，
+    不能因为目录名恰好能推断就把缺失的清单证据补上。
+    """
+
+    directory_batch = _batch_from_directory(directory.name)
+    if directory_batch is not None:
+        if manifest_batch is not None and manifest_batch != directory_batch:
+            # 两个可信来源矛盾：不采用任何一个（采用目录值会把该目录的记录
+            # 错误计入覆盖统计），归属保持不可确定，由调用方报文件级 FAIL。
+            return BatchDecision(
+                BATCH_STATE_MANIFEST_CONFLICT, None,
+                "目录名推断 " + repr(directory_batch)
+                + "，清单声明 " + repr(manifest_batch))
+        if manifest_batch is None and manifest_problem is not None:
+            return BatchDecision(BATCH_STATE_MANIFEST_INVALID, None,
+                                 manifest_problem)
+        if manifest_batch is None and not legacy:
+            return BatchDecision(
+                BATCH_STATE_MANIFEST_MISSING, directory_batch,
+                "目录名可推断批次，但清单没有给出该文件的 batch")
+        return BatchDecision(BATCH_STATE_DIRECTORY, directory_batch, "")
+
+    if manifest_problem is not None:
+        return BatchDecision(BATCH_STATE_MANIFEST_INVALID, None, manifest_problem)
+
+    if manifest_batch is not None:
+        return BatchDecision(BATCH_STATE_MANIFEST, manifest_batch,
+                             "清单给出 batch=" + repr(manifest_batch))
+
+    invalids, declared = _scan_batch_declarations(results_path)
+    if invalids or declared:
+        detail = "、".join(
+            "第 " + str(lineno) + " 行 batch=" + repr(value)
+            for lineno, value in invalids + declared)
+        return BatchDecision(
+            BATCH_STATE_UNTRUSTED_RECORDS, None,
+            "目录名与清单都没有给出批次；记录自述（" + detail + "）只能交叉验证")
+    return BatchDecision(BATCH_STATE_MISSING, None,
+                         "目录名、清单与记录都没有给出批次")
 
 
 def _scan_batch_declarations(results_path):
@@ -859,41 +985,8 @@ def _scan_batch_declarations(results_path):
     return invalids, declared
 
 
-def decide_batch(directory, results_path):
-    """批次判定：目录前缀优先；否则看记录是否一致声明；否则区分缺失/冲突/非法。
-
-    目录名给出批次时它就是可信值（记录声明别的批次由 check_results 逐行 FAIL），
-    因为「这个目录属于哪个批次」不依赖记录自述；目录名判不出时才看记录，
-    而记录之间矛盾（conflict）或值非法（invalid）都不能算「无从推断」的 UNKNOWN。
-    """
-
-    directory_batch = _batch_from_directory(directory.name)
-    invalids, declared = _scan_batch_declarations(results_path)
-    if directory_batch is not None:
-        return BatchDecision(BATCH_STATE_DIRECTORY, directory_batch, "")
-    if invalids:
-        detail = "、".join(
-            "第 " + str(lineno) + " 行 batch=" + repr(value)
-            for lineno, value in invalids)
-        return BatchDecision(BATCH_STATE_INVALID, None, detail)
-    values = []
-    for _, value in declared:
-        if value not in values:
-            values.append(value)
-    if len(values) > 1:
-        detail = "、".join(
-            "第 " + str(lineno) + " 行 batch=" + repr(value)
-            for lineno, value in declared)
-        return BatchDecision(BATCH_STATE_CONFLICT, None, detail)
-    if values:
-        return BatchDecision(BATCH_STATE_RECORDS, values[0],
-                             "记录一致声明 batch=" + repr(values[0]))
-    return BatchDecision(BATCH_STATE_MISSING, None,
-                         "目录名与记录都没有给出批次")
-
-
 def expected_batch_for(directory, results_path):
-    """预期批次名（兼容旧调用）；四态判定见 decide_batch()。"""
+    """预期批次名（兼容旧调用）；可信来源优先级见 decide_batch()。"""
 
     return decide_batch(directory, results_path).value
 
@@ -948,7 +1041,8 @@ def run_preflight(runs_dir, manifest_path, repo_root):
     report.notes.append(f"repo-root: {repo_root}")
     report.notes.append("本工具只读：不写实验数据、不生成盲评包、不调用模型/Embedding API。")
 
-    declared, failed = check_manifest(report, manifest_path, repo_root)
+    manifest_index = check_manifest(report, manifest_path, repo_root)
+    declared, failed = manifest_index.declared, manifest_index.failed
     manifest_basis = "docs/GRADUATION-EXPERIMENT-FILE-MANIFEST.csv（可信清单）"
 
     if not runs_dir.is_dir():
@@ -1002,9 +1096,50 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                            "有计划但没有结果文件", "设计 §5.3")
             continue
 
-        batch_decision = decide_batch(directory, results_path)
+        # --- 可信批次：清单 > 目录名 > B0 legacy 目录名 ---
+        # 清单批次按规范化相对路径索引；同一 run-dir 的 plan.json 与 results.jsonl
+        # 必须给出同一个清单批次，否则这个目录属于哪个批次无法唯一确定。
+        results_resolved = results_path.resolve()
+        plan_resolved = plan_path.resolve()
+        manifest_batch = manifest_index.batches.get(results_resolved)
+        manifest_problem = manifest_index.batch_problems.get(results_resolved)
+        plan_manifest_batch = manifest_index.batches.get(plan_resolved)
+        plan_manifest_problem = manifest_index.batch_problems.get(plan_resolved)
+
+        if plan_path.is_file() and not legacy and plan_resolved in manifest_index.declared:
+            if plan_manifest_problem is not None:
+                report.add("FAIL", "清单", f"{label}/plan.json · batch",
+                           "清单 batch 非空字符串", plan_manifest_problem,
+                           "清单没有给出 plan.json 的可信批次", manifest_basis)
+            elif (manifest_batch is not None
+                  and plan_manifest_batch != manifest_batch):
+                report.add("FAIL", "清单", f"{label}/plan.json · batch",
+                           f"batch={manifest_batch}（与 results.jsonl 的清单批次一致）",
+                           repr(plan_manifest_batch),
+                           "同一 run-dir 的 plan.json 与 results.jsonl 清单批次不一致，"
+                           "目录属于哪个批次无法唯一确定", manifest_basis)
+
+        batch_decision = decide_batch(
+            directory, results_path, manifest_batch=manifest_batch,
+            manifest_problem=manifest_problem, legacy=legacy)
         expected_batch = batch_decision.value
         design_batch = expected_batch in TOTAL_BATCHES
+
+        if batch_decision.state == BATCH_STATE_MANIFEST_CONFLICT:
+            report.add("FAIL", "批次", label, "目录名与清单的批次一致",
+                       batch_decision.detail,
+                       "同一文件的批次有两个互相矛盾的可信来源，归属不可确定",
+                       BATCH_BASIS)
+        elif batch_decision.state == BATCH_STATE_MANIFEST_MISSING:
+            report.add("FAIL", "批次", label, "清单给出该文件的 batch",
+                       batch_decision.detail,
+                       "正式 results.jsonl 必须有合法的清单 batch；目录名推断不能补上"
+                       "缺失的清单证据", BATCH_BASIS)
+        elif batch_decision.state == BATCH_STATE_MANIFEST_INVALID:
+            report.add("FAIL", "批次", label, "清单给出该文件的 batch",
+                       batch_decision.detail,
+                       "清单里有这个文件但没有合法 batch，正式批次无法确认；"
+                       "不得回退到记录自述", BATCH_BASIS)
         plan = None
         if plan_path.is_file():
             plan = check_plan(report, plan_path, None, label, strict=design_batch)
