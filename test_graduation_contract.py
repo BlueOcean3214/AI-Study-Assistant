@@ -1731,6 +1731,41 @@ def _full_main_case(root):
     return repo_root, runs_dir, run_dir, plan, plan_path, path, manifest
 
 
+def _full_b0_case(root):
+    """B0 legacy 完整 10 条（S5/S7 × B0 × 5 轮）+ 同源 plan + 清单。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, "b0-remainder-20261113T013105Z")
+    plan = plan_schedule.build_schedule(
+        experiment_id=EXPERIMENT_ID,
+        sample_groups={"S5": ["B0"], "S7": ["B0"]},
+        rounds=5,
+        seed=SEED,
+        scheme=SCHEME,
+        algorithm_version=ALGORITHM_VERSION,
+        config_hash="cd" * 32,
+        created_at="2026-11-20T14:00:00+08:00",
+    )
+    plan_path = _write_plan(run_dir, plan)
+    api = _make_api(repo_root)
+    path = None
+    for block in plan["blocks"]:
+        for task in block["tasks"]:
+            _record, path = _produce(
+                run_dir, api,
+                sample_id=block["sample_id"],
+                group=task["group"],
+                repeat_index=task["repeat_index"],
+                round_index=task["round_index"],
+                plan_seq=task["plan_seq"],
+                plan_sha256=plan["plan_sha256"],
+            )
+    manifest = _write_manifest(repo_root, (
+        ("b0-legacy", plan_path, len(plan_schedule.plan_tasks(plan))),
+        ("b0-legacy", path, len(_rows_of(path))),
+    ))
+    return repo_root, runs_dir, run_dir, plan, plan_path, path, manifest
+
+
 def _completion_passes(report):
     return [item for item in report.findings
             if item.level == "PASS" and item.target.endswith(" · 计划完成度")]
@@ -1881,6 +1916,131 @@ def test_flow_legacy_not_untrusted(root):
           not any(item.area == "清单覆盖" and item.level == "FAIL"
                   for item in report.findings),
           [item.render() for item in report.findings if item.area == "清单覆盖"])
+
+
+def test_flow_b0_declared_results_tamper(root):
+    """B0 results 已入清单但内容被改 —— legacy 不能绕过完整性失败。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_b0_case(root)
+    rows = _rows_of(path)
+    rows[0]["answer"] = "B0 被改写的答案：清单没有刷新"
+    _write_rows(path, rows)
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-B0-已声明-results-未刷新"
+
+    manifest_fails = [item for item in _fails(report)
+                      if item.area == "清单" and item.target.endswith("results.jsonl")]
+    check(label + "：清单报 B0 results.jsonl 的 SHA/大小 FAIL",
+          manifest_fails != []
+          and any("SHA-256" in item.reason for item in manifest_fails),
+          [item.render() for item in manifest_fails])
+    check(label + "：不得产生 B0 覆盖 PASS",
+          _findings(report, "PASS", "批次 b0-legacy") == [],
+          [item.render() for item in _findings(report, "PASS", "批次 b0-legacy")])
+    check(label + "：不得产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：不误报成未声明的 legacy（无 B0 legacy WARNING）",
+          not [item for item in report.findings
+               if item.level == "WARNING" and "B0 legacy" in item.reason],
+          [item.render() for item in report.findings
+           if item.level == "WARNING" and "B0 legacy" in item.reason])
+    check(label + "：说明 B0 结果文件未通过清单核验",
+          "results.jsonl 未通过可信清单完整性核验" in notes, report.notes)
+
+
+def test_flow_b0_declared_plan_tamper(root):
+    """B0 plan 已入清单但内容被改 —— 不能进入有效计划索引。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_b0_case(root)
+    plan["created_at"] = "2026-11-21T14:00:00+08:00"
+    plan["plan_sha256"] = plan_schedule.plan_digest(plan)
+    _write_plan(run_dir, plan)
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-B0-已声明-plan-未刷新"
+
+    manifest_fails = [item for item in _fails(report)
+                      if item.area == "清单" and item.target.endswith("plan.json")]
+    check(label + "：清单报 B0 plan.json 的 SHA/大小 FAIL",
+          manifest_fails != []
+          and any("SHA-256" in item.reason for item in manifest_fails),
+          [item.render() for item in manifest_fails])
+    check(label + "：计划不进入有效索引（无身份唯一性 PASS）",
+          _findings(report, "PASS", "身份唯一性") == [],
+          [item.render() for item in _findings(report, "PASS", "身份唯一性")])
+    check(label + "：不得建立计划身份索引（无身份命中结论）",
+          "身份命中" not in notes, report.notes)
+    check(label + "：不得产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：说明 B0 计划未通过清单核验且未做内容核验",
+          "plan.json：未通过可信清单完整性核验" in notes
+          and "未进行计划内容核验" in notes, report.notes)
+
+
+def test_flow_plan_results_batch_conflict_full(root):
+    """完整 main 计划/结果，plan 与 results 清单 batch 冲突 —— 全链路切断。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, _manifest = _full_main_case(root)
+    manifest = _write_manifest(repo_root, (
+        ("suppl-subj", plan_path, len(plan_schedule.plan_tasks(plan))),
+        ("main", path, len(_rows_of(path))),
+    ))
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-plan-results-清单批次冲突"
+
+    conflicts = [item for item in _fails(report)
+                 if item.target.endswith("plan.json · batch")]
+    check(label + "：报且只报一条计划批次冲突 FAIL", len(conflicts) == 1,
+          [item.render() for item in _fails(report)])
+    check(label + "：FAIL 写明应与 results.jsonl 的清单批次一致",
+          bool(conflicts)
+          and "与 results.jsonl 的清单批次一致" in conflicts[0].expected,
+          [(item.expected,) for item in conflicts])
+    check(label + "：实际值点名 suppl-subj，预期点名 main",
+          bool(conflicts) and "suppl-subj" in conflicts[0].actual
+          and "main" in conflicts[0].expected,
+          [(item.expected, item.actual) for item in conflicts])
+    check(label + "：不得产生该目录的批次覆盖 PASS",
+          _findings(report, "PASS", "批次 main") == [],
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：不得产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：不得产生可信总量 PASS",
+          _total_passes(report) == [],
+          [item.render() for item in _total_passes(report)])
+    check(label + "：不得产生身份关系正向结论",
+          _findings(report, "PASS", "身份唯一性") == []
+          and _findings(report, "PASS", "身份集合") == []
+          and "身份命中" not in notes, report.notes)
+    check(label + "：不把冲突降级为 UNKNOWN",
+          [item for item in report.findings if item.level == "UNKNOWN"] == [],
+          [item.render() for item in report.findings if item.level == "UNKNOWN"])
+    check(label + "：说明批次归属冲突、计划和结果均不进入汇总",
+          "plan-results-conflict" in notes
+          and "计划不进入身份索引" in notes
+          and "身份不计入 165 份总量" in notes, report.notes)
+
+
+def test_flow_plan_results_batch_conflict_control(root):
+    """plan/results 清单 batch 一致的完整 main 对照仍保留正向结论。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_main_case(root)
+    report = _flow(repo_root, runs_dir, manifest)
+    label = "7.10-批次冲突-正常对照"
+
+    check(label + "：计划完成度 PASS",
+          len(_completion_passes(report)) == 1,
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：main 批次 140 覆盖 PASS",
+          len(_findings(report, "PASS", "批次 main")) == 1,
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：没有批次冲突说明",
+          "plan-results-conflict" not in "\n".join(report.notes), report.notes)
 
 
 # ---------------------------------------------------------------------------
@@ -2123,6 +2283,10 @@ def _run_all():
             ("case-trusted-control", test_flow_trusted_control),
             ("case-results-not-in-manifest", test_flow_untrusted_results_not_in_manifest),
             ("case-legacy-not-untrusted", test_flow_legacy_not_untrusted),
+            ("case-b0-declared-results-tamper", test_flow_b0_declared_results_tamper),
+            ("case-b0-declared-plan-tamper", test_flow_b0_declared_plan_tamper),
+            ("case-batch-conflict-full", test_flow_plan_results_batch_conflict_full),
+            ("case-batch-conflict-control", test_flow_plan_results_batch_conflict_control),
         ):
             runner(root / name)
 
