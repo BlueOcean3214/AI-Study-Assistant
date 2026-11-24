@@ -2059,6 +2059,214 @@ def test_flow_plan_results_batch_conflict_control(root):
 
 
 # ---------------------------------------------------------------------------
+# 7.11 plan/results 清单 batch 缺失/为空时的配对闸门（第十一轮复审）
+#
+# 第十轮只处理了「两侧 batch 都合法但互相矛盾」。如果 plan 已入清单但 batch
+# 为空、或整张清单没有 batch 列，文件哈希/大小仍正确，plan_trusted 仍为 True：
+# 计划会进入身份索引，甚至拿到完成度 PASS，results 的 main 批次也会被算成覆盖。
+# 下面用完整 140 条主实验数据钉住：任一侧清单 batch 不可用，都不得产生依赖
+# 批次配对的正向结论，也不能降级成 UNKNOWN/WARNING。
+# ---------------------------------------------------------------------------
+
+
+def _pairing_case(root, *, plan_batch="main", results_batch="main",
+                  without_batch_column=False):
+    """完整 main 计划 + 140 条结果，按指定清单 batch 重写清单。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, _manifest = _full_main_case(root)
+    if without_batch_column:
+        manifest = _write_manifest_without_batch(repo_root, (
+            (plan_path, len(plan_schedule.plan_tasks(plan))),
+            (path, len(_rows_of(path))),
+        ))
+    else:
+        manifest = _write_manifest(repo_root, (
+            (plan_batch, plan_path, len(plan_schedule.plan_tasks(plan))),
+            (results_batch, path, len(_rows_of(path))),
+        ))
+    return _flow(repo_root, runs_dir, manifest)
+
+
+def _unknown_or_batch_warning(report):
+    unknown = [item for item in report.findings if item.level == "UNKNOWN"]
+    warnings = [item for item in report.findings
+                if item.level == "WARNING" and "batch" in item.target]
+    return unknown + warnings
+
+
+def test_flow_plan_manifest_batch_empty_blocks_pairing(root):
+    """场景 A：plan 清单 batch 为空 —— 计划不可信、配对结论全断。"""
+
+    report = _pairing_case(root, plan_batch="")
+    notes = "\n".join(report.notes)
+    label = "7.11-plan-清单-batch-空"
+    fails = [item for item in _fails(report)
+             if item.target.endswith("plan.json · batch")]
+
+    check(label + "：报且只报一条 plan 清单 batch FAIL", len(fails) == 1,
+          [item.render() for item in _fails(report)])
+    check(label + "：FAIL 说清清单条目 batch 为空",
+          bool(fails) and "空" in fails[0].actual,
+          [(item.actual,) for item in fails])
+    check(label + "：不产生身份唯一性 PASS",
+          _findings(report, "PASS", "身份唯一性") == [],
+          [item.render() for item in _findings(report, "PASS", "身份唯一性")])
+    check(label + "：不产生身份集合 PASS",
+          _findings(report, "PASS", "身份集合") == [],
+          [item.render() for item in _findings(report, "PASS", "身份集合")])
+    check(label + "：不产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：不产生 main 批次覆盖 PASS",
+          _findings(report, "PASS", "批次 main") == [],
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：不产生可信生成总量 PASS",
+          [item for item in report.findings
+           if item.target == "生成任务总数"] == [],
+          [item.render() for item in report.findings
+           if item.target == "生成任务总数"])
+    check(label + "：不降级为 UNKNOWN/WARNING",
+          _unknown_or_batch_warning(report) == [],
+          [item.render() for item in _unknown_or_batch_warning(report)])
+    check(label + "：说明计划未做内容核验且批次归属不可确认",
+          "未进行计划内容核验" in notes
+          and "plan.json 的清单 batch 不可用" in notes
+          and "批次归属不可确认" in notes, report.notes)
+
+
+def test_flow_manifest_without_batch_column_blocks_pairing(root):
+    """场景 B：整张清单没有 batch 列 —— plan 与 results 都不得进入正向结论。"""
+
+    report = _pairing_case(root, without_batch_column=True)
+    notes = "\n".join(report.notes)
+    label = "7.11-清单-无-batch-列"
+    fails = [item for item in _fails(report)
+             if item.target.endswith("plan.json · batch")]
+
+    check(label + "：报且只报一条 plan 清单 batch FAIL", len(fails) == 1,
+          [item.render() for item in _fails(report)])
+    check(label + "：FAIL 说清清单没有 batch 列",
+          bool(fails) and "没有 batch 列" in fails[0].actual,
+          [(item.actual,) for item in fails])
+    check(label + "：不产生身份唯一性 PASS",
+          _findings(report, "PASS", "身份唯一性") == [],
+          [item.render() for item in _findings(report, "PASS", "身份唯一性")])
+    check(label + "：不产生身份集合 PASS",
+          _findings(report, "PASS", "身份集合") == [],
+          [item.render() for item in _findings(report, "PASS", "身份集合")])
+    check(label + "：不产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：不产生 main 批次覆盖 PASS",
+          _findings(report, "PASS", "批次 main") == [],
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：不产生可信生成总量 PASS",
+          [item for item in report.findings
+           if item.target == "生成任务总数"] == [],
+          [item.render() for item in report.findings
+           if item.target == "生成任务总数"])
+    check(label + "：不降级为 UNKNOWN/WARNING",
+          _unknown_or_batch_warning(report) == [],
+          [item.render() for item in _unknown_or_batch_warning(report)])
+    check(label + "：说明计划未做内容核验且批次归属不可确认",
+          "未进行计划内容核验" in notes
+          and "plan.json 的清单 batch 不可用" in notes
+          and "批次归属不可确认" in notes, report.notes)
+
+
+def test_flow_results_manifest_batch_empty_blocks_pairing(root):
+    """results 清单 batch 为空：plan 内容仍可核，但完成度/覆盖/总量必须切断。"""
+
+    report = _pairing_case(root, results_batch="")
+    notes = "\n".join(report.notes)
+    label = "7.11-results-清单-batch-空"
+    fails = [item for item in _fails(report) if item.area == "批次"]
+
+    check(label + "：报且只报一条 results 清单 batch FAIL", len(fails) == 1,
+          [item.render() for item in _fails(report)])
+    check(label + "：FAIL 说清清单条目 batch 为空",
+          bool(fails) and "空" in fails[0].actual,
+          [(item.actual,) for item in fails])
+    check(label + "：不产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：不产生 main 批次覆盖 PASS",
+          _findings(report, "PASS", "批次 main") == [],
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：不产生可信生成总量 PASS",
+          [item for item in report.findings
+           if item.target == "生成任务总数"] == [],
+          [item.render() for item in report.findings
+           if item.target == "生成任务总数"])
+    check(label + "：不降级为 UNKNOWN/WARNING",
+          _unknown_or_batch_warning(report) == [],
+          [item.render() for item in _unknown_or_batch_warning(report)])
+    check(label + "：说明 results 清单 batch 不可用且未做覆盖核对",
+          "results.jsonl 的清单 batch 不可用" in notes
+          and "未做覆盖核对" in notes, report.notes)
+
+
+def test_flow_plan_batch_pairing_control(root):
+    """场景 C：两侧清单 batch 合法且一致 —— 正向结论全部保留。"""
+
+    report = _pairing_case(root)
+    notes = "\n".join(report.notes)
+    label = "7.11-正常对照"
+
+    check(label + "：计划身份唯一性 PASS",
+          len(_findings(report, "PASS", "身份唯一性")) == 1,
+          [item.render() for item in _findings(report, "PASS", "身份唯一性")])
+    # run_preflight 不向 check_plan 传 expected_identities（那是 check_coverage
+    # 的职责），所以计划侧不会单独出「身份集合」PASS。等价证据是批次 main 的
+    # 140 身份集合核对 PASS，下面两条一起钉住它。
+    check(label + "：计划身份集合未被判 FAIL",
+          _findings(report, "FAIL", "身份集合") == [],
+          [item.render() for item in _findings(report, "FAIL", "身份集合")])
+    check(label + "：批次 main 的 140 身份集合核对 PASS",
+          any("140 个身份" in (item.expected or "")
+              for item in _findings(report, "PASS", "批次 main")),
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：计划完成度 PASS",
+          len(_completion_passes(report)) == 1,
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：main 批次 140 覆盖 PASS",
+          len(_findings(report, "PASS", "批次 main")) == 1,
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：没有批次配对闸门说明",
+          "批次归属不可确认" not in notes, report.notes)
+
+
+def test_flow_b0_legacy_not_declared_after_pairing_gate(root):
+    """场景 D：B0 未纳入清单仍是设计例外，不因配对闸门被判不可信。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, _manifest = _full_b0_case(root)
+    note = repo_root / "docs" / "synthetic-note.txt"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("合成清单占位文件（B0 不在清单里）\n", encoding="utf-8")
+    manifest = _write_manifest(repo_root, (("docs", note, None),))
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.11-B0-legacy-未纳入清单"
+
+    check(label + "：不把 legacy 文件判为清单不可信",
+          "未通过可信清单完整性核验" not in notes, report.notes)
+    check(label + "：不触发批次配对闸门",
+          "批次归属不可确认" not in notes, report.notes)
+    check(label + "：legacy 10 条仍计入 b0-legacy 批次",
+          "批次 b0-legacy：10 条记录" in notes, report.notes)
+    check(label + "：仍只有 B0 legacy WARNING、不报清单覆盖 FAIL",
+          len(_findings(report, "WARNING", "批次 b0-legacy")) == 1
+          and not any(item.level == "FAIL" and item.area == "清单覆盖"
+                      for item in report.findings),
+          [item.render() for item in report.findings
+           if item.area == "清单覆盖"
+           or "批次 b0-legacy" in item.target])
+    check(label + "：计划完成度仍是 PASS",
+          len(_completion_passes(report)) == 1,
+          [item.render() for item in _completion_passes(report)])
+
+
+# ---------------------------------------------------------------------------
 # 8. 消费者二：打包器
 # ---------------------------------------------------------------------------
 
@@ -2302,6 +2510,16 @@ def _run_all():
             ("case-b0-declared-plan-tamper", test_flow_b0_declared_plan_tamper),
             ("case-batch-conflict-full", test_flow_plan_results_batch_conflict_full),
             ("case-batch-conflict-control", test_flow_plan_results_batch_conflict_control),
+        ):
+            runner(root / name)
+
+        # 7.11：清单 batch 缺失/为空必须阻断批次配对结论（第十一轮复审）
+        for name, runner in (
+            ("case-plan-batch-empty-pairing", test_flow_plan_manifest_batch_empty_blocks_pairing),
+            ("case-manifest-no-column-pairing", test_flow_manifest_without_batch_column_blocks_pairing),
+            ("case-results-batch-empty-pairing", test_flow_results_manifest_batch_empty_blocks_pairing),
+            ("case-pairing-control", test_flow_plan_batch_pairing_control),
+            ("case-b0-legacy-pairing", test_flow_b0_legacy_not_declared_after_pairing_gate),
         ):
             runner(root / name)
 

@@ -494,9 +494,10 @@ def check_results(report, results_path, plan, expected_batch=None,
     WARNING。直接调用（不传 plan_check）时保持旧行为：plan 非 None 即按 valid 处理。
 
     `trusted=False` 时（正式结果文件在清单中哈希/大小/记录数不一致、未纳入清单，
-    或 plan/results 清单 batch 冲突），结果行仍逐条解析并报告字段、身份、批次诊断，
-    但不返回身份、不做计划完成度结论；调用方不得把这些身份计入 by_batch、覆盖
-    或 165 份总量。`untrusted_reason` 用于把具体原因（例如批次冲突）写进说明。
+    或 plan/results 的清单 batch 缺失/为空/互相冲突），结果行仍逐条解析并报告字段、
+    身份、批次诊断，但不返回身份、不做计划完成度结论；调用方不得把这些身份计入
+    by_batch、覆盖或 165 份总量。`untrusted_reason` 用于把具体原因（例如批次冲突
+    或某一侧清单 batch 不可用）写进说明。
     """
 
     if batch_decision is None:
@@ -1203,15 +1204,21 @@ def run_preflight(runs_dir, manifest_path, repo_root):
         plan_manifest_batch = manifest_index.batches.get(plan_resolved)
         plan_manifest_problem = manifest_index.batch_problems.get(plan_resolved)
 
-        # 同一 run-dir 的 plan 与 results 必须给出同一个清单 batch；不一致时
-        # 目录归属无法唯一确定。这个冲突不能只是一条 FAIL 后继续用 results 的
-        # batch 算覆盖：它必须切断计划索引、完成度、覆盖与总量结论。
+        # 同一 run-dir 的 plan 与 results 必须给出合法且一致的清单 batch。
+        # 任一侧的清单 batch 缺失/为空，或两侧合法 batch 不一致，都无法证明
+        # 「这份 plan 与这份 results 属于同一批次」。这类配对问题不能只报一条
+        # FAIL 后继续用某一侧的 batch 算覆盖/完成度：它必须切断计划索引、
+        # 完成度、覆盖与总量结论，也不能降级成 UNKNOWN/WARNING。
         plan_results_batch_conflict = None
+        plan_batch_missing_problem = None
         if plan_path.is_file() and plan_resolved in manifest_index.declared:
             if plan_manifest_problem is not None:
+                plan_batch_missing_problem = (
+                    f"plan.json 的清单 batch 不可用（{plan_manifest_problem}）")
                 report.add("FAIL", "清单", f"{label}/plan.json · batch",
                            "清单 batch 非空字符串", plan_manifest_problem,
-                           "清单没有给出 plan.json 的可信批次", manifest_basis)
+                           "清单没有给出 plan.json 的可信批次；计划不得进入身份索引，"
+                           "结果不得计入覆盖与总量", manifest_basis)
             elif (manifest_batch is not None
                   and plan_manifest_batch != manifest_batch):
                 plan_results_batch_conflict = (
@@ -1223,6 +1230,18 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                            "同一 run-dir 的 plan.json 与 results.jsonl 清单批次不一致，"
                            "目录属于哪个批次无法唯一确定；计划不得参与成员关系、同源与"
                            "完成度核验，结果不得计入覆盖与总量", manifest_basis)
+
+        # results 一侧的清单 batch 缺失/为空：plan 的 batch 即使合法，也无法
+        # 证明两者批次归属一致。decide_batch 已经在「批次」区域报 FAIL，这里只
+        # 记录配对问题，供结果信任与覆盖/总量结论统一切断。
+        results_batch_missing_problem = None
+        if (results_resolved in manifest_index.declared
+                and manifest_problem is not None):
+            results_batch_missing_problem = (
+                f"results.jsonl 的清单 batch 不可用（{manifest_problem}）")
+        batch_pairing_problem = (plan_results_batch_conflict
+                                 or plan_batch_missing_problem
+                                 or results_batch_missing_problem)
 
         batch_decision = decide_batch(
             directory, results_path, manifest_batch=manifest_batch,
@@ -1261,6 +1280,16 @@ def run_preflight(runs_dir, manifest_path, repo_root):
             report.notes.append(
                 f"{label}/plan.json：plan.json 与 results.jsonl 的清单批次冲突"
                 f"（{plan_results_batch_conflict}），未进行计划内容核验")
+        elif plan_path.is_file() and plan_batch_missing_problem is not None:
+            # 已声明但清单 batch 缺失/为空：哈希/大小正确只证明文件没被改，
+            # 不能证明它属于哪个批次。与批次冲突同等切断，不能退化成 missing
+            # （那会被当成缺少 plan 的 legacy 目录）。
+            plan_check = PlanCheck(PLAN_STATE_UNTRUSTED, None,
+                                   plan_batch_missing_problem)
+            report.notes.append(
+                f"{label}/plan.json：清单没有给出可信批次"
+                f"（{plan_batch_missing_problem}），未进行计划内容核验；"
+                f"结果侧不据此建立成员关系、同源或完成度结论")
         elif plan_path.is_file() and not plan_trusted:
             # 清单已经为这个文件报了 FAIL（哈希/大小/记录数不一致）或清单覆盖 FAIL
             # （正式文件未纳入清单）；这里不再重复报一次，只把状态切断：计划内容
@@ -1290,12 +1319,17 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                                    batch_decision=batch_decision,
                                    plan_check=plan_check,
                                    trusted=(results_trusted
-                                            and plan_results_batch_conflict is None),
-                                   untrusted_reason=plan_results_batch_conflict)
+                                            and batch_pairing_problem is None),
+                                   untrusted_reason=batch_pairing_problem)
         experiment_ids = {row[0] for row in identities}
         if plan_results_batch_conflict is not None:
             report.notes.append(
                 f"{label}：批次归属冲突，未做覆盖核对，身份不计入 165 份总量")
+        elif batch_pairing_problem is not None:
+            report.notes.append(
+                f"{label}：plan.json 与 results.jsonl 的批次归属不可确认"
+                f"（{batch_pairing_problem}），未做覆盖核对，"
+                f"结果身份不计入 165 份总量")
         elif expected_batch is not None:
             by_batch.setdefault(expected_batch, []).extend(identities)
             check_coverage(report, expected_batch, identities, experiment_ids)
