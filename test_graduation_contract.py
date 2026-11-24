@@ -210,8 +210,13 @@ def _seed_usage(recorder, *, prompt_tokens=321, completion_tokens=123):
 
 def _produce(run_dir, api, *, group=GROUP, repeat_index=0, ok=True, usage=True,
              experiment_id=EXPERIMENT_ID, sample_id=SAMPLE_ID,
-             plan_sha256=PLAN_SHA):
-    """真实跑一次 run_one() 并真实 append_jsonl() 落盘，返回 (record, 源行号)。"""
+             plan_sha256=PLAN_SHA, plan_seq=None, round_index=None):
+    """真实跑一次 run_one() 并真实 append_jsonl() 落盘，返回 (record, 源行号)。
+
+    `plan_seq`/`round_index` 默认等于 `repeat_index`（单格 5 轮夹具的旧行为）；
+    全主实验 140 任务夹具需要按计划里的全局序号单独传入，否则同一样本不同组
+    会拿到相同的 plan_seq。
+    """
 
     recorder = run_experiment.UsageRecorder()
     if usage:
@@ -227,8 +232,8 @@ def _produce(run_dir, api, *, group=GROUP, repeat_index=0, ok=True, usage=True,
         run_dir=run_dir,
         recorder=recorder,
         sampling={"temperature": 0.7, "top_p": 0.9, "max_tokens": 1024},
-        plan_seq=repeat_index,
-        round_index=repeat_index,
+        plan_seq=repeat_index if plan_seq is None else plan_seq,
+        round_index=repeat_index if round_index is None else round_index,
         seed=SEED,
         scheme=SCHEME,
         algorithm_version=ALGORITHM_VERSION,
@@ -1670,6 +1675,215 @@ def test_flow_invalid_plan_full_seed(root):
 
 
 # ---------------------------------------------------------------------------
+# 7.10 清单完整性失败必须阻断下游正向结论（第九轮复审）
+#
+# 7.6–7.9 证明了「文件存在/计划自洽」就能拿计划完成度、覆盖与总量 PASS，但没有
+# 证明「文件是否通过可信清单核验」是这些结论的前提。下面用全主实验 140 条真实
+# 生产器记录，分别破坏 results/plan 的清单哈希、把 results 移出清单，并保留
+# B0 legacy 例外，全部走真实 run_preflight()。
+# ---------------------------------------------------------------------------
+
+FULL_MAIN_SAMPLES = ("S1", "S2", "S3", "S4", "S5", "S6", "S7")
+FULL_MAIN_GROUPS = ("A", "B", "C", "D")
+
+
+def _write_rows(path, rows):
+    Path(path).write_text(
+        "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in rows), encoding="utf-8", newline="\n")
+    return Path(path)
+
+
+def _full_main_case(root):
+    """7 样本 × A/B/C/D × 5 轮 = 140 条真实生产器记录 + 同源 plan + 清单。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, "main-20261113T061051Z")
+    plan = plan_schedule.build_schedule(
+        experiment_id=EXPERIMENT_ID,
+        sample_groups={sample: list(FULL_MAIN_GROUPS)
+                       for sample in FULL_MAIN_SAMPLES},
+        rounds=5,
+        seed=SEED,
+        scheme=SCHEME,
+        algorithm_version=ALGORITHM_VERSION,
+        config_hash="cd" * 32,
+        created_at="2026-11-20T14:00:00+08:00",
+    )
+    plan_path = _write_plan(run_dir, plan)
+    api = _make_api(repo_root)
+    path = None
+    for block in plan["blocks"]:
+        sample_id = block["sample_id"]
+        for task in block["tasks"]:
+            _record, path = _produce(
+                run_dir, api,
+                sample_id=sample_id,
+                group=task["group"],
+                repeat_index=task["repeat_index"],
+                round_index=task["round_index"],
+                plan_seq=task["plan_seq"],
+                plan_sha256=plan["plan_sha256"],
+            )
+    manifest = _write_manifest(repo_root, (
+        ("main", plan_path, len(plan_schedule.plan_tasks(plan))),
+        ("main", path, len(_rows_of(path))),
+    ))
+    return repo_root, runs_dir, run_dir, plan, plan_path, path, manifest
+
+
+def _completion_passes(report):
+    return [item for item in report.findings
+            if item.level == "PASS" and item.target.endswith(" · 计划完成度")]
+
+
+def _total_passes(report):
+    return [item for item in report.findings
+            if item.level == "PASS" and item.target == "生成任务总数"]
+
+
+def test_flow_untrusted_results_tamper(root):
+    """场景 1：results 内容被改、清单未刷新 —— 覆盖/完成度/总量都不得 PASS。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_main_case(root)
+    rows = _rows_of(path)
+    rows[0]["answer"] = "被改写的答案：清单没有刷新"
+    _write_rows(path, rows)
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-results-未刷新清单"
+
+    manifest_fails = [item for item in _fails(report)
+                      if item.area == "清单" and item.target.endswith("results.jsonl")]
+    check(label + "：清单报 results.jsonl 的 SHA/大小 FAIL",
+          manifest_fails != []
+          and any("SHA-256" in item.reason for item in manifest_fails),
+          [item.render() for item in manifest_fails])
+    check(label + "：不得产生主批次覆盖 PASS",
+          _findings(report, "PASS", "批次 main") == [],
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：不得产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：不得产生可信总量 PASS",
+          _total_passes(report) == [],
+          [item.render() for item in _total_passes(report)])
+    check(label + "：说明结果文件未通过清单核验、身份不计入汇总",
+          "results.jsonl 未通过可信清单完整性核验" in notes
+          and "身份不计入 by_batch" in notes
+          and "不产生计划完成度结论" in notes, report.notes)
+
+
+def test_flow_untrusted_plan_tamper(root):
+    """场景 2：plan 合法字段被改并重算内部哈希、清单未刷新 —— 计划不可用。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_main_case(root)
+    plan["created_at"] = "2026-11-21T14:00:00+08:00"
+    plan["plan_sha256"] = plan_schedule.plan_digest(plan)
+    _write_plan(run_dir, plan)
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-plan-未刷新清单"
+
+    manifest_fails = [item for item in _fails(report)
+                      if item.area == "清单" and item.target.endswith("plan.json")]
+    check(label + "：清单报 plan.json 的 SHA/大小 FAIL",
+          manifest_fails != []
+          and any("SHA-256" in item.reason for item in manifest_fails),
+          [item.render() for item in manifest_fails])
+    check(label + "：不得把计划标成有效（无身份唯一性 PASS）",
+          _findings(report, "PASS", "身份唯一性") == [],
+          [item.render() for item in _findings(report, "PASS", "身份唯一性")])
+    check(label + "：不得建立计划身份索引（无身份命中结论）",
+          "身份命中" not in notes, report.notes)
+    check(label + "：不得产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：说明计划未通过清单核验且未做内容核验",
+          "plan.json：未通过可信清单完整性核验" in notes
+          and "未进行计划内容核验" in notes
+          and "结果侧未建立计划身份索引" in notes, report.notes)
+    check(label + "：不误报成 legacy（无 plan_sha256 WARNING）",
+          not [item for item in report.findings
+               if item.level == "WARNING" and "plan_sha256" in item.target],
+          [item.render() for item in report.findings
+           if item.level == "WARNING" and "plan_sha256" in item.target])
+
+
+def test_flow_trusted_control(root):
+    """场景 3：内容与清单完全一致 —— 正常完成度与主批次覆盖 PASS 保留。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_main_case(root)
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-可信对照"
+
+    check(label + "：140 条结果全部写入",
+          len(_rows_of(path)) == 140, len(_rows_of(path)))
+    check(label + "：计划完成度 PASS",
+          len(_completion_passes(report)) == 1,
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：主批次 140 覆盖 PASS",
+          len(_findings(report, "PASS", "批次 main")) == 1,
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：没有触发清单完整性闸门的诊断说明",
+          "未通过可信清单完整性核验" not in notes, report.notes)
+
+
+def test_flow_untrusted_results_not_in_manifest(root):
+    """场景 5：results 未纳入清单 —— 不能靠目录前缀或记录自述进入可信汇总。"""
+
+    repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_main_case(root)
+    # 只保留 plan 的清单条目：results 完全不在清单里，但目录名仍是 main-*。
+    manifest = _write_manifest(repo_root, (
+        ("main", plan_path, len(plan_schedule.plan_tasks(plan))),
+    ))
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-results-未纳入清单"
+
+    check(label + "：清单覆盖报 results.jsonl FAIL",
+          _findings(report, "FAIL", "results.jsonl") != []
+          and any(item.area == "清单覆盖" for item in _findings(report, "FAIL", "results.jsonl")),
+          [item.render() for item in _findings(report, "FAIL", "results.jsonl")])
+    check(label + "：不得产生主批次覆盖 PASS",
+          _findings(report, "PASS", "批次 main") == [],
+          [item.render() for item in _findings(report, "PASS", "批次 main")])
+    check(label + "：不得产生计划完成度 PASS",
+          _completion_passes(report) == [],
+          [item.render() for item in _completion_passes(report)])
+    check(label + "：不得产生可信总量 PASS",
+          _total_passes(report) == [],
+          [item.render() for item in _total_passes(report)])
+    check(label + "：说明结果文件未纳入可信清单",
+          "results.jsonl 未通过可信清单完整性核验" in notes, report.notes)
+
+
+def test_flow_legacy_not_untrusted(root):
+    """场景 4：B0 legacy 未纳入清单是设计例外，不能被新闸门判为不可信。"""
+
+    repo_root, runs_dir, run_dir = _repo(root, "b0-remainder-20261113T013105Z")
+    api = _make_api(repo_root)
+    _produce(run_dir, api, plan_sha256=None, sample_id="S7", group="B0",
+             repeat_index=0)
+    note = repo_root / "docs" / "synthetic-note.txt"
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text("合成清单占位文件（不属于任何运行目录）\n", encoding="utf-8")
+    manifest = _write_manifest(repo_root, (("docs", note, None),))
+    report = _flow(repo_root, runs_dir, manifest)
+    notes = "\n".join(report.notes)
+    label = "7.10-B0-legacy"
+
+    check(label + "：legacy 文件未被判为清单不可信",
+          "未通过可信清单完整性核验" not in notes, report.notes)
+    check(label + "：legacy 身份仍计入 b0-legacy 批次",
+          "批次 b0-legacy：1 条记录" in notes, report.notes)
+    check(label + "：legacy 未纳入清单仍只报 WARNING、不报清单覆盖 FAIL",
+          not any(item.area == "清单覆盖" and item.level == "FAIL"
+                  for item in report.findings),
+          [item.render() for item in report.findings if item.area == "清单覆盖"])
+
+
+# ---------------------------------------------------------------------------
 # 8. 消费者二：打包器
 # ---------------------------------------------------------------------------
 
@@ -1899,6 +2113,16 @@ def _run_all():
         for name, runner in (
             ("case-invalid-plan-seq", test_flow_invalid_plan_full_plan_seq),
             ("case-invalid-plan-seed", test_flow_invalid_plan_full_seed),
+        ):
+            runner(root / name)
+
+        # 7.10：清单完整性失败必须阻断下游正向结论（第九轮任务）
+        for name, runner in (
+            ("case-untrusted-results", test_flow_untrusted_results_tamper),
+            ("case-untrusted-plan", test_flow_untrusted_plan_tamper),
+            ("case-trusted-control", test_flow_trusted_control),
+            ("case-results-not-in-manifest", test_flow_untrusted_results_not_in_manifest),
+            ("case-legacy-not-untrusted", test_flow_legacy_not_untrusted),
         ):
             runner(root / name)
 

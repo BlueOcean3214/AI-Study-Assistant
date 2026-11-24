@@ -14,6 +14,8 @@
 - 清单（manifest）声明的文件是否存在、大小/SHA-256/记录数是否与磁盘一致；
 - **文件级**清单覆盖：每个运行目录的 plan.json 与 results.jsonl 要分别确认已纳入清单，
   不能用「目录里有一个文件在清单里」代表整个目录可信；B0 legacy 按设计例外单独处理；
+- **文件级信任**是下游结论的前提：清单哈希/大小/记录数不一致或正式文件未纳入清单时，
+  该文件不得产生计划完成度、批次覆盖或 165 份总量的 PASS（结果仍解析用于诊断）；
 - plan.json 的 plan_sha256 是否自洽，冻结参数（seed/scheme/algorithm_version/
   block_unit/round_count）是否与设计 §5.1 一致；
 - results.jsonl 是否可解析、字段是否齐全、身份是否重复、行是否属于计划、
@@ -283,16 +285,21 @@ def _count_jsonl(path):
 PLAN_STATE_MISSING = "missing"
 PLAN_STATE_VALID = "valid"
 PLAN_STATE_INVALID = "invalid"
+PLAN_STATE_UNTRUSTED = "untrusted"
 
 
 @dataclass(frozen=True)
 class PlanCheck:
-    """plan.json 的三态核验结果：missing / valid / invalid。
+    """plan.json 的四态核验结果：missing / valid / invalid / untrusted。
 
     `invalid` 时 `plan` 可能是已载入的计划（类型/结构/身份问题），也可能是 None
-    （文件损坏、plan_sha256 不自洽）。结果侧只能使用 `valid` 的计划：无效计划不得
-    建立身份索引、不得做计划成员关系或完成度核验，也不能被当作「没有 plan.json」
-    的 legacy 目录而给出 legacy WARNING。
+    （文件损坏、plan_sha256 不自洽）。`untrusted` 表示文件存在，但没有通过可信清单的
+    完整性核验（SHA-256/大小/记录数不一致，或正式文件未纳入清单）：清单 FAIL 已经
+    由 check_manifest()/清单覆盖检查给出，本状态只负责阻止计划内容进入下游。
+
+    结果侧只能使用 `valid` 的计划：无效或不可信计划不得建立身份索引、不得做计划
+    成员关系或完成度核验，也不能被当作「没有 plan.json」的 legacy 目录而给出
+    legacy WARNING。
     """
 
     state: str
@@ -437,11 +444,13 @@ def _is_int(value):
 
 
 def check_results(report, results_path, plan, expected_batch=None,
-                  batch_decision=None, *, plan_check=None):
+                  batch_decision=None, *, plan_check=None, trusted=True):
     """逐行核对 results.jsonl 的字段、身份、批次、重复与计划同源关系。
 
-    返回**字段类型合法**的身份列表（畸形记录只形成 FAIL，不进入集合比较，
-    否则 list/dict 值会让 set/dict 抛 TypeError，预检就崩了）。
+    返回**字段类型合法且文件可信**的身份列表（畸形记录只形成 FAIL，不进入集合
+    比较，否则 list/dict 值会让 set/dict 抛 TypeError，预检就崩了）。`trusted=False`
+    表示文件没有通过可信清单的完整性核验：仍然解析并报告字段/身份/批次诊断，
+    但不返回身份、不产生计划完成度结论 —— 行内容再正确也不能替代清单哈希核验。
 
     两种记录来源：
 
@@ -477,11 +486,15 @@ def check_results(report, results_path, plan, expected_batch=None,
     `batch_decision` 为 None 时（直接调用的旧路径）按 expected_batch 退化成
     directory / missing 两态，行为与第五轮一致。
 
-    `plan_check` 是 check_plan() 的三态结果。只有 `valid` 计划参与身份索引、
-    结果行成员关系、同源字段与计划完成度核验；`invalid` 计划保留「计划」区域的
-    原始 FAIL，结果侧只继续做与计划无关的字段核验，并写一条「未做计划核验」的
-    说明 —— 既不能建立索引，也不能被误当作没有 plan.json 的 legacy 而报 WARNING。
-    直接调用（不传 plan_check）时保持旧行为：plan 非 None 即按 valid 处理。
+    `plan_check` 是 check_plan()/清单闸门给出的四态结果。只有 `valid` 计划参与
+    身份索引、结果行成员关系、同源字段与计划完成度核验；`invalid` 与 `untrusted`
+    计划保留文件级 FAIL，结果侧只继续做与计划无关的字段核验，并写一条「未做计划
+    核验」的说明 —— 既不能建立索引，也不能被误当作没有 plan.json 的 legacy 而报
+    WARNING。直接调用（不传 plan_check）时保持旧行为：plan 非 None 即按 valid 处理。
+
+    `trusted=False` 时（正式结果文件在清单中哈希/大小/记录数不一致，或未纳入清单），
+    结果行仍逐条解析并报告字段、身份、批次诊断，但不返回身份、不做计划完成度
+    结论；调用方不得把这些身份计入 by_batch、覆盖或 165 份总量。
     """
 
     if batch_decision is None:
@@ -501,6 +514,7 @@ def check_results(report, results_path, plan, expected_batch=None,
         plan = plan_check.plan
     plan_usable = plan_state == PLAN_STATE_VALID
     plan_missing = plan_state == PLAN_STATE_MISSING
+    plan_untrusted = plan_state == PLAN_STATE_UNTRUSTED
 
     area = "结果记录"
     basis = "设计 §7.1（记录字段）/ §5.3（身份四元组）/ §2.4（覆盖与批次）"
@@ -815,6 +829,11 @@ def check_results(report, results_path, plan, expected_batch=None,
         report.notes.append(
             f"{label}：plan.json 校验失败（{reason}），结果侧未建立计划身份索引，"
             f"未做计划成员关系、同源字段与计划完成度核验")
+    elif plan_untrusted:
+        reason = plan_detail or "原因见「清单」区域"
+        report.notes.append(
+            f"{label}：plan.json 未通过可信清单完整性核验（{reason}），"
+            f"结果侧未建立计划身份索引，未做计划成员关系、同源字段与计划完成度核验")
     if plan_structure_problems:
         report.notes.append(
             f"{label}：计划结构不完整（{len(plan_structure_problems)} 处），未建立身份索引；"
@@ -826,7 +845,7 @@ def check_results(report, results_path, plan, expected_batch=None,
 
     if invalid_rows:
         report.notes.append(f"{label}：{invalid_rows} 行字段/身份畸形，已跳过集合比较")
-    if plan_ids is not None:
+    if plan_ids is not None and trusted:
         missing_ids = sorted(plan_ids - set(identities))
         report.notes.append(
             f"{label}：计划任务 {len(plan_ids)} 个，身份命中（已执行）"
@@ -839,6 +858,12 @@ def check_results(report, results_path, plan, expected_batch=None,
             report.add("PASS", area, f"{label} · 计划完成度",
                        f"{len(plan_ids)} 个计划身份", "全部有结果",
                        "计划任务全部完成", basis)
+    if not trusted:
+        report.notes.append(
+            f"{label}：results.jsonl 未通过可信清单完整性核验（SHA-256/大小/记录数"
+            f"不一致，或正式文件未纳入清单），已解析 {result_rows} 行仅用于诊断；"
+            f"身份不计入 by_batch、覆盖与 165 份总量，不产生计划完成度结论")
+        return []
     return identities
 
 
@@ -1125,6 +1150,8 @@ def run_preflight(runs_dir, manifest_path, repo_root):
         label = directory.name
 
         # --- 文件级清单覆盖：plan.json 与 results.jsonl 分别确认 ---
+        results_resolved = results_path.resolve()
+        plan_resolved = plan_path.resolve()
         for path in (plan_path, results_path):
             if not path.is_file():
                 continue
@@ -1156,8 +1183,13 @@ def run_preflight(runs_dir, manifest_path, repo_root):
         # --- 可信批次：清单 > 目录名 > B0 legacy 目录名 ---
         # 清单批次按规范化相对路径索引；同一 run-dir 的 plan.json 与 results.jsonl
         # 必须给出同一个清单批次，否则这个目录属于哪个批次无法唯一确定。
-        results_resolved = results_path.resolve()
-        plan_resolved = plan_path.resolve()
+        #
+        # 文件级信任同样以清单为准：正式文件只有在「已声明且未进 failed」时才可信。
+        # B0 legacy 按冻结设计保留例外（它本来就不在清单里），不能因为缺少清单条目
+        # 或清单核验失败被新闸门误伤。
+        plan_trusted = legacy or (plan_resolved in declared and plan_resolved not in failed)
+        results_trusted = legacy or (results_resolved in declared
+                                     and results_resolved not in failed)
         manifest_batch = manifest_index.batches.get(results_resolved)
         manifest_problem = manifest_index.batch_problems.get(results_resolved)
         plan_manifest_batch = manifest_index.batches.get(plan_resolved)
@@ -1197,7 +1229,18 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                        batch_decision.detail,
                        "清单里有这个文件但没有合法 batch，正式批次无法确认；"
                        "不得回退到记录自述", BATCH_BASIS)
-        if plan_path.is_file():
+        if plan_path.is_file() and not plan_trusted:
+            # 清单已经为这个文件报了 FAIL（哈希/大小/记录数不一致）或清单覆盖 FAIL
+            # （正式文件未纳入清单）；这里不再重复报一次，只把状态切断：计划内容
+            # 不进入身份索引、成员关系、同源字段与完成度核验。不能退化成 missing，
+            # 否则会误报 legacy WARNING。
+            reason = ("SHA-256/大小/记录数与清单不一致" if plan_resolved in failed
+                      else "正式文件未纳入可信清单")
+            plan_check = PlanCheck(PLAN_STATE_UNTRUSTED, None, reason)
+            report.notes.append(
+                f"{label}/plan.json：未通过可信清单完整性核验（{reason}），"
+                f"未进行计划内容核验")
+        elif plan_path.is_file():
             plan_check = check_plan(report, plan_path, None, label,
                                     strict=design_batch)
         else:
@@ -1206,12 +1249,14 @@ def run_preflight(runs_dir, manifest_path, repo_root):
                        "设计 §5.3")
             plan_check = PlanCheck(PLAN_STATE_MISSING, None, "plan.json 不存在")
 
-        # 计划有效性贯穿到结果侧：invalid 计划不得建立身份索引，也不得因 plan=None
-        # 被当作 legacy。missing 才走 legacy 路径。
+        # 计划有效性与文件信任贯穿到结果侧：invalid/untrusted 计划不得建立身份索引，
+        # 也不得因 plan=None 被当作 legacy；missing 才走 legacy 路径。results 的
+        # 清单信任独立判定：行内容正确也不能替代清单哈希核验。
         identities = check_results(report, results_path, plan_check.plan,
                                    expected_batch=expected_batch,
                                    batch_decision=batch_decision,
-                                   plan_check=plan_check)
+                                   plan_check=plan_check,
+                                   trusted=results_trusted)
         experiment_ids = {row[0] for row in identities}
         if expected_batch is not None:
             by_batch.setdefault(expected_batch, []).extend(identities)
