@@ -1923,7 +1923,8 @@ def test_flow_b0_declared_results_tamper(root):
 
     repo_root, runs_dir, run_dir, plan, plan_path, path, manifest = _full_b0_case(root)
     rows = _rows_of(path)
-    rows[0]["answer"] = "B0 被改写的答案：清单没有刷新"
+    original_answer = rows[0]["final_output"]["answer"]
+    rows[0]["final_output"]["answer"] = "B0 被改写的答案：清单没有刷新"
     _write_rows(path, rows)
     report = _flow(repo_root, runs_dir, manifest)
     notes = "\n".join(report.notes)
@@ -1948,6 +1949,20 @@ def test_flow_b0_declared_results_tamper(root):
            if item.level == "WARNING" and "B0 legacy" in item.reason])
     check(label + "：说明 B0 结果文件未通过清单核验",
           "results.jsonl 未通过可信清单完整性核验" in notes, report.notes)
+
+    # 同一份完整 B0 数据恢复原文后必须能拿到覆盖与完成度 PASS，
+    # 证明上面的「无 PASS」来自信任闸门，而不是夹具本身缺字段。
+    rows[0]["final_output"]["answer"] = original_answer
+    _write_rows(path, rows)
+    control = _flow(repo_root, runs_dir, manifest)
+    check(label + "：完整 B0 正常对照拿到 10 条覆盖结论（legacy 设计差异为 WARNING）",
+          len(_findings(control, "WARNING", "批次 b0-legacy")) == 1
+          and _findings(control, "PASS", "批次 b0-legacy") == [],
+          [item.render() for item in control.findings
+           if "批次 b0-legacy" in item.target])
+    check(label + "：完整 B0 正常对照拿到计划完成度 PASS",
+          len(_completion_passes(control)) == 1,
+          [item.render() for item in _completion_passes(control)])
 
 
 def test_flow_b0_declared_plan_tamper(root):

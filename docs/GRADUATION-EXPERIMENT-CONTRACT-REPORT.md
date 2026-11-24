@@ -13,13 +13,13 @@
 3. 统计器的 `condition` 比较已改为"由源记录 `group` 派生"，与打包器 `SourceRow.condition = self.group` 同口径；mapping 与源记录任一侧被篡改都会报 `results-mapping-mismatch`。
 4. 预检对生产器记录走标准化路径：可派生字段照常核验，7 个不可恢复字段逐字段 FAIL（不降级为 WARNING），设计原生记录仍走原严格路径（回归用例证明未放宽）。
 5. 第三轮复审指出的阻断问题已修：预检不再因「这一行凑不齐 29 字段」就整行跳过。**执行证据**（身份四元组、批次归属、是否属于 plan.json、plan_sha256 是否同源）与 **§7.1 契约完整性**（29 字段是否齐备）现在是两个独立维度：缺口照报 FAIL，执行证据照常核验，报告里分开计数（第五节）。
-6. 新增生产者—消费者契约测试 42 个用例、343 项断言（第十轮扩到 62 个用例 / 449 项断言）：真实跑 `run_one()` → 真实 `append_jsonl()` 落盘 → 依次过预检、打包器、统计器。7 套测试全绿（详见第十三、十四节）。
+6. 新增生产者—消费者契约测试 42 个用例、343 项断言（第十轮扩到 62 个用例 / 451 项断言）：真实跑 `run_one()` → 真实 `append_jsonl()` 落盘 → 依次过预检、打包器、统计器。7 套测试全绿（详见第十三、十四节）。
 7. 第四轮复审的两处遗留已在第五轮修掉：**批次不可判定**不再冒充契约缺口（只报 UNKNOWN，其余字段失败照常保留）；**结果行与计划文件的逐字段同源审计**补齐 `plan_seq`/`seed`/`scheme`/`algorithm_version`，其中 `plan_seq` 必须按实验身份定位到计划任务再比 —— 只查「是不是整数 / 在不在范围内 / 连不连续」抓不到那类篡改。B0 legacy 的 WARNING 现在由真实 `b0-*` 目录走完整流程验证（第六节）。
 8. 第六轮复审的两处问题已修（第十一节）：**批次判定拆成四态**，只有「目录名与记录都没有批次信息」才报 UNKNOWN，同一文件内声明冲突与 `batch` 值非法（list/dict/int/bool/空串）各自独立 FAIL，不再被压成「无从推断」；**计划身份唯一性**改为逐任务展开核对，`set`/`dict` 不再吃掉重复身份，重复身份一定 FAIL 并点名各自 `plan_seq`，计划结构缺失时直接 FAIL 且不生成看似完整的身份索引。
 9. 第七轮复审的两处问题已修（第七节）：**清单成为批次归属的唯一可信来源**，目录名只在能与清单一致时确认批次，记录声明只能交叉验证；未识别目录不再能靠记录统一写 `batch="main"` 冒充正式批次，清单缺 batch / batch 为空 / 没有 batch 列 / 目录与清单矛盾 / plan.json 与 results.jsonl 清单批次不一致全部独立 FAIL。**plan.json 增加严格 JSON 类型核验**：顶层 `schema_version`/`seed`/`round_count`、每个任务的 `plan_seq`/`round_index`/`repeat_index` 必须是 int 且不能是 bool，`group` 必须是非空字符串；`1.0 == 1`、`True == 1` 这类等值比较不再能逃过预检。契约测试 389 项、七套合计 1093 项本机全绿。
 10. 第八轮复审的问题已修（第八节）：`check_plan()` 检测到 plan.json 类型/结构/哈希错误后仍把 plan 返回，`run_preflight()` 随即把这份无效计划交给 `check_results()`，后者照常建立计划身份索引，5 条完整结果就能拿到「计划完成度 PASS」——计划侧的 FAIL 与结果侧的 PASS 同时出现。现在计划核验改为 `PlanCheck` 三态（missing / valid / invalid）并贯穿整个调用链：invalid 计划不建索引、不做成员关系与同源核验、不给计划完成度结论，但仍保留计划区域原始 FAIL；结果侧不再把它误当 legacy 而报 `plan_sha256` WARNING。契约测试 404 项、七套合计 1108 项本机全绿。
 11. 第九轮复审的问题已修（第九节）：`check_manifest()` 把 SHA-256/大小/记录数不一致的文件放进 `ManifestIndex.failed`，但 `run_preflight()` 只用它压掉「清单覆盖 PASS」，随后仍把这些文件交给 `check_plan()`、`check_results()`、`by_batch`、覆盖与 165 份总量。于是一个哈希对不上的 results.jsonl 仍可能拿到主批次覆盖 PASS、计划完成度 PASS 与总计 PASS。现在文件信任成为下游结论的前置条件：`failed` 中的 plan.json 进入第四态 `untrusted`，不建索引、不做计划核验；`failed` 中或未纳入清单的正式 results.jsonl 仍解析诊断，但返回空身份、不产生完成度结论、不计入 `by_batch`/覆盖/总量；B0 legacy 的清单外例外保持不变。契约测试 427 项、七套合计 1131 项本机全绿。
-12. 第十轮复审的两处阻断已修（第十节）：**B0 legacy 不再绕过已声明文件的完整性失败**——`legacy` 只豁免「未纳入清单」，已声明且进入 `failed` 的 B0 plan/results 仍按不可信处理，只有未声明时才走 legacy；**plan/results 清单批次冲突不再只报一条 FAIL**——新增 `plan-results-conflict` 批次态，冲突时 plan 直接进入 `untrusted`、不建身份索引，results 以 `trusted=False` 只做诊断，覆盖与 165 份总量均不产生正向结论。契约测试 449 项、七套合计 1153 项本机全绿。
+12. 第十轮复审的两处阻断已修（第十节）：**B0 legacy 不再绕过已声明文件的完整性失败**——`legacy` 只豁免「未纳入清单」，已声明且进入 `failed` 的 B0 plan/results 仍按不可信处理，只有未声明时才走 legacy；**plan/results 清单批次冲突不再只报一条 FAIL**——新增 `plan-results-conflict` 批次态，冲突时 plan 直接进入 `untrusted`、不建身份索引，results 以 `trusted=False` 只做诊断，覆盖与 165 份总量均不产生正向结论。契约测试 451 项、七套合计 1155 项本机全绿。
 
 本轮没有让预检报告"变绿"：真实数据的预检结论仍是 FAIL，因为生产器确实没有记录那 7 个字段。本轮的产出是"能把这件事准确查出来、并且证明查得对"。
 
@@ -455,13 +455,13 @@ results_trusted = results_resolved not in failed and (
 
 冲突只切断该 run-dir；其他目录照常核验。清单批次一致的正常目录不受影响。
 
-### 10.3 第十轮新增全流程用例（4 个场景 / 22 项断言）
+### 10.3 第十轮新增全流程用例（4 个场景 / 24 项断言）
 
 全部走真实 `run_preflight()`，合成数据写入临时目录。B0 夹具是完整 10 条（S5/S7 × B0 × 5 轮）+ 同源 10 任务 plan.json；冲突夹具是完整 140 条主实验记录 + 同源 140 任务 plan.json。
 
 | 用例 | 构造 | 期望 |
 | --- | --- | --- |
-| `test_flow_b0_declared_results_tamper` | B0 的 plan/results 都登记进清单（各 10 条），只改第 0 行 `answer`，不刷新清单 | 清单报 results.jsonl SHA/大小 FAIL；无 B0 批次覆盖 PASS；无计划完成度 PASS；不误报成清单外 legacy WARNING；notes 写明 results 未通过核验 |
+| `test_flow_b0_declared_results_tamper` | B0 的 plan/results 都登记进清单（各 10 条），只改第 0 行 `final_output.answer`，不刷新清单；随后恢复原文作为同夹具对照 | 清单报 results.jsonl SHA/大小 FAIL；无 B0 批次覆盖 PASS；无计划完成度 PASS；不误报成清单外 legacy WARNING；notes 写明 results 未通过核验；恢复后对照拿到 legacy WARNING 与完成度 PASS |
 | `test_flow_b0_declared_plan_tamper` | B0 的 plan/results 都登记，改 plan 的 `created_at` 并重算 `plan_sha256`，不刷新清单 | 清单报 plan.json SHA/大小 FAIL；无身份唯一性 PASS；无「身份命中」；无计划完成度 PASS；notes 写明 plan 未通过核验且未做内容核验 |
 | `test_flow_plan_results_batch_conflict_full` | 140 条完整主实验 + 140 任务 plan；清单把 plan 的 batch 写 `suppl-subj`、results 写 `main`，两份文件哈希/大小/records 都正确 | 恰一条 `plan.json · batch` FAIL，expected 点名 main、actual 点名 suppl-subj；无主批次覆盖 PASS；无完成度 PASS；无总量 PASS；无身份唯一性/身份集合 PASS；notes 无「身份命中」；无 UNKNOWN；notes 写明 plan-results-conflict、计划不进入索引、结果不计入 165 |
 | `test_flow_plan_results_batch_conflict_control` | 同一 140 条夹具，清单 plan/results 都为 `main` | 计划完成度 PASS；main 批次 140 覆盖 PASS；无 plan-results-conflict 说明（证明闸门没有误伤正常目录） |
@@ -544,7 +544,7 @@ results_trusted = results_resolved not in failed and (
 | `experiments/graduation/plan_schedule.py` | 第六轮 +83 / −0，第七轮 +106 / −33（现 700 行） | 新增 `plan_identity_entries()`/`plan_identity_duplicates()`/`plan_identity_map()`，把计划任务逐条展开并带 `where`；`plan_tasks()`/`plan_identities()` 未改动。第七轮新增 `_int_type_problem()`/`_str_type_problem()` 与公开的 `plan_type_problems(plan)`（顶层与 task 的 int 不得是 bool，`group` 非空字符串，`sample_id` 缺失不算类型错误），生产侧 `_check_plan_scalar_types`/`_check_plan_types` 改为复用同一份判定 |
 | `experiments/graduation/analyze_stats.py` | +31 / −1 | 引入 result_schema（`:64`）；`MAPPING_IDENTITY_FIELDS` 去掉 condition 并加注释（`:1624-1634`）；`_compare_mapping_identity` 增加 condition 归属判定（`:1692-1706`） |
 | `test_graduation_stats.py` | +5 / −2 | 合成源行夹具的 group 改为与 condition 相等（真实记录 group 就是 A/B/C/D/C-subj/D-subj/B0）。原夹具 group="G"+... 与打包器 condition=group 冲突，是 STATS EXIT 2 的真因 |
-| `test_graduation_contract.py` | 第三轮新增，第四轮 +220 行，第五轮 +260 行，第六轮 +257 / −3，第七轮 +258 / −34，第八轮 +83，第九轮 +228 / −4，第十轮 +164（现 2260 行） | 生产者—消费者契约测试，62 个用例 / 449 项断言；第四轮新增第 7.5 节七个「生产器记录 × plan.json 联合核验」场景；第五轮新增第 7.6 节七个走 `run_preflight()` 全流程的场景（批次不可判定、四种字段篡改、对照组、真实 `b0-*` legacy）；第六轮新增第 7.7 节八个场景（批次四态五条 + 计划唯一性三条，含正常对照组），B0 legacy 用例改用 S5/S7 与 B0 组；第七轮改写 7.6 的批次用例（清单回退、文件不在清单），新增 7.7 四个清单批次场景与 7.8 六个 plan.json 类型负向场景；第八轮新增 7.9 两个「无效计划 + 完整 5 条结果」全流程场景，并给 7.7 对照组补一条完成度 PASS 断言；第九轮新增 7.10 五个「清单完整性闸门」全流程场景（140 条真实主实验记录 × 4 组、B0 legacy 例外），并给 `_produce()` 增加 `plan_seq`/`round_index` 覆盖参数以构造 140 任务计划；第十轮新增 7.10 的 4 个场景（B0 已声明 results 篡改、B0 已声明 plan 篡改、140 条完整数据的 plan/results 清单批次冲突、同夹具正常对照），新增 `_full_b0_case()` 完整 10 条 B0 夹具 |
+| `test_graduation_contract.py` | 第三轮新增，第四轮 +220 行，第五轮 +260 行，第六轮 +257 / −3，第七轮 +258 / −34，第八轮 +83，第九轮 +228 / −4，第十轮 +179（现 2273 行） | 生产者—消费者契约测试，62 个用例 / 451 项断言；第四轮新增第 7.5 节七个「生产器记录 × plan.json 联合核验」场景；第五轮新增第 7.6 节七个走 `run_preflight()` 全流程的场景（批次不可判定、四种字段篡改、对照组、真实 `b0-*` legacy）；第六轮新增第 7.7 节八个场景（批次四态五条 + 计划唯一性三条，含正常对照组），B0 legacy 用例改用 S5/S7 与 B0 组；第七轮改写 7.6 的批次用例（清单回退、文件不在清单），新增 7.7 四个清单批次场景与 7.8 六个 plan.json 类型负向场景；第八轮新增 7.9 两个「无效计划 + 完整 5 条结果」全流程场景，并给 7.7 对照组补一条完成度 PASS 断言；第九轮新增 7.10 五个「清单完整性闸门」全流程场景（140 条真实主实验记录 × 4 组、B0 legacy 例外），并给 `_produce()` 增加 `plan_seq`/`round_index` 覆盖参数以构造 140 任务计划；第十轮新增 7.10 的 4 个场景（B0 已声明 results 篡改、B0 已声明 plan 篡改、140 条完整数据的 plan/results 清单批次冲突、同夹具正常对照），新增 `_full_b0_case()` 完整 10 条 B0 夹具 |
 
 未改动：`run_experiment.py`（生产器）、`make_blind_pack.py`（打包器）、`docs/GRADUATION-EXPERIMENT-DESIGN.md`（冻结规范）。
 
@@ -597,12 +597,12 @@ results_trusted = results_resolved not in failed and (
 - 第七轮新增（第 7.6 / 7.7 / 7.8 节，12 个场景 / 46 项断言）：清单与目录矛盾、清单 batch 为空、清单没有 batch 列、plan.json 与 results.jsonl 清单批次不一致各 1 条场景；plan.json 的 `plan_seq`/`round_index`/`seed`/`round_count` 六个 float/bool 负向场景。具体构造与断言见第 7.3 节。
 - 第八轮新增（第 7.9 节，2 个场景 / 14 项断言）：无效计划（`plan_seq=1.0` / `seed` 等值 float）+ 完整 5 条结果，验证计划类型 FAIL 保留、无计划完成度 PASS、无身份唯一性 PASS、无「身份命中」、无 legacy WARNING；对照组追加正常计划 5 条结果的完成度 PASS。具体构造与断言见第 8.3 节。
 - 第九轮新增（第 7.10 节，5 个场景 / 23 项断言）：140 条真实主实验记录分别验证 results 哈希失败、plan 哈希失败、可信对照、results 未纳入清单、B0 legacy 例外。前两者不得产生覆盖/完成度/总量 PASS，可信对照必须保留完成度与主批次覆盖 PASS，未纳入清单的 results 不得靠目录前缀进入汇总，B0 legacy 不因清单外被新闸门误伤。具体构造与断言见第 9.3 节。
-- 第十轮新增（第 7.10 节，4 个场景 / 22 项断言）：完整 10 条 B0 数据分别验证「results 已声明后改 answer」「plan 已声明后改 created_at 并重算 plan_sha256」都不得产生 B0 覆盖/完成度 PASS，且不误报 legacy；完整 140 条主实验数据把 plan 的清单 batch 写成 suppl-subj、results 写成 main，验证恰一条冲突 FAIL、无计划索引/完成度/覆盖/总量/身份 PASS、无 UNKNOWN；同一 140 条夹具在 batch 一致时保留完成度与覆盖 PASS。具体构造与断言见第 10.3 节。
+- 第十轮新增（第 7.10 节，4 个场景 / 24 项断言）：完整 10 条 B0 数据分别验证「results 已声明后改 final_output.answer」「plan 已声明后改 created_at 并重算 plan_sha256」都不得产生 B0 覆盖/完成度 PASS，且不误报 legacy；B0 数据恢复原文后必须拿到 legacy WARNING 与完成度 PASS 作为同夹具对照；完整 140 条主实验数据把 plan 的清单 batch 写成 suppl-subj、results 写成 main，验证恰一条冲突 FAIL、无计划索引/完成度/覆盖/总量/身份 PASS、无 UNKNOWN；同一 140 条夹具在 batch 一致时保留完成度与覆盖 PASS。具体构造与断言见第 10.3 节。
 - 打包器：test_packer（读得到、SourceRow.condition == group、行哈希与统计器一致、文件哈希 = 文件字节 SHA-256）
 - 统计器：test_stats_roundtrip（1 mapping ↔ 1 行、命中第 1 行、内容一致、文件哈希记录、cost_metrics 可用）+ test_stats_condition_tamper、test_stats_source_group_tamper、test_stats_source_condition_conflict、test_stats_group_missing、test_stats_mapping_condition_empty
 - 三消费者口径一致：test_consumers_agree（身份四元组、condition 归属、prompt 哈希三处判定同源）
 
-结果：`0 FAILED / 449 PASSED`，退出码 0。
+结果：`0 FAILED / 451 PASSED`，退出码 0。
 
 ## 十四、测试结果（本机，非 CI）
 
@@ -614,9 +614,9 @@ results_trusted = results_resolved not in failed and (
 | `test_graduation_rating_materials.py` | 59 通过 / 0 失败，退出码 0 |
 | `test_graduation_toolchain_e2e.py` | 8/8 PASS，退出码 0 |
 | `test_graduation_experiment_runner.py` | 205 PASSED / 0 FAILED，退出码 0 |
-| `test_graduation_contract.py`（第三轮新增，第四～十轮扩充） | 449 PASSED / 0 FAILED，退出码 0 |
+| `test_graduation_contract.py`（第三轮新增，第四～十轮扩充） | 451 PASSED / 0 FAILED，退出码 0 |
 
-合计 1153 项断言全部通过（第三轮 936 + 第四轮新增 33 项 + 第五轮新增 43 项：第 7.6 节七个全流程场景 + 第六轮新增 35 项：第 7.7 节八个场景 + 第七轮新增 46 项：清单批次场景与 plan.json 类型负向 + 第八轮新增 15 项：第 7.9 节两个无效计划场景与对照组完成度断言 + 第九轮新增 23 项：第 7.10 节五个清单完整性场景 + 第十轮新增 22 项：第 10.3 节四个 B0/批次冲突场景）。以上全部为本机运行，非 CI。本轮按要求未访问真实 `runs/`、`feedback.db`、`blind_private/`；测试只使用 `tempfile` 临时目录，结束后自动清理。
+合计 1155 项断言全部通过（第三轮 936 + 第四轮新增 33 项 + 第五轮新增 43 项：第 7.6 节七个全流程场景 + 第六轮新增 35 项：第 7.7 节八个场景 + 第七轮新增 46 项：清单批次场景与 plan.json 类型负向 + 第八轮新增 15 项：第 7.9 节两个无效计划场景与对照组完成度断言 + 第九轮新增 23 项：第 7.10 节五个清单完整性场景 + 第十轮新增 24 项：第 10.3 节四个 B0/批次冲突场景）。以上全部为本机运行，非 CI。本轮按要求未访问真实 `runs/`、`feedback.db`、`blind_private/`；测试只使用 `tempfile` 临时目录，结束后自动清理。
 
 复现：`cd F:\somethingProject\dsbot-preflight`；`$env:PYTHONIOENCODING="utf-8"`；`& "F:\somethingProject\dsbot\.venv\Scripts\python.exe" test_graduation_contract.py`。
 
