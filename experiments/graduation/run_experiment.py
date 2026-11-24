@@ -41,6 +41,7 @@ if str(HERE) not in sys.path:
 
 import build_prompts  # noqa: E402
 import plan_schedule  # noqa: E402
+import run_provenance  # noqa: E402
 import seed_fixture  # noqa: E402
 
 REAL_DB = (seed_fixture.PROJECT_ROOT / "feedback.db").resolve()
@@ -580,6 +581,9 @@ def run_one(
     scheme=None,
     algorithm_version=None,
     plan_sha256=None,
+    config_sha256=None,
+    sample=None,
+    provenance_context=None,
 ):
     """跑一个 (样本, 组, 重复) 并返回一条待追加的结果记录（不写文件）。
 
@@ -596,10 +600,28 @@ def run_one(
     if resolved_db == REAL_DB:
         raise RuntimeError(f"拒绝在真实数据库上运行实验：{resolved_db}")
 
+    # run_id 必须在本次运行开始时生成；它不是历史记录的 run_id，也不能事后补写。
+    started_at = now or datetime.now(timezone.utc)
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
+    run_id = run_provenance.make_run_id(sample_id, group, repeat_index, now=started_at)
+    strict_provenance = provenance_context is not None
+    if provenance_context is None:
+        # 直接调用（测试/调试）使用当前工作树快照；正式 main() 必须显式传入。
+        provenance_context = run_provenance.capture_context(now=started_at)
+
     slots = build_prompts.group_inputs(group, inputs)
     content = build_prompts.build_group_content(group, inputs, api)
     system = api["agent_plan_draft"].DRAFT_SYSTEM_PROMPT
     prompt_ref = write_prompt_file(run_dir, sample_id, group, system, content)
+
+    # 注入清单先于模型调用写盘：它描述的是"实际要注入的对象"，不是事后猜测。
+    injected_memories = run_provenance.select_injected_memories(
+        build_prompts.GROUP_SLOTS[group], inputs, strict=strict_provenance
+    )
+    injected_ref, injected_sha = run_provenance.write_injected_json(
+        run_dir, sample_id, group, injected_memories
+    )
 
     steps = evidence_steps(group, inputs)
     raw_sink = []
@@ -686,6 +708,30 @@ def run_one(
         else (result.get("message") or (str(failure) if failure else None)),
         "stopped_reason": result.get("stopped_reason"),
     }
+
+    provenance = run_provenance.build_provenance(
+        context=provenance_context,
+        run_id=run_id,
+        sample_id=sample_id,
+        group=group,
+        repeat_index=repeat_index,
+        group_slots=build_prompts.GROUP_SLOTS[group],
+        inputs=inputs,
+        sample=sample,
+        prompt_sha256=record["prompt_sha256"],
+        config_sha256=config_sha256,
+        plan_sha256=plan_sha256,
+        generated_at=record["generated_at"],
+        model_alias=record["model"],
+        model_snapshot_id=None,
+        strict=strict_provenance,
+    )
+    provenance["injected_json_ref"] = injected_ref
+    provenance["injected_json_sha256"] = injected_sha
+    record.update(provenance)
+
+    if strict_provenance:
+        run_provenance.validate_provenance(record, strict=True)
 
     return record
 
@@ -1129,6 +1175,13 @@ def main(argv=None):
     experiment_id = make_experiment_id(config, run_dir)
     config_hash = plan_schedule.config_sha256(config)
 
+    # 在任何模型请求之前固定运行时来源；工作树不干净不阻止运行，但必须留证据。
+    try:
+        provenance_context = run_provenance.capture_context()
+    except run_provenance.ProvenanceError as error:
+        print(f"拒绝运行：无法采集运行时来源：{error}", file=sys.stderr)
+        return 5
+
     try:
         schedule, skipped_b0 = build_plan_schedule(
             base_plan, settings, rounds, experiment_id, config_hash
@@ -1270,6 +1323,10 @@ def main(argv=None):
         f"本次待执行 {len(pending)}"
     )
     print(f"sampling      = {sampling}")
+    print(
+        f"provenance    = base_sha={provenance_context.base_sha[:12]}… "
+        f"worktree_clean={provenance_context.runtime_worktree_clean}"
+    )
 
     if skipped_b0:
         print(
@@ -1330,25 +1387,38 @@ def main(argv=None):
             return 3
 
         for task in sample_tasks:
-            record = run_one(
-                experiment_id=experiment_id,
-                sample_id=sample_id,
-                group=task["group"],
-                repeat_index=task["repeat_index"],
-                inputs=inputs,
-                api=api,
-                run_dir=run_dir,
-                recorder=recorder,
-                sampling=sampling,
-                sample_selection=task["sample_selection"],
-                b0_sample_override=task["b0_sample_override"],
-                plan_seq=task["plan_seq"],
-                round_index=task["round_index"],
-                seed=plan["seed"],
-                scheme=plan["scheme"],
-                algorithm_version=plan["algorithm_version"],
-                plan_sha256=plan["plan_sha256"],
-            )
+            try:
+                record = run_one(
+                    experiment_id=experiment_id,
+                    sample_id=sample_id,
+                    group=task["group"],
+                    repeat_index=task["repeat_index"],
+                    inputs=inputs,
+                    api=api,
+                    run_dir=run_dir,
+                    recorder=recorder,
+                    sampling=sampling,
+                    sample_selection=task["sample_selection"],
+                    b0_sample_override=task["b0_sample_override"],
+                    plan_seq=task["plan_seq"],
+                    round_index=task["round_index"],
+                    seed=plan["seed"],
+                    scheme=plan["scheme"],
+                    algorithm_version=plan["algorithm_version"],
+                    plan_sha256=plan["plan_sha256"],
+                    config_sha256=config_hash,
+                    sample=sample,
+                    provenance_context=provenance_context,
+                )
+            except run_provenance.ProvenanceError as error:
+                print(
+                    f"拒绝运行：本次 run 来源不完整：{error}", file=sys.stderr
+                )
+                print(
+                    "已按 fail-closed 停止；该记录没有写入 results.jsonl。",
+                    file=sys.stderr,
+                )
+                return 5
             append_jsonl(results_path, record)
 
             executed += 1

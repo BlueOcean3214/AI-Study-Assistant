@@ -282,10 +282,32 @@ def resolve_request_subject(sample, user_message, api):
     return key
 
 
+def _raw_memory_rows(memory_service, *, subject, limit, tool_result):
+    """只在 Tool 确实返回条目时补取原始对象；失败运行不伪造来源。"""
+
+    memories = (tool_result or {}).get("memories") or []
+    if not tool_result or not tool_result.get("ok") or not memories:
+        return {"memories": []}
+
+    result = memory_service.retrieve(
+        memory_type=None,
+        subject=subject,
+        status="active",
+        limit=limit,
+    )
+
+    if not isinstance(result, dict) or not result.get("ok"):
+        message = result.get("message") if isinstance(result, dict) else None
+        raise RuntimeError(f"运行时记忆来源采集失败：{message or result!r}")
+
+    return result
+
+
 def collect_inputs(sample, config, api, moment):
     """收集四组共用的原始输入（只读，全部在固定时钟下进行）。"""
 
     agent_tools = api["agent_tools"]
+    memory_service = api["memory_service"]
     memory_context = api["memory_context"]
     agent_plan_draft = api["agent_plan_draft"]
 
@@ -321,6 +343,23 @@ def collect_inputs(sample, config, api, moment):
             subject_memory_tool = agent_tools.get_learning_memory(
                 subject=subject_filter, limit=limit
             )
+
+        # 来源采集：Tool 返回值刻意剥离 memory_id / status，因此只能在运行时
+        # 再从同一个 memory_service.retrieve(status="active") 取一次原始对象。
+        # 这是只读查询，不改变注入内容；用于把"实际注入条目"逐条绑定到 memory_id。
+        raw_default = _raw_memory_rows(
+            memory_service, subject=None, limit=limit, tool_result=memory_tool
+        )
+        raw_subject = (
+            _raw_memory_rows(
+                memory_service,
+                subject=subject_filter,
+                limit=limit,
+                tool_result=subject_memory_tool,
+            )
+            if subject_memory_tool is not None
+            else {"memories": []}
+        )
 
     if difficult_error:
         raise RuntimeError(f"{sample['sample_id']} 无法推导难度标记：{difficult_error}")
