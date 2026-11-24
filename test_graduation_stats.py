@@ -143,18 +143,22 @@ def _default_item(sample, item):
     raise AssertionError("未知评分项 %r" % (item,))
 
 
-def _results_row(sample, condition, repeat, phase, zero_latency):
+def _results_row(sample, condition, repeat, phase, zero_latency, round_index=1):
     bias = {"formal": 0, "calibration": 100, "supplementary": 1000}[phase]
     base = 10 if condition == "A" else (14 if condition == "D" else 12)
     latency = 0.0 if (zero_latency and condition == "A") else float(
         base + repeat + bias)
     tokens = (1000 if condition == "A" else (1200 if condition == "D" else 1100))
     return {
+        "experiment_id": "exp-" + sample,
         "sample_id": sample,
-        "group": "G" + sample[1:],
+        # 真实记录里 group 就是实验条件（A/B/C/D/C-subj/D-subj/B0）：打包器的
+        # SourceRow.condition 恒等于源记录的 group，生产器也不写 condition 字段，
+        # 所以夹具必须让 group 与 condition 一致，否则夹具本身就违反冻结口径。
+        "group": condition,
         "condition": condition,
         "repeat_index": repeat,
-        "round_index": 1,
+        "round_index": round_index,
         "prompt_sha256": _sha("prompt", phase, sample, condition, repeat),
         "request_count": 3 + bias,
         "elapsed_seconds": latency,
@@ -187,15 +191,19 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
         spec += _supplement_spec()
 
     mapping_rows, results_rows = [], []
+    results_by_run_dir = {}
     for seq, item in enumerate(spec, start=1):
         sample = item["sample"]
         condition = item["condition"]
         repeat = item["repeat"]
         prompt = _sha("prompt", item["phase"], sample, condition, repeat)
         if with_results:
+            raw_round = str(item.get("round", "1")).strip()
             result_row = _results_row(sample, condition, repeat, item["phase"],
-                                      zero_latency)
+                                      zero_latency,
+                                      int(raw_round) if raw_round else None)
             results_rows.append(result_row)
+            results_by_run_dir.setdefault(item["run_dir"], []).append(result_row)
             row_sha = A.row_sha256(result_row)
         else:
             row_sha = _sha("row", seq)
@@ -205,10 +213,14 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
             "batch": item["batch"],
             "source_run_dir": item["run_dir"],
             "source_file": "results.jsonl",
-            "source_row_number": str(seq),
+            # 真实 mapping 的 source_row_number 是「源 results.jsonl 内的行号」，
+            # 不是全局序号（make_blind_pack.read_rows 用 enumerate(..., start=1)）。
+            "source_row_number": str(sum(
+                1 for other in mapping_rows
+                if other["source_run_dir"] == item["run_dir"]) + 1),
             "experiment_id": "exp-" + sample,
             "sample_id": sample,
-            "group": "G" + sample[1:],
+            "group": condition,
             "condition": condition,
             "repeat_index": str(repeat),
             "round_index": item.get("round", "1"),
@@ -270,21 +282,57 @@ def make_fixture(root, overrides=None, rater_overrides=None, pending=None,
         "calibration_raw": root / "ratings_calibration_raw.csv",
         "supplement_raw": root / "ratings_supplement_raw.csv",
         "adjudicated": root / "ratings_adjudicated.csv",
-        "results": root / "results.jsonl",
+        "results": [],
+        "results_by_run_dir": {},
     }
+    if with_results:
+        for run_dir, rows in results_by_run_dir.items():
+            path = root / run_dir / "results.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True)
+                          for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            paths["results"].append(path)
+            paths["results_by_run_dir"][run_dir] = path
+            for meta in mapping_rows:
+                if meta["source_run_dir"] == run_dir:
+                    meta["source_results_file_sha256"] = digest
     _write_csv(paths["mapping"], A.MAPPING_COLUMNS, mapping_rows)
     _write_csv(paths["formal_raw"], A.FORMAL_RAW_COLUMNS, formal_rows)
     _write_csv(paths["calibration_raw"], A.FORMAL_RAW_COLUMNS, calibration_rows)
     _write_csv(paths["supplement_raw"], A.SUPPLEMENT_RAW_COLUMNS, supplement_rows)
     _write_csv(paths["adjudicated"], A.ADJUDICATED_COLUMNS, adjudications)
-    if with_results:
-        paths["results"].write_text(
-            "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True)
-                      for row in results_rows) + "\n",
-            encoding="utf-8",
-        )
     return {"root": root, "paths": paths, "mapping_rows": mapping_rows,
             "spec": spec}
+
+
+def results_extra(fixture):
+    """把每个 run-dir 的 results.jsonl 展开成 --results 参数序列。"""
+
+    argv = []
+    for path in fixture["paths"]["results"]:
+        argv.extend(["--results", str(path)])
+    return tuple(argv)
+
+
+def refresh_mapping_file_sha(fixture):
+    """按磁盘上的结果文件重算 mapping 的 source_results_file_sha256 并重写映射。
+
+    用于「只改结果内容、不改文件哈希记录」之外的场景：测试想验证行级/覆盖类检查时，
+    先让文件哈希保持一致，避免哈希守卫先拦住。
+    """
+
+    for run_dir, path in fixture["paths"]["results_by_run_dir"].items():
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        for meta in fixture["mapping_rows"]:
+            if meta["source_run_dir"] == run_dir:
+                meta["source_results_file_sha256"] = digest
+    _write_csv(fixture["paths"]["mapping"], A.MAPPING_COLUMNS,
+               fixture["mapping_rows"])
+    return fixture
 
 
 def blind_of(fixture, phase, sample, condition, repeat):
@@ -881,14 +929,16 @@ def test_overwrite_protection(fixture, out_dir):
 
 def test_input_hashes_unchanged(fixture, out_dir):
     before = {Path(path).name: A.sha256_file(path)
-              for name, path in fixture["paths"].items() if name != "results"}
+              for name, path in fixture["paths"].items()
+              if isinstance(path, (str, Path))}
     records = {Path(row["path"]).name: row["sha256"]
                for row in read_csv(out_dir / "input_hashes.csv")}
     ok = all(records.get(name) == digest for name, digest in before.items())
     check("input_hashes.csv 记录与输入一致", ok,
           {name: (records.get(name), digest) for name, digest in before.items()})
     after = {Path(path).name: A.sha256_file(path)
-             for name, path in fixture["paths"].items() if name != "results"}
+             for name, path in fixture["paths"].items()
+              if isinstance(path, (str, Path))}
     check("运行后输入未被改动", before == after)
 
 
@@ -1222,8 +1272,7 @@ def test_h5_with_results():
     fixture = make_fixture(TMP_ROOT / "h5_ok", overrides=e2e_overrides(),
                            with_results=True)
     out_dir = TMP_ROOT / "h5_ok_out"
-    code, _ = run_main(fixture, out_dir,
-                       extra=("--results", str(fixture["paths"]["results"])))
+    code, _ = run_main(fixture, out_dir, extra=results_extra(fixture))
     check("有 results 时可跑完", code == 0)
     h5 = {row["label"]: row for row in read_csv(out_dir / "h5_results.csv")}
     check("H5 两行（Y3/Y5）", len(h5) == 2, list(h5))
@@ -1241,15 +1290,16 @@ def test_h5_with_results():
     holm = read_csv(out_dir / "holm_adjusted_results.csv")
     check("H5 家族单独成族（3+2=5 行）", len(holm) == 5 and
           sum(1 for row in holm if row["family"] == "H5_Y3_Y5") == 2)
-    check("input_hashes 多一条 results",
-          len(read_csv(out_dir / "input_hashes.csv")) == 6)
+    check("input_hashes 覆盖 5 个输入 + 每个结果文件",
+          len(read_csv(out_dir / "input_hashes.csv")) ==
+          5 + len(fixture["paths"]["results"]))
 
     # 对数定义域不满足 → fail-closed，不加常数
     fixture2 = make_fixture(TMP_ROOT / "h5_zero", overrides=e2e_overrides(),
                             with_results=True, zero_latency=True)
     out_dir2 = TMP_ROOT / "h5_zero_out"
     code2, _ = run_main(fixture2, out_dir2,
-                        extra=("--results", str(fixture2["paths"]["results"])))
+                        extra=results_extra(fixture2))
     check("延迟为 0 时仍可跑完（不崩）", code2 == 0)
     h5b = {row["label"]: row for row in read_csv(out_dir2 / "h5_results.csv")}
     y3 = h5b["Y3(log) D−A"]
@@ -1263,32 +1313,175 @@ def test_h5_with_results():
 def test_results_mismatch():
     fixture = make_fixture(TMP_ROOT / "res_bad", overrides=e2e_overrides(),
                            with_results=True)
+    target_file = fixture["paths"]["results_by_run_dir"]["runs/formal"]
     rows = [json.loads(line) for line in
-            fixture["paths"]["results"].read_text(encoding="utf-8").splitlines()
+            target_file.read_text(encoding="utf-8").splitlines()
             if line.strip()]
     rows[0]["prompt_sha256"] = "0" * 64
-    fixture["paths"]["results"].write_text(
+    target_file.write_text(
         "\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True)
                   for row in rows) + "\n", encoding="utf-8")
+    refresh_mapping_file_sha(fixture)
     expect_error("results 与 mapping 的 prompt 哈希不一致 → fail-closed",
                  "results-mapping-mismatch",
                  lambda: run_main(fixture, TMP_ROOT / "res_bad_out",
-                                  extra=("--results", str(fixture["paths"]["results"]))))
+                                  extra=results_extra(fixture)))
 
     fixture2 = make_fixture(TMP_ROOT / "res_missing", overrides=e2e_overrides(),
                             with_results=True)
-    lines = fixture2["paths"]["results"].read_text(encoding="utf-8").splitlines()
-    fixture2["paths"]["results"].write_text("\n".join(lines[1:]) + "\n",
-                                            encoding="utf-8")
+    drop_file = fixture2["paths"]["results_by_run_dir"]["runs/formal"]
+    lines = drop_file.read_text(encoding="utf-8").splitlines()
+    drop_file.write_text("\n".join(lines[1:]) + "\n", encoding="utf-8")
+    refresh_mapping_file_sha(fixture2)
     expect_error("results 缺行 → fail-closed", "results-mapping-mismatch",
                  lambda: run_main(fixture2, TMP_ROOT / "res_missing_out",
-                                  extra=("--results", str(fixture2["paths"]["results"]))))
+                                  extra=results_extra(fixture2)))
 
     broken = TMP_ROOT / "res_broken" / "results.jsonl"
     broken.parent.mkdir(parents=True, exist_ok=True)
     broken.write_text("{not json}\n", encoding="utf-8")
     expect_error("results 非法 JSON → bad-results", "bad-results",
                  lambda: A.load_results([broken], {}))
+
+
+def test_results_file_hash_guard():
+    fixture = make_fixture(TMP_ROOT / "res_hash", overrides=e2e_overrides(),
+                           with_results=True)
+    formal_file = fixture["paths"]["results_by_run_dir"]["runs/formal"]
+
+    original = formal_file.read_bytes()
+    formal_file.write_bytes(original + b'{"tampered": true}\n')
+    out1 = TMP_ROOT / "res_hash_out1"
+    expect_error("源文件被追加内容但 mapping 未更新 → 文件哈希不符",
+                 "results-file-hash-mismatch",
+                 lambda: run_main(fixture, out1, extra=results_extra(fixture)))
+    check("哈希不符时不产出统计目录", not out1.exists(), out1)
+    formal_file.write_bytes(original)
+
+    bad = make_fixture(TMP_ROOT / "res_hash_bad", overrides=e2e_overrides(),
+                       with_results=True)
+    for meta in bad["mapping_rows"]:
+        if meta["source_run_dir"] == "runs/formal":
+            meta["source_results_file_sha256"] = "0" * 64
+    _write_csv(bad["paths"]["mapping"], A.MAPPING_COLUMNS, bad["mapping_rows"])
+    expect_error("mapping 记录的源文件哈希被篡改 → fail-closed",
+                 "results-file-hash-mismatch",
+                 lambda: run_main(bad, TMP_ROOT / "res_hash_out2",
+                                  extra=results_extra(bad)))
+
+    missing = make_fixture(TMP_ROOT / "res_hash_missing",
+                           overrides=e2e_overrides(), with_results=True)
+    missing_path = missing["paths"]["results_by_run_dir"]["runs/calibration"]
+    missing_bytes = missing_path.read_bytes()
+    missing_path.unlink()
+    expect_error("源文件缺失 → CLI 读取输入阶段就拒绝", "missing-input",
+                 lambda: run_main(missing, TMP_ROOT / "res_hash_out3",
+                                  extra=results_extra(missing)))
+    missing_path.write_bytes(missing_bytes)
+    expect_error("源文件缺失 → load_results 也拒绝", "results-file-missing",
+                 lambda: A.load_results([missing_path],
+                                        A.load_mapping(missing["paths"]["mapping"])))
+    missing_path.unlink()
+
+    ambiguous = make_fixture(TMP_ROOT / "res_hash_amb",
+                             overrides=e2e_overrides(), with_results=True)
+    copy = (TMP_ROOT / "res_hash_amb_copy" / "runs" / "formal" /
+            "results.jsonl")
+    copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ambiguous["paths"]["results_by_run_dir"]["runs/formal"],
+                    copy)
+    expect_error("同名 run-dir 出现两个候选文件 → 路径歧义",
+                 "results-file-ambiguous",
+                 lambda: run_main(ambiguous, TMP_ROOT / "res_hash_out4",
+                                  extra=results_extra(ambiguous) +
+                                  ("--results", str(copy))))
+
+    unused = make_fixture(TMP_ROOT / "res_hash_unused",
+                          overrides=e2e_overrides(), with_results=True)
+    extra_file = TMP_ROOT / "res_hash_unused" / "runs" / "extra" / "results.jsonl"
+    extra_file.parent.mkdir(parents=True, exist_ok=True)
+    extra_file.write_text('{"sample_id": "S1"}\n', encoding="utf-8")
+    expect_error("传入未被 mapping 引用的结果文件 → fail-closed",
+                 "results-file-unused",
+                 lambda: run_main(unused, TMP_ROOT / "res_hash_out5",
+                                  extra=results_extra(unused) +
+                                  ("--results", str(extra_file))))
+
+    dup = make_fixture(TMP_ROOT / "res_hash_dup", overrides=e2e_overrides(),
+                       with_results=True)
+    dup_file = dup["paths"]["results_by_run_dir"]["runs/formal"]
+    first_line = dup_file.read_text(encoding="utf-8").splitlines()[0]
+    dup_file.write_text(dup_file.read_text(encoding="utf-8") + first_line + "\n",
+                        encoding="utf-8")
+    expect_error("同一文件内出现完全相同的两行 → bad-results", "bad-results",
+                 lambda: A.load_results([dup_file], {}))
+
+
+def test_mapping_identity_guard():
+    """mapping 元数据被改（源文件字节不变）时必须 fail-closed。
+
+    只核对文件 SHA-256 挡不住这类篡改：文件一个字节没动，condition / repeat_index /
+    experiment_id / source_row_number 被换成另一个「合法」值后，统计结果会把记录算进
+    错误的格子里。这里逐项改 mapping 再走 load_results，必须报 results-mapping-mismatch。
+    """
+
+    fixture = make_fixture(TMP_ROOT / "ident", overrides=e2e_overrides(),
+                           with_results=True)
+    mapping_path = fixture["paths"]["mapping"]
+    results = fixture["paths"]["results"]
+
+    def probe(label, mutate):
+        mapping = A.load_mapping(mapping_path)
+        rows = sorted(mapping.values(), key=lambda row: row["blind_id"])
+        mutate(rows)
+        try:
+            A.load_results(results, mapping)
+        except A.StatsError as exc:
+            check(label + " → results-mapping-mismatch",
+                  exc.code == "results-mapping-mismatch", exc.code)
+        else:
+            check(label + " → results-mapping-mismatch", False, "load_results 未报错")
+
+    def bump_int(field_name):
+        def mutate(rows):
+            row = rows[0]
+            row[field_name] = str(int(str(row[field_name]).strip() or "0") + 1)
+        return mutate
+
+    probe("mapping condition 被改成另一个条件",
+          lambda rows: rows[0].__setitem__("condition", "B"))
+    probe("mapping repeat_index 被改", bump_int("repeat_index"))
+    probe("mapping round_index 被改", bump_int("round_index"))
+    probe("mapping experiment_id 被改",
+          lambda rows: rows[0].__setitem__("experiment_id", "exp-other"))
+    probe("mapping sample_id 被改",
+          lambda rows: rows[0].__setitem__("sample_id", "S9"))
+    probe("mapping source_row_number 被改", bump_int("source_row_number"))
+    probe("mapping source_prompt_sha256 被改",
+          lambda rows: rows[0].__setitem__("source_prompt_sha256", "0" * 64))
+
+    # CSV 级端到端：load_mapping 不校验这两列，篡改后必须由 load_results 拦住，
+    # 且不得留下任何统计产物。
+    for field_name, value in (("source_row_number", None),
+                              ("experiment_id", "exp-other")):
+        root = TMP_ROOT / ("ident_csv_" + field_name)
+        built = make_fixture(root, overrides=e2e_overrides(), with_results=True)
+
+        def mutate(rows, field_name=field_name, value=value):
+            target = next(row for row in rows if row["phase"] == "formal")
+            if value is None:
+                target[field_name] = str(int(target[field_name]) + 1)
+            else:
+                target[field_name] = value
+
+        mutate_csv(built["paths"]["mapping"], mutate)
+        out_dir = TMP_ROOT / ("ident_csv_out_" + field_name)
+        expect_error("mapping.csv 的 %s 被改 → fail-closed" % field_name,
+                     "results-mapping-mismatch",
+                     lambda built=built, out_dir=out_dir: run_main(
+                         built, out_dir, extra=results_extra(built)))
+        check("mapping.csv 的 %s 被改时不产出统计目录" % field_name,
+              not out_dir.exists(), out_dir)
 
 
 def test_missing_inputs():
@@ -1555,10 +1748,14 @@ def test_mapping_structure():
         calib[0]["sample_id"] = target["sample_id"]
         calib[0]["condition"] = target["condition"]
         calib[0]["repeat_index"] = target["repeat_index"]
-        check("A4 负向用例只改格点（来源行号与 blind_id 仍与正式行不同）",
-              calib[0]["source_row_number"] != target["source_row_number"] and
+        # source_row_number 是「源文件内行号」，不同 run 目录下可能同为 1；
+        # 定位源记录靠 (source_run_dir, source_row_number) 这个组合。
+        calib_source = (calib[0]["source_run_dir"], calib[0]["source_row_number"])
+        formal_source = (target["source_run_dir"], target["source_row_number"])
+        check("A4 负向用例只改格点（来源记录与 blind_id 仍与正式行不同）",
+              calib_source != formal_source and
               calib[0]["blind_id"] != target["blind_id"],
-              (calib[0]["source_row_number"], target["source_row_number"]))
+              (calib_source, formal_source))
 
     _, message = load_and_grab("map_calib_slot", calib_same_slot)
     check("A4 校准与正式同格同 repeat → bad-mapping", message is not None,
@@ -1930,6 +2127,8 @@ def main():
         test_holm_report_consistency()
         test_h5_with_results()
         test_results_mismatch()
+        test_results_file_hash_guard()
+        test_mapping_identity_guard()
         test_missing_inputs()
     finally:
         print("")

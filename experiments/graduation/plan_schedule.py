@@ -261,6 +261,89 @@ def plan_identities(plan):
     }
 
 
+def plan_identity_entries(plan):
+    """逐任务展开身份条目：不去重、不合并，重复与结构问题都如实返回。
+
+    返回 (entries, problems)：
+      entries  [{"identity": 四元组, "plan_seq": int|None, "repeat_index": ...,
+                "round_index": ..., "where": "blocks[0].tasks[1]"}]
+      problems 结构问题描述（缺 blocks/sample_id/group/repeat_index 等）
+
+    必须逐任务展开而不是走集合推导：plan_identities() 用 set 会把重复身份折叠成
+    一个，而「计划里两个任务同身份」恰恰是最需要被发现的情形，不能靠它。
+    """
+
+    entries = []
+    problems = []
+    if not isinstance(plan, dict):
+        return entries, ["plan.json 不是 JSON 对象"]
+    experiment_id = plan.get("experiment_id")
+    if not isinstance(experiment_id, str) or not experiment_id.strip():
+        problems.append("缺少非空 experiment_id，无法构成身份四元组")
+    blocks = plan.get("blocks")
+    if not isinstance(blocks, list) or not blocks:
+        problems.append("blocks 缺失或为空，没有任务列表")
+        return entries, problems
+    for block_index, block in enumerate(blocks):
+        if not isinstance(block, dict):
+            problems.append("blocks[" + str(block_index) + "] 不是 JSON 对象")
+            continue
+        sample_id = block.get("sample_id")
+        if not isinstance(sample_id, str) or not sample_id.strip():
+            problems.append("blocks[" + str(block_index) + "] 缺少非空 sample_id")
+        tasks = block.get("tasks")
+        if not isinstance(tasks, list) or not tasks:
+            problems.append("blocks[" + str(block_index) + "]（sample_id="
+                            + repr(sample_id) + "）没有任务")
+            continue
+        for task_index, task in enumerate(tasks):
+            where = ("blocks[" + str(block_index) + "].tasks["
+                     + str(task_index) + "]")
+            if not isinstance(task, dict):
+                problems.append(where + " 不是 JSON 对象")
+                continue
+            group = task.get("group")
+            repeat_index = task.get("repeat_index")
+            if not isinstance(group, str) or not group.strip():
+                problems.append(where + " 缺少非空 group")
+            if not isinstance(repeat_index, int) or isinstance(repeat_index, bool):
+                problems.append(where + " 缺少 int repeat_index")
+            entries.append({
+                "identity": (experiment_id, sample_id, group, repeat_index),
+                "plan_seq": task.get("plan_seq"),
+                "repeat_index": repeat_index,
+                "round_index": task.get("round_index"),
+                "where": where,
+            })
+    return entries, problems
+
+
+def plan_identity_duplicates(entries):
+    """同一身份出现 ≥2 次的分组（按首次出现顺序）；每组保留全部条目与 plan_seq。"""
+
+    grouped = {}
+    order = []
+    for entry in entries:
+        key = entry["identity"]
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(entry)
+    return [(key, grouped[key]) for key in order if len(grouped[key]) > 1]
+
+
+def plan_identity_map(plan):
+    """身份 → 条目列表（保留重复，不覆盖）。结构有问题时返回 (None, problems)。"""
+
+    entries, problems = plan_identity_entries(plan)
+    if problems:
+        return None, problems
+    mapping = {}
+    for entry in entries:
+        mapping.setdefault(entry["identity"], []).append(entry)
+    return mapping, problems
+
+
 # ---------------------------------------------------------------------------
 # 校验
 # ---------------------------------------------------------------------------
@@ -276,82 +359,155 @@ def _expect(plan, field, expected):
         )
 
 
-def _require_int(where, field, value):
-    """整数类型校验：bool 是 int 的子类，必须单独拒绝，不能用 == 顶替。"""
+def _int_type_problem(where, field, value):
+    """整数类型的严格判定：bool 是 int 的子类，必须单独拒绝，不能用 == 顶替。
+
+    返回问题描述（含处置建议）；类型正确时返回 None。生产侧抛异常、只读核验报 FAIL
+    共用这套判定，避免「生产器拒绝、预检放行」两条口径。
+    """
 
     if isinstance(value, bool) or not isinstance(value, int):
-        raise PlanIntegrityError(
+        return (
             f"plan.json 的 {where} 的 {field} 类型不正确：{value!r}"
             f"（{type(value).__name__}），必须是整数（且不能是 bool）；"
             "拒绝自动类型转换，请换新的 --run-dir。"
         )
 
-    return value
+    return None
 
 
-def _require_str(where, field, value):
+def _str_type_problem(where, field, value):
+    """字符串类型判定；空字符串不算合法的身份字段值。"""
+
     if not isinstance(value, str):
-        raise PlanIntegrityError(
+        return (
             f"plan.json 的 {where} 的 {field} 类型不正确：{value!r}"
             f"（{type(value).__name__}），必须是字符串；"
             "拒绝自动类型转换，请换新的 --run-dir。"
         )
 
-    return value
+    if not value.strip():
+        return (
+            f"plan.json 的 {where} 的 {field} 不能是空字符串；"
+            "拒绝自动类型转换，请换新的 --run-dir。"
+        )
+
+    return None
 
 
-def _check_plan_scalar_types(plan):
-    """顶层标量字段的严格类型校验，必须早于任何 _expect() 等值比较。
+def plan_type_problems(plan):
+    """整份计划的严格类型校验，按发现顺序返回问题清单（不抛异常）。
 
-    SCHEMA_VERSION 是整数 1，而 True == 1、1.0 == 1，若先做等值比较，
-    篡改后重算 plan_sha256 的 plan.json 就能绕过完整性要求。
+    Python 里 True == 1、1.0 == 1，等值比较识别不了类型冒充；计划一旦被改成
+    等值浮点/布尔再重算 plan_sha256，所有 == 比较都会放行。因此类型必须先查，
+    而且要覆盖顶层（schema_version/seed/round_count）与每个任务的身份字段
+    （plan_seq/round_index/repeat_index 是整数非 bool，group 是非空字符串）。
+
+    只读核验（预检）用它把类型错误报成 FAIL；生产侧 validate_plan() 通过
+    _check_plan_types() 取第一个问题抛 PlanIntegrityError，两边同一个判定。
     """
 
-    _require_int("顶层字段", "schema_version", plan.get("schema_version"))
-    _require_int("顶层字段", "seed", plan.get("seed"))
-    _require_int("顶层字段", "round_count", plan.get("round_count"))
+    if not isinstance(plan, dict):
+        return [f"plan.json 的顶层必须是 JSON 对象，收到 {type(plan).__name__}"]
 
+    problems = []
 
-def _check_plan_types(plan, sample_order, blocks):
-    """整份计划的严格类型校验；在任何范围/顺序/身份比较之前执行。
+    for field in ("schema_version", "seed", "round_count"):
+        problem = _int_type_problem("顶层字段", field, plan.get(field))
 
-    Python 里 True == 1、False == 0，单纯的值比较无法识别 bool 冒充整数，
-    因此 plan_seq / round_index / repeat_index 必须先确认是 int 且不是 bool，
-    group / sample_id / sample_order 必须先确认是字符串。
-    """
+        if problem:
+            problems.append(problem)
 
-    _check_plan_scalar_types(plan)
+    sample_order = plan.get("sample_order")
 
-    for index, sample_id in enumerate(sample_order):
-        _require_str(f"sample_order 第 {index} 项", "sample_order", sample_id)
+    if not isinstance(sample_order, list):
+        problems.append(
+            f"plan.json 的 sample_order 必须是数组，收到 {type(sample_order).__name__}"
+        )
+    else:
+        for index, sample_id in enumerate(sample_order):
+            problem = _str_type_problem(
+                f"sample_order 第 {index} 项", "sample_order", sample_id)
+
+            if problem:
+                problems.append(problem)
+
+    blocks = plan.get("blocks")
+
+    if not isinstance(blocks, list):
+        problems.append(
+            f"plan.json 的 blocks 必须是数组，收到 {type(blocks).__name__}")
+        return problems
 
     for block_index, block in enumerate(blocks):
         if not isinstance(block, dict):
-            raise PlanIntegrityError(
+            problems.append(
                 f"plan.json 的 blocks 第 {block_index} 项必须是 JSON 对象，"
                 f"收到 {type(block).__name__}"
             )
+            continue
 
-        _require_str(f"blocks 第 {block_index} 项", "sample_id", block.get("sample_id"))
+        # 缺 sample_id 是「结构不完整」，由 plan_identity_map()/check_plan 的
+        # 计划结构 FAIL 报告；这里只查「字段存在但类型/取值不对」，避免把结构缺口
+        # 提前误报成类型问题、掩盖真正的结构判定。
+        if "sample_id" in block:
+            problem = _str_type_problem(
+                "blocks 第 " + str(block_index) + " 项", "sample_id",
+                block.get("sample_id"))
+
+            if problem:
+                problems.append(problem)
+
         tasks = block.get("tasks")
 
         if not isinstance(tasks, list):
-            raise PlanIntegrityError(
-                f"plan.json 的 {block.get('sample_id')} 区块缺少 tasks"
-            )
+            problems.append(f"plan.json 的 {block.get('sample_id')} 区块缺少 tasks")
+            continue
 
         for task_index, task in enumerate(tasks):
             where = f"{block.get('sample_id')} 第 {task_index} 个任务"
 
             if not isinstance(task, dict):
-                raise PlanIntegrityError(
+                problems.append(
                     f"plan.json 的 {where} 必须是 JSON 对象，收到 {type(task).__name__}"
                 )
+                continue
 
-            _require_int(where, "plan_seq", task.get("plan_seq"))
-            _require_int(where, "round_index", task.get("round_index"))
-            _require_int(where, "repeat_index", task.get("repeat_index"))
-            _require_str(where, "group", task.get("group"))
+            for field in ("plan_seq", "round_index", "repeat_index"):
+                problem = _int_type_problem(where, field, task.get(field))
+
+                if problem:
+                    problems.append(problem)
+
+            problem = _str_type_problem(where, "group", task.get("group"))
+
+            if problem:
+                problems.append(problem)
+
+    return problems
+
+
+def _check_plan_scalar_types(plan):
+    """顶层标量字段的严格类型校验（生产侧：第一个问题即抛异常）。
+
+    SCHEMA_VERSION 是整数 1，而 True == 1、1.0 == 1，若先做等值比较，
+    篡改后重算 plan_sha256 的 plan.json 就能绕过完整性要求。
+    """
+
+    problems = [problem for problem in plan_type_problems(plan)
+                if "顶层字段" in problem]
+
+    if problems:
+        raise PlanIntegrityError(problems[0])
+
+
+def _check_plan_types(plan, sample_order, blocks):
+    """整份计划的严格类型校验；在任何范围/顺序/身份比较之前执行。"""
+
+    problems = plan_type_problems(plan)
+
+    if problems:
+        raise PlanIntegrityError(problems[0])
 
 
 def validate_plan(
