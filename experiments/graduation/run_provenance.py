@@ -39,7 +39,7 @@ DATA_KINDS = ("simulated_learner_fixture", "real_user_data")
 
 _HEX40 = re.compile(r"^[0-9a-f]{40}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-r[0-9]+-[0-9a-f]{8}$")
+_RUN_ID = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[A-Za-z0-9_.-]+-[A-Za-z0-9_.-]+-r[0-9]+-[0-9a-f]{32}$")
 
 
 class ProvenanceError(RuntimeError):
@@ -78,17 +78,65 @@ class ProvenanceContext:
     runtime_patch_sha256: str | None
     dirty_entries: tuple[str, ...]
     captured_at: str
+    runtime_staged_patch_sha256: str | None = None
+    runtime_unstaged_patch_sha256: str | None = None
+    runtime_untracked_sha256: str | None = None
+    project_root: str = ""
 
     @property
     def base_sha(self) -> str:
         return self.runtime_source_commit
 
+    def to_dict(self) -> dict:
+        return {
+            "runtime_source_commit": self.runtime_source_commit,
+            "base_sha": self.base_sha,
+            "runtime_worktree_clean": self.runtime_worktree_clean,
+            "runtime_patch_sha256": self.runtime_patch_sha256,
+            "runtime_staged_patch_sha256": self.runtime_staged_patch_sha256,
+            "runtime_unstaged_patch_sha256": self.runtime_unstaged_patch_sha256,
+            "runtime_untracked_sha256": self.runtime_untracked_sha256,
+            "dirty_entries": list(self.dirty_entries),
+            "captured_at": self.captured_at,
+            "project_root": self.project_root,
+        }
+
+
+def assert_context_matches(expected: ProvenanceContext, current: ProvenanceContext) -> None:
+    """批次开始时与每个 run 开始前的环境必须完全一致。
+
+    只比较源码环境事实，不比较 captured_at（每次采集时间必然不同）。
+    """
+
+    fields = (
+        "runtime_source_commit",
+        "runtime_worktree_clean",
+        "runtime_patch_sha256",
+        "runtime_staged_patch_sha256",
+        "runtime_unstaged_patch_sha256",
+        "runtime_untracked_sha256",
+        "dirty_entries",
+        "project_root",
+    )
+    changed = [field for field in fields if getattr(expected, field) != getattr(current, field)]
+    if changed:
+        raise ProvenanceError(
+            "批次运行期间源码环境发生变化，拒绝继续："
+            + ", ".join(changed)
+            + f"（批次 captured_at={expected.captured_at}，"
+            + f"当前 captured_at={current.captured_at}）"
+        )
+
 
 def capture_context(project_root=None, now=None) -> ProvenanceContext:
     """在运行开始时采集 Git 事实。
 
-    base_sha 只取 HEAD；工作树是否干净单独记录。未跟踪文件也会让
-    runtime_worktree_clean=false，并把未跟踪文件的内容哈希纳入 patch 摘要。
+    base_sha 只取 HEAD；工作树是否干净单独记录。staged / unstaged diff
+    分别计算 SHA-256，统一 patch 摘要还覆盖 git status 与每个未跟踪文件内容。
+    未跟踪文件也会让 runtime_worktree_clean=false。
+
+    注意：这里只保存摘要，不保存 patch 正文；仅凭 runtime_patch_sha256
+    无法还原当时的源代码。
     """
 
     root = Path(project_root).resolve() if project_root else Path(__file__).resolve().parents[2]
@@ -101,20 +149,47 @@ def capture_context(project_root=None, now=None) -> ProvenanceContext:
     clean = not dirty_entries
 
     patch_sha = None
+    staged_sha = None
+    unstaged_sha = None
+    untracked_sha = None
+
     if not clean:
-        diff = _run_git(root, "diff", "--binary", "--no-color")
+        # staged 与 unstaged 必须分别计算，否则 git add 后只改暂存区会被漏掉。
+        staged = _run_git(root, "diff", "--cached", "--binary", "--no-color")
+        unstaged = _run_git(root, "diff", "--binary", "--no-color")
+        staged_sha = sha256_bytes(staged) if staged else None
+        unstaged_sha = sha256_bytes(unstaged) if unstaged else None
+
         untracked = _run_git(root, "ls-files", "--others", "--exclude-standard").decode(
             "utf-8", "replace"
         )
+        untracked_paths = sorted(line for line in untracked.splitlines() if line.strip())
+
+        # 统一摘要覆盖：status + staged diff + unstaged diff + 每个未跟踪文件内容。
+        # 只保存摘要，不能仅凭 runtime_patch_sha256 还原源代码。
         digest = hashlib.sha256()
-        digest.update(diff)
-        for relative in sorted(line for line in untracked.splitlines() if line.strip()):
+        digest.update(b"status\0")
+        digest.update(status.encode("utf-8"))
+        digest.update(b"\0staged\0")
+        digest.update(staged)
+        digest.update(b"\0unstaged\0")
+        digest.update(unstaged)
+        digest.update(b"\0")
+        untracked_digest = hashlib.sha256()
+        for relative in untracked_paths:
             path = root / relative
+            content = path.read_bytes() if path.is_file() else b""
+            untracked_digest.update(relative.encode("utf-8"))
+            untracked_digest.update(b"\0")
+            untracked_digest.update(content)
+            untracked_digest.update(b"\0")
+            digest.update(b"untracked\0")
             digest.update(relative.encode("utf-8"))
             digest.update(b"\0")
-            if path.is_file():
-                digest.update(path.read_bytes())
+            digest.update(content)
             digest.update(b"\0")
+        if untracked_paths:
+            untracked_sha = untracked_digest.hexdigest()
         patch_sha = digest.hexdigest()
 
     moment = now or datetime.now(timezone.utc)
@@ -128,6 +203,10 @@ def capture_context(project_root=None, now=None) -> ProvenanceContext:
         runtime_patch_sha256=patch_sha,
         dirty_entries=dirty_entries,
         captured_at=captured_at,
+        runtime_staged_patch_sha256=staged_sha,
+        runtime_unstaged_patch_sha256=unstaged_sha,
+        runtime_untracked_sha256=untracked_sha,
+        project_root=str(root),
     )
 
 
@@ -140,7 +219,8 @@ def make_run_id(sample_id: str, group: str, repeat_index: int, now=None) -> str:
     stamp = moment.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     sample = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sample_id)).strip("_") or "sample"
     group_text = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(group)).strip("_") or "group"
-    run_id = f"{stamp}-{sample}-{group_text}-r{int(repeat_index)}-{uuid.uuid4().hex[:8]}"
+    # 完整 UUID4（32 hex），同一秒内大量生成也不依赖时间戳保证唯一性。
+    run_id = f"{stamp}-{sample}-{group_text}-r{int(repeat_index)}-{uuid.uuid4().hex}"
     if not _RUN_ID.fullmatch(run_id):
         raise ProvenanceError(f"run_id 形态不合法：{run_id!r}")
     return run_id
@@ -188,10 +268,16 @@ def tag_memory_provenance(tool_result, raw_result) -> list[dict]:
     if isinstance(raw_result, dict):
         raw_rows = raw_result.get("memories") or []
 
+    if len(raw_rows) != len(tool_rows):
+        raise ProvenanceError(
+            "Tool 返回的注入条目数与运行时原始对象不一致："
+            f"tool={len(tool_rows)} raw={len(raw_rows)}"
+        )
+
     by_content = {}
     for row in raw_rows:
         if not isinstance(row, dict):
-            continue
+            raise ProvenanceError("运行时原始记忆对象不是 dict")
         by_content.setdefault(row.get("content"), []).append(row)
 
     tagged = []
@@ -287,7 +373,13 @@ def select_injected_memories(group_slots, inputs, strict=True) -> list[dict]:
     ]
 
 
-def short_term_facts(inputs, group_slots, strict=True) -> dict:
+def short_term_facts(inputs, group_slots, selected_block, strict=True) -> dict:
+    """三个独立事实必须以组别最终选择的 block 为准，而不是原始 inputs。
+
+    selected_block 必须来自 build_prompts.group_inputs(group, inputs)
+    ["short_term_block"]：槽位关闭时它是 None，槽位开启但上下文为空时是空串。
+    """
+
     info = inputs.get("short_term_info")
     count = None
     if isinstance(info, dict):
@@ -296,10 +388,13 @@ def short_term_facts(inputs, group_slots, strict=True) -> dict:
         if strict:
             raise ProvenanceError("inputs.short_term_info.feedback_count 缺失或不合法")
         count = None
-    block = inputs.get("short_term_block")
+    slot_enabled = bool(group_slots.get("short_term"))
+    block_present = bool(
+        slot_enabled and isinstance(selected_block, str) and selected_block.strip()
+    )
     return {
-        "short_term_slot_enabled": bool(group_slots.get("short_term")),
-        "short_term_block_present": bool(isinstance(block, str) and block.strip()),
+        "short_term_slot_enabled": slot_enabled,
+        "short_term_block_present": block_present,
         "short_term_feedback_history_present": None if count is None else count > 0,
         "short_term_feedback_count": count,
     }
@@ -330,29 +425,48 @@ def resolve_data_kind(sample, strict=True) -> str:
     raise ProvenanceError("样本 simulation.is_simulated 不是显式布尔值")
 
 
-def injected_json_path(run_dir, sample_id, group) -> Path:
+def injected_json_path(run_dir, run_id, sample_id, group) -> Path:
     safe_sample = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(sample_id)) or "sample"
     safe_group = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(group)) or "group"
-    return Path(run_dir) / "injected" / safe_sample / f"{safe_group}.json"
+    safe_run = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_id)) or "run"
+    return Path(run_dir) / "injected" / safe_sample / safe_group / f"{safe_run}.json"
 
 
-def write_injected_json(run_dir, sample_id, group, memories) -> tuple[str, str]:
-    """原子写注入清单，返回 (相对路径, sha256)。内容只含运行时对象字段。"""
+def write_injected_json(
+    run_dir,
+    run_id,
+    sample_id,
+    group,
+    repeat_index,
+    generated_at,
+    memories,
+) -> tuple[str, str]:
+    """按 run 隔离原子写注入清单，返回 (相对路径, sha256)。
 
-    path = injected_json_path(run_dir, sample_id, group)
+    路径为 injected/<sample>/<group>/<run_id>.json，保证同一 sample/group
+    的多次重复运行不会互相覆盖。文件内容只含运行时对象字段。
+    """
+
+    path = injected_json_path(run_dir, run_id, sample_id, group)
+    if path.exists():
+        raise ProvenanceError(f"注入清单已存在，拒绝覆盖：{path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "schema": "graduation-injected-memory/v1",
+        "schema_version": "graduation-injected-memory/v1",
+        "run_id": run_id,
         "sample_id": sample_id,
         "group": group,
+        "repeat_index": repeat_index,
+        "generated_at": generated_at,
         "memory_injected": list(memories),
     }
     data = (canonical_json(payload) + "\n").encode("utf-8")
-    temporary = path.with_name(path.name + ".tmp")
+    temporary = path.with_name(path.name + f".tmp-{uuid.uuid4().hex}")
     temporary.write_bytes(data)
     temporary.replace(path)
     try:
-        relative = path.relative_to(Path(run_dir).resolve()).as_posix()
+        relative = path.resolve().relative_to(Path(run_dir).resolve()).as_posix()
     except ValueError:
         relative = path.name
     return relative, sha256_bytes(data)
@@ -368,18 +482,29 @@ def build_provenance(
     group_slots: dict,
     inputs: dict,
     sample,
+    selected_short_term_block,
+    selected_difficult_flag,
     prompt_sha256: str,
     config_sha256: str | None,
     plan_sha256: str | None,
     generated_at: str,
     model_alias: str | None,
+    injected_json_ref: str | None = None,
+    injected_json_sha256: str | None = None,
     model_snapshot_id: str | None = None,
+    model_snapshot_status: str | None = None,
     strict=True,
 ) -> dict:
     knowledge_ids = extract_knowledge_result_ids(inputs)
     memories = select_injected_memories(group_slots, inputs, strict=strict)
-    facts = short_term_facts(inputs, group_slots, strict=strict)
+    facts = short_term_facts(
+        inputs, group_slots, selected_short_term_block, strict=strict
+    )
     data_kind = resolve_data_kind(sample, strict=strict)
+    if model_snapshot_status is None:
+        model_snapshot_status = (
+            "provided" if model_snapshot_id else "not_provided_by_provider"
+        )
 
     return {
         "run_id": run_id,
@@ -387,24 +512,29 @@ def build_provenance(
         "runtime_source_commit": context.runtime_source_commit,
         "runtime_worktree_clean": context.runtime_worktree_clean,
         "runtime_patch_sha256": context.runtime_patch_sha256,
+        "runtime_staged_patch_sha256": context.runtime_staged_patch_sha256,
+        "runtime_unstaged_patch_sha256": context.runtime_unstaged_patch_sha256,
+        "runtime_untracked_sha256": context.runtime_untracked_sha256,
+        "batch_context": context.to_dict(),
         "knowledge_result_ids": knowledge_ids,
         "memory_injected": memories,
         "short_term_slot_enabled": facts["short_term_slot_enabled"],
         "short_term_block_present": facts["short_term_block_present"],
         "short_term_feedback_history_present": facts["short_term_feedback_history_present"],
         "short_term_feedback_count": facts["short_term_feedback_count"],
-        "difficult_flag": bool(group_slots.get("difficult")),
+        "difficult_flag": bool(selected_difficult_flag),
         "data_kind": data_kind,
         "config_sha256": config_sha256,
         "plan_sha256": plan_sha256,
         "prompt_sha256": prompt_sha256,
-        "injected_json_sha256": None,
-        "injected_json_ref": None,
+        "injected_json_sha256": injected_json_sha256,
+        "injected_json_ref": injected_json_ref,
         "result_schema_version": PROVENANCE_SCHEMA_VERSION,
         "experiment_design_version": DESIGN_VERSION,
         "generated_at": generated_at,
         "model_alias": model_alias,
         "model_snapshot_id": model_snapshot_id,
+        "model_snapshot_status": model_snapshot_status,
     }
 
 
@@ -417,6 +547,10 @@ def validate_provenance(record, strict=True) -> None:
         "runtime_source_commit",
         "runtime_worktree_clean",
         "runtime_patch_sha256",
+        "runtime_staged_patch_sha256",
+        "runtime_unstaged_patch_sha256",
+        "runtime_untracked_sha256",
+        "batch_context",
         "knowledge_result_ids",
         "memory_injected",
         "short_term_slot_enabled",
@@ -435,6 +569,7 @@ def validate_provenance(record, strict=True) -> None:
         "generated_at",
         "model_alias",
         "model_snapshot_id",
+        "model_snapshot_status",
     )
     missing = [field for field in required if field not in record]
     if missing:
@@ -453,8 +588,41 @@ def validate_provenance(record, strict=True) -> None:
         str(record["runtime_patch_sha256"])
     ):
         raise ProvenanceError("runtime_patch_sha256 不是 64 位 SHA")
-    if record["runtime_worktree_clean"] and record["runtime_patch_sha256"] is not None:
-        raise ProvenanceError("工作树干净时不应有 runtime_patch_sha256")
+    for field in (
+        "runtime_staged_patch_sha256",
+        "runtime_unstaged_patch_sha256",
+        "runtime_untracked_sha256",
+    ):
+        value = record[field]
+        if value is not None and (
+            not isinstance(value, str) or not _HEX64.fullmatch(value)
+        ):
+            raise ProvenanceError(f"{field} 不是 64 位 SHA")
+    dirty_patch_fields = (
+        "runtime_patch_sha256",
+        "runtime_staged_patch_sha256",
+        "runtime_unstaged_patch_sha256",
+        "runtime_untracked_sha256",
+    )
+    if record["runtime_worktree_clean"]:
+        if any(record[field] is not None for field in dirty_patch_fields):
+            raise ProvenanceError("工作树干净时不应有 patch 摘要")
+    else:
+        if record["runtime_patch_sha256"] is None:
+            raise ProvenanceError("工作树不干净时必须记录统一 patch 摘要")
+        if all(record[field] is None for field in dirty_patch_fields[1:]):
+            raise ProvenanceError("工作树不干净但没有任何 staged/unstaged/untracked 摘要")
+
+    batch = record["batch_context"]
+    if not isinstance(batch, dict):
+        raise ProvenanceError("batch_context 必须是对象")
+    for field in ("runtime_source_commit", "base_sha", "captured_at"):
+        if not isinstance(batch.get(field), str) or not batch.get(field).strip():
+            raise ProvenanceError(f"batch_context 缺少 {field}")
+    if batch["base_sha"] != record["base_sha"]:
+        raise ProvenanceError("batch_context.base_sha 与记录不一致")
+    if batch["runtime_source_commit"] != record["runtime_source_commit"]:
+        raise ProvenanceError("batch_context.runtime_source_commit 与记录不一致")
 
     knowledge = record["knowledge_result_ids"]
     if not isinstance(knowledge, list) or any(not isinstance(item, str) for item in knowledge):
@@ -492,6 +660,8 @@ def validate_provenance(record, strict=True) -> None:
     ):
         if not isinstance(record[field], bool):
             raise ProvenanceError(f"{field} 必须是布尔值")
+    if not record["short_term_slot_enabled"] and record["short_term_block_present"]:
+        raise ProvenanceError("short_term 槽位关闭时 block_present 不能为 true")
     if record["short_term_feedback_count"] is not None and (
         not isinstance(record["short_term_feedback_count"], int)
         or isinstance(record["short_term_feedback_count"], bool)
@@ -503,10 +673,8 @@ def validate_provenance(record, strict=True) -> None:
         raise ProvenanceError(f"data_kind 不合法：{record['data_kind']!r}")
     for field in ("config_sha256", "plan_sha256", "prompt_sha256"):
         value = record[field]
-        if value is not None and not _HEX64.fullmatch(str(value)):
-            raise ProvenanceError(f"{field} 不是 64 位 SHA")
-    if record["prompt_sha256"] is None:
-        raise ProvenanceError("prompt_sha256 不能为空")
+        if not isinstance(value, str) or not _HEX64.fullmatch(value):
+            raise ProvenanceError(f"{field} 缺失或不是 64 位 SHA")
     if record["injected_json_sha256"] is None or not _HEX64.fullmatch(
         str(record["injected_json_sha256"])
     ):
@@ -525,3 +693,10 @@ def validate_provenance(record, strict=True) -> None:
         raise ProvenanceError("model_alias 必须是字符串或 null")
     if record["model_snapshot_id"] is not None and not isinstance(record["model_snapshot_id"], str):
         raise ProvenanceError("model_snapshot_id 必须是字符串或 null")
+    allowed_snapshot_status = ("provided", "not_provided_by_provider", "not_available")
+    if record["model_snapshot_status"] not in allowed_snapshot_status:
+        raise ProvenanceError("model_snapshot_status 不在允许值内")
+    if record["model_snapshot_id"] is None and record["model_snapshot_status"] == "provided":
+        raise ProvenanceError("model_snapshot_id 为空时不能标记 provided")
+    if record["model_snapshot_id"] is not None and record["model_snapshot_status"] != "provided":
+        raise ProvenanceError("model_snapshot_id 存在时必须标记 provided")

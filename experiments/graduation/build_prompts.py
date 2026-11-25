@@ -38,6 +38,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import run_provenance  # noqa: E402
 import seed_fixture  # noqa: E402
 
 # 设计 §2.2 的输入矩阵：A/B/C/D 是主对照，B0 是"只有原始反馈行"的探索组。
@@ -378,6 +379,15 @@ def collect_inputs(sample, config, api, moment):
         else None
     )
 
+    # 运行时来源：Tool 返回的是剥离过 memory_id/status 的条目；原始对象只在上面的
+    # fixed_clock 只读查询里取得。这里逐条绑定，任何歧义在模型调用前失败。
+    memory_provenance = {
+        "default": run_provenance.tag_memory_provenance(memory_tool, raw_default),
+        "subject": run_provenance.tag_memory_provenance(
+            subject_memory_tool, raw_subject
+        ),
+    }
+
     # B0 专用：保留原始反馈行，但统计槽位固定为空 dict、难度标记固定 False
     feedback_list = feedback_result.get("feedback") or []
     raw_feedback_result = {
@@ -403,6 +413,7 @@ def collect_inputs(sample, config, api, moment):
         "subject_filter": subject_filter,
         "subject_memory_result": subject_memory_result,
         "subject_memory_tool": subject_memory_tool,
+        "memory_provenance": memory_provenance,
         "plan_date": plan_date,
     }
 
